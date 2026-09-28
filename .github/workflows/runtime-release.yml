@@ -1,0 +1,260 @@
+# Builds the runtime Distributed ships — msb, libkrunfw and the Go FFI — per
+# platform, and publishes it as a GitHub release of this fork.
+#
+# Each tarball is the tree Distributed installs:
+#   bin/msb
+#   lib/libkrunfw.so.<version> + .so.<abi> + .so   (darwin: libkrunfw.<abi>.dylib + .dylib)
+#   lib/libmicrosandbox_go_ffi.{so,dylib}
+#   distributed-runtime.commit                      (the tagged commit)
+#
+# Linux builds run on Ubuntu 22.04 so nothing shipped needs a glibc newer than 2.35.
+name: Runtime release
+
+on:
+  push:
+    tags: ["v*-gitii.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag whose release failed to publish, e.g. v0.6.9-gitii.1
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: runtime-release-${{ inputs.tag || github.ref_name }}
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  RUST_TOOLCHAIN: 1.94.0
+  LIBKRUNFW_VERSION: "5.6.1"
+  LIBKRUNFW_ABI: "5"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The guest kernel (libkrunfw.so and kernel.c, which darwin links its dylib
+  # from) and the static guest init agentd, which msb embeds.
+  kernel:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            musl: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            musl: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Check out libkrunfw
+        id: krunfw
+        run: |
+          git submodule update --init --depth 1 vendor/libkrunfw
+          echo "sha=$(git rev-parse HEAD:vendor/libkrunfw)" >>"$GITHUB_OUTPUT"
+
+      - name: Cache the kernel
+        id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+            vendor/libkrunfw/kernel.c
+          key: kernel-${{ matrix.runner }}-${{ steps.krunfw.outputs.sha }}
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      # libkrunfw's own download retries neither HTTP/2 stream errors nor
+      # verifies the tarball, so it is fetched and checked here first; its
+      # Makefile then finds the file in place and skips the download.
+      - name: Fetch the kernel source
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: vendor/libkrunfw
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^KERNEL_VERSION *= *//p' Makefile)
+          tarball="$version.tar.gz"
+          expected=$(awk -v f="$tarball" '$2 == f { print $1 }' "$GITHUB_WORKSPACE/.github/kernel-tarballs.sha256")
+          if [ -z "$expected" ]; then
+            echo "::error::.github/kernel-tarballs.sha256 has no digest for $tarball; add it from https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc"
+            exit 1
+          fi
+          mkdir -p tarballs
+          curl --fail --location --http1.1 --retry 8 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 30 --continue-at - --output "tarballs/$tarball.part" \
+            "https://cdn.kernel.org/pub/linux/kernel/v6.x/$tarball"
+          echo "$expected  tarballs/$tarball.part" | sha256sum --check
+          mv "tarballs/$tarball.part" "tarballs/$tarball"
+
+      - name: Build the kernel
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: vendor/libkrunfw
+        run: make -j"$(nproc)"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.musl }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: agentd-${{ matrix.arch }}
+          cache-bin: false
+
+      - name: Build agentd
+        run: cargo build --locked --release -p microsandbox-agentd --target ${{ matrix.musl }}
+
+      - name: Stage the parts
+        run: |
+          mkdir -p parts
+          cp vendor/libkrunfw/libkrunfw.so.$LIBKRUNFW_VERSION vendor/libkrunfw/kernel.c parts/
+          cp target/${{ matrix.musl }}/release/agentd parts/
+          # agentd is PID 1 in guests of any userland: it must not need a dynamic loader.
+          if readelf -lW parts/agentd | grep -q INTERP; then
+            echo "::error::agentd is dynamically linked"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: parts/
+          retention-days: 1
+
+  build:
+    needs: kernel
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-22.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-22.04-arm
+          - os: darwin
+            arch: arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.arch }}
+          cache-bin: false
+
+      - name: Install build dependencies
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: parts/
+
+      # build/ is where the crates' build scripts look: agentd for msb to embed
+      # (touched, as a downloaded file is older than the sources and refused),
+      # and msb plus libkrunfw so the FFI's SDK dependency downloads nothing.
+      - name: Stage agentd and libkrunfw
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cp parts/agentd build/agentd
+          touch build/agentd
+          cd build
+          if [ "${{ matrix.os }}" = darwin ]; then
+            cc -fPIC -DABI_VERSION=$LIBKRUNFW_ABI -shared -o libkrunfw.$LIBKRUNFW_ABI.dylib ../parts/kernel.c
+            ln -sf libkrunfw.$LIBKRUNFW_ABI.dylib libkrunfw.dylib
+          else
+            install -m 0755 ../parts/libkrunfw.so.$LIBKRUNFW_VERSION .
+            ln -sf libkrunfw.so.$LIBKRUNFW_VERSION libkrunfw.so.$LIBKRUNFW_ABI
+            ln -sf libkrunfw.so.$LIBKRUNFW_ABI libkrunfw.so
+          fi
+
+      - name: Build msb
+        run: |
+          cargo build --locked --release --no-default-features --features net,ssh -p microsandbox-cli
+          cp target/release/msb build/msb
+          if [ "${{ matrix.os }}" = darwin ]; then
+            codesign --entitlements msb-entitlements.plist --force -s - build/msb
+          fi
+
+      - name: Build the Go FFI
+        run: cargo build --locked --release -p microsandbox-go
+
+      - name: Pack the runtime
+        run: |
+          set -euo pipefail
+          tree="runtime"
+          mkdir -p "$tree/bin" "$tree/lib"
+          cp -p build/msb "$tree/bin/msb"
+          cp -P build/libkrunfw* "$tree/lib/"
+          if [ "${{ matrix.os }}" = darwin ]; then
+            cp target/release/libmicrosandbox_go_ffi.dylib "$tree/lib/"
+          else
+            cp target/release/libmicrosandbox_go_ffi.so "$tree/lib/"
+          fi
+          git rev-parse HEAD >"$tree/distributed-runtime.commit"
+          tar -czf microsandbox-runtime-${{ matrix.os }}-${{ matrix.arch }}.tar.gz -C "$tree" bin lib distributed-runtime.commit
+          tar -tvzf microsandbox-runtime-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
+      # Distributed's node packages declare glibc 2.35 (Ubuntu 22.04) as their floor.
+      - name: Check the glibc floor
+        if: matrix.os == 'linux'
+        run: |
+          set -euo pipefail
+          floor=$(objdump -T runtime/bin/msb runtime/lib/*.so* | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "glibc floor: $floor"
+          [ -n "$floor" ]
+          [ "$(printf '%s\n2.35\n' "$floor" | sort -V | tail -1)" = 2.35 ]
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-${{ matrix.os }}-${{ matrix.arch }}
+          path: microsandbox-runtime-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: runtime-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Publish the release
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz >checksums.sha256
+          cat checksums.sha256
+          # Fails if the release exists: a published runtime is never replaced; rebuild under a new tag.
+          gh release create "$TAG" --title "$TAG" --verify-tag \
+            --notes "microsandbox runtime for Distributed, built from $(git rev-parse HEAD)." \
+            *.tar.gz checksums.sha256
+
+      # The Go SDK lives in sdk/go, so its module version is tagged sdk/go/<tag>.
+      - name: Tag the Go module
+        run: git push origin "HEAD:refs/tags/sdk/go/$TAG"
