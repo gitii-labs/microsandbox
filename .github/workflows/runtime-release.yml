@@ -16,11 +16,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to rebuild, e.g. v0.6.9-gitii.1
+        description: Tag whose release failed to publish, e.g. v0.6.9-gitii.1
         required: true
 
 permissions:
   contents: write
+
+concurrency:
+  group: runtime-release-${{ inputs.tag || github.ref_name }}
 
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
@@ -111,7 +114,11 @@ jobs:
           mkdir -p parts
           cp vendor/libkrunfw/libkrunfw.so.$LIBKRUNFW_VERSION vendor/libkrunfw/kernel.c parts/
           cp target/${{ matrix.musl }}/release/agentd parts/
-          file parts/agentd | grep -q 'statically linked'
+          # agentd is PID 1 in guests of any userland: it must not need a dynamic loader.
+          if readelf -lW parts/agentd | grep -q INTERP; then
+            echo "::error::agentd is dynamically linked"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -173,7 +180,7 @@ jobs:
             cc -fPIC -DABI_VERSION=$LIBKRUNFW_ABI -shared -o libkrunfw.$LIBKRUNFW_ABI.dylib ../parts/kernel.c
             ln -sf libkrunfw.$LIBKRUNFW_ABI.dylib libkrunfw.dylib
           else
-            cp ../parts/libkrunfw.so.$LIBKRUNFW_VERSION .
+            install -m 0755 ../parts/libkrunfw.so.$LIBKRUNFW_VERSION .
             ln -sf libkrunfw.so.$LIBKRUNFW_VERSION libkrunfw.so.$LIBKRUNFW_ABI
             ln -sf libkrunfw.so.$LIBKRUNFW_ABI libkrunfw.so
           fi
@@ -209,8 +216,10 @@ jobs:
       - name: Check the glibc floor
         if: matrix.os == 'linux'
         run: |
+          set -euo pipefail
           floor=$(objdump -T runtime/bin/msb runtime/lib/*.so* | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
           echo "glibc floor: $floor"
+          [ -n "$floor" ]
           [ "$(printf '%s\n2.35\n' "$floor" | sort -V | tail -1)" = 2.35 ]
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -241,14 +250,10 @@ jobs:
           set -euo pipefail
           sha256sum *.tar.gz >checksums.sha256
           cat checksums.sha256
-          # A rebuild through workflow_dispatch replaces the assets of an existing release.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" --clobber *.tar.gz checksums.sha256
-          else
-            gh release create "$TAG" --title "$TAG" --verify-tag \
-              --notes "microsandbox runtime for Distributed, built from $(git rev-parse HEAD)." \
-              *.tar.gz checksums.sha256
-          fi
+          # Fails if the release exists: a published runtime is never replaced; rebuild under a new tag.
+          gh release create "$TAG" --title "$TAG" --verify-tag \
+            --notes "microsandbox runtime for Distributed, built from $(git rev-parse HEAD)." \
+            *.tar.gz checksums.sha256
 
       # The Go SDK lives in sdk/go, so its module version is tagged sdk/go/<tag>.
       - name: Tag the Go module
