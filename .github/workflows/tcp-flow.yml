@@ -2,7 +2,7 @@ name: TCP Flow Control
 
 on:
   pull_request:
-    branches: [feat/deny-events]
+    branches: [main]
 
 permissions:
   contents: read
