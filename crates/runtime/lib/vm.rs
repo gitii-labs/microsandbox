@@ -60,6 +60,11 @@ const EXIT_REASON_AGENT_UNRESPONSIVE: u8 = 5;
 const EXIT_REASON_SHUTDOWN_REQUESTED: u8 = 6;
 const EXIT_REASON_STARTUP_COMMAND_FAILED: u8 = 7;
 
+/// `run.termination_detail` recorded when a guest missed its poweroff
+/// deadline and the host tore the VM down instead.
+const FORCED_EXIT_DETAIL: &str =
+    "guest did not power off within the shutdown grace window; host forced the exit";
+
 /// Fixed fd carrying the bulk `msb sandbox` config (argv overflow) as
 /// NUL-terminated argument records. Keeps the network-config blob and the
 /// repeated `--env` flags off the process argv — see issue #997.
@@ -328,9 +333,6 @@ pub struct VmConfig {
     #[cfg(unix)]
     pub backends: Vec<(String, Box<dyn DynFileSystem + Send + Sync>)>,
 
-    /// Path to the init binary in the guest.
-    pub init_path: Option<PathBuf>,
-
     /// Environment variables as `KEY=VALUE` pairs.
     pub env: Vec<String>,
 
@@ -396,9 +398,95 @@ type VmBuildOutput = (
     BindIdentityMapRegistration,
 );
 
+/// How a run ended, as the exit observer determined it.
+pub(crate) struct RunTermination {
+    /// Process exit status recorded on the run row.
+    pub exit_code: i32,
+
+    /// Coarse reason the sandbox stopped.
+    pub reason: run_entity::TerminationReason,
+
+    /// Free-form detail, set when the host had to force the exit.
+    pub detail: Option<String>,
+}
+
+/// Race-free record of a host-forced VM exit.
+///
+/// A grace-window sleeper and libkrun's exit observer can wake at the same
+/// instant — the guest may power off just as the deadline expires — so both
+/// facts live in one atomic. A sleeper marks the exit forced only while the
+/// observer has not started; once the observer starts, the verdict is frozen
+/// at what it read and a late wake changes nothing.
+///
+/// This is deliberately *not* a termination reason. Every reason survives a
+/// forced exit unchanged — the run still records why the sandbox was being
+/// stopped, be it a shutdown request, an idle timeout, a departed parent or a
+/// failed startup command — and the forced exit is carried by a non-zero exit
+/// code and `run.termination_detail` instead.
+///
+/// Only a handoff sandbox arms one. An agentd-as-PID-1 guest gets the short
+/// [`NORMAL_SHUTDOWN_FLUSH_TIMEOUT`] window, which has always been a hint
+/// rather than a deadline: it is routinely shorter than a clean poweroff and
+/// its expiry is not evidence of anything. A disarmed `ForcedExit` never
+/// records a forced exit, so those sandboxes keep exactly their old
+/// behaviour — exit code 0, no detail, no forced process exit.
+///
+/// [`NORMAL_SHUTDOWN_FLUSH_TIMEOUT`]: microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
+#[derive(Debug)]
+struct ForcedExit {
+    state: std::sync::atomic::AtomicU8,
+    armed: bool,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl ForcedExit {
+    /// No deadline has expired and the exit observer has not started.
+    const PENDING: u8 = 0;
+
+    /// A grace window expired and the host triggered the exit.
+    const FORCED: u8 = 1;
+
+    /// The exit observer is running; the verdict is frozen.
+    const OBSERVED: u8 = 2;
+
+    /// `armed` is whether this sandbox hands PID 1 to a guest init, the only
+    /// mode whose grace window is a real deadline.
+    fn new(armed: bool) -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(Self::PENDING),
+            armed,
+        }
+    }
+
+    /// Record that a grace window expired and the host is forcing the exit.
+    ///
+    /// Returns `false` when this sandbox arms no forced exit, when the
+    /// observer has already started — the guest powered off on its own and
+    /// this wake lost the race — or when another sleeper got there first.
+    fn force(&self) -> bool {
+        self.armed
+            && self
+                .state
+                .compare_exchange(
+                    Self::PENDING,
+                    Self::FORCED,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+    }
+
+    /// Called by the exit observer as its first act. Freezes the state and
+    /// reports whether an expired deadline forced this exit.
+    fn observer_started(&self) -> bool {
+        self.state
+            .swap(Self::OBSERVED, std::sync::atomic::Ordering::SeqCst)
+            == Self::FORCED
+    }
+}
 
 impl BindIdentityMapRegistration {
     fn new() -> Self {
@@ -441,7 +529,6 @@ impl std::fmt::Debug for VmConfig {
         #[cfg(unix)]
         debug.field("backends", &format!("[{} backend(s)]", self.backends.len()));
         debug
-            .field("init_path", &self.init_path)
             .field("env", &self.env)
             .field("workdir", &self.workdir)
             .field("exec_path", &self.exec_path)
@@ -505,7 +592,8 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
-    let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
+    let handoff_init = has_handoff_init(&config.vm.env);
+    let shutdown_flush_timeout = guest_shutdown_flush_timeout(handoff_init);
 
     // Create console shared state (ring buffers + wake pipes).
     let shared = Arc::new(ConsoleSharedState::new());
@@ -539,6 +627,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let writeback_disk_paths = match writeback_limited_disk_paths(&config.vm) {
         Ok(disk_paths) => disk_paths,
         Err(error) => {
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
@@ -553,6 +642,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     )) {
         Ok(guard) => Arc::new(guard),
         Err(error) => {
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
@@ -571,6 +661,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             if let Err(release_error) = tokio_rt.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%release_error, "release CPU placement after writeback admission failure");
             }
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             return Err(error);
         }
@@ -596,6 +687,12 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     // triggering exit; the exit observer reads it for the DB update.
     let exit_reason: Arc<std::sync::atomic::AtomicU8> =
         Arc::new(std::sync::atomic::AtomicU8::new(EXIT_REASON_COMPLETED));
+
+    // Set when a grace window expires and the host forces the exit. Kept
+    // apart from the reason tag so the original cause (idle, parent exit,
+    // startup command) survives into the persisted run. Armed only for a
+    // handoff guest, whose window is a real deadline.
+    let forced_exit = Arc::new(ForcedExit::new(handoff_init));
 
     // Activate the shared-memory metrics writer if the host reserved a slot.
     // The host always reserves and passes a handoff when sampling is enabled,
@@ -625,6 +722,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_sandbox_id = config.sandbox_id;
     let exit_run_id = run_db_id;
     let exit_reason_for_observer = Arc::clone(&exit_reason);
+    let forced_exit_for_observer = Arc::clone(&forced_exit);
     let exit_sock_path = config.agent_sock_path.clone();
     let exit_sandboxes_dir = config.sandboxes_dir.clone();
     let exit_log_writer = exec_log_writer.clone();
@@ -653,12 +751,21 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         &config,
         console_backend,
         move |exit_code: i32| {
-            use microsandbox_db::entity::sandbox as sandbox_entity;
-            use sea_orm::QueryFilter;
-            use sea_orm::sea_query::Expr;
+            // Claim the verdict before anything else: a sleeper waking on an
+            // expired deadline at this same instant must not retag a shutdown
+            // the guest completed on its own.
+            let forced = forced_exit_for_observer.observer_started();
 
             // Map (exit_code, reason tag) → TerminationReason.
             let reason_tag = exit_reason_for_observer.load(std::sync::atomic::Ordering::SeqCst);
+            // libkrun's host-triggered exit reports status zero. A forced exit
+            // is never clean, so the run must not record success.
+            let exit_code = if forced && exit_code == 0 {
+                1
+            } else {
+                exit_code
+            };
+            let termination_detail = forced.then(|| FORCED_EXIT_DETAIL.to_string());
             let reason = match reason_tag {
                 EXIT_REASON_IDLE_TIMEOUT => run_entity::TerminationReason::IdleTimeout,
                 EXIT_REASON_AGENT_UNRESPONSIVE => run_entity::TerminationReason::AgentUnresponsive,
@@ -681,33 +788,21 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     tracing::warn!(%error, "release CPU placement at VM exit");
                 }
 
-                // Mark run as terminated with exit code and reason.
-                let _ = run_entity::Entity::update_many()
-                    .col_expr(
-                        run_entity::Column::Status,
-                        Expr::value(run_entity::RunStatus::Terminated),
-                    )
-                    .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
-                    .col_expr(run_entity::Column::ExitCode, Expr::value(exit_code))
-                    .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
-                    .filter(run_entity::Column::Id.eq(exit_run_id))
-                    .exec(&exit_db)
-                    .await;
-
-                // Mark sandbox as stopped.
-                let _ = sandbox_entity::Entity::update_many()
-                    .col_expr(
-                        sandbox_entity::Column::Status,
-                        Expr::value(sandbox_entity::SandboxStatus::Stopped),
-                    )
-                    .col_expr(
-                        sandbox_entity::Column::ActiveConfig,
-                        Expr::value(Option::<String>::None),
-                    )
-                    .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
-                    .filter(sandbox_entity::Column::Id.eq(exit_sandbox_id))
-                    .exec(&exit_db)
-                    .await;
+                // Retire the endpoint files and then the rows. The unlink
+                // leads deliberately: see `finish_terminated_run`.
+                finish_terminated_run(
+                    &exit_db,
+                    &exit_sock_path,
+                    exit_sandbox_id,
+                    exit_run_id,
+                    RunTermination {
+                        exit_code,
+                        reason,
+                        detail: termination_detail.clone(),
+                    },
+                    now,
+                )
+                .await;
 
                 // Self-clean: if this sandbox was created ephemeral, drop its
                 // persisted row + directory now that it is terminal. Reads
@@ -758,9 +853,13 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 flush();
             }
 
-            // Clean up agent.sock — the relay's async cleanup won't run because
-            // _exit() is called immediately after this observer returns.
-            let _ = std::fs::remove_file(&exit_sock_path);
+            if forced {
+                // libkrun's host-triggered exit defaults to status zero. Its
+                // device exit observers have already drained block writes;
+                // this is our final user observer. Preserve failure for SDK
+                // lifecycle owners as well as the persisted run record.
+                std::process::exit(1);
+            }
         },
         tokio_rt.handle().clone(),
         cpu_guard.vcpu_targets(),
@@ -781,6 +880,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             if let Err(error) = tokio_rt.block_on(cpu_guard.release(&db)) {
                 tracing::warn!(%error, "release CPU placement after VM build failure");
             }
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             // Free the slot: build_vm never started the sampler, so no live
             // sample is worth preserving. Prefer the writer (already holds
@@ -844,18 +944,24 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 parent_watchdog,
                 Arc::clone(&shared),
                 Arc::clone(&exit_reason),
+                Arc::clone(&forced_exit),
                 exit_handle.clone(),
                 config.sandbox_name.clone(),
                 shutdown_flush_timeout,
             )
         {
+            // The relay bound the endpoint before the run row existed, and
+            // this path returns instead of reaching the exit observer, so the
+            // files are unlinked here or not at all. No waiter is released by
+            // `mark_run_failed` — it writes the run row only — so this is leak
+            // avoidance, not the ordering guard the observer needs.
+            remove_agent_endpoint_files(&config.agent_sock_path);
             let _ = tokio_rt.block_on(mark_run_failed(&db, run_db_id));
             if let Some(writer) = metrics_writer.clone() {
                 let _ = writer.release(ReleaseMode::Free);
             } else {
                 release_reserved_metrics_slot(config.metrics_slot.as_ref());
             }
-            let _ = std::fs::remove_file(&config.agent_sock_path);
             return Err(e);
         }
     }
@@ -999,6 +1105,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     {
         let shutdown_exit_handle = exit_handle.clone();
         let shutdown_reason = Arc::clone(&exit_reason);
+        let shutdown_forced_exit = Arc::clone(&forced_exit);
         tokio_rt.spawn(async move {
             if relay_drain_rx.recv().await.is_some() {
                 shutdown_reason.store(
@@ -1009,7 +1116,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     "core.shutdown forwarded to agentd, allowing flush window before host fallback"
                 );
                 tokio::time::sleep(shutdown_flush_timeout).await;
-                tracing::info!("flush window elapsed, triggering host exit");
+                if shutdown_forced_exit.force() {
+                    tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
+                }
                 shutdown_exit_handle.trigger();
             }
         });
@@ -1023,6 +1132,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         let startup_shared = Arc::clone(&shared);
         let startup_exit_handle = exit_handle.clone();
         let startup_reason = Arc::clone(&exit_reason);
+        let startup_forced_exit = Arc::clone(&forced_exit);
         let startup_shutdown_flush_timeout = shutdown_flush_timeout;
         tokio_rt.spawn(async move {
             tracing::info!(
@@ -1072,6 +1182,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                     );
                 }
             }
+            if startup_forced_exit.force() {
+                tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
+            }
             startup_exit_handle.trigger();
         });
     }
@@ -1085,6 +1198,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         let idle_timeout = config.idle_timeout_secs.map(Duration::from_secs);
         let heartbeat_exit_handle = exit_handle.clone();
         let heartbeat_reason = Arc::clone(&exit_reason);
+        let heartbeat_forced_exit = Arc::clone(&forced_exit);
         let heartbeat_shared = Arc::clone(&shared);
         let heartbeat_shutdown_flush_timeout = shutdown_flush_timeout;
         tokio_rt.spawn(async move {
@@ -1123,6 +1237,9 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                                     "idle shutdown request failed, triggering host exit"
                                 );
                             }
+                        }
+                        if heartbeat_forced_exit.force() {
+                            tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
                         }
                         heartbeat_exit_handle.trigger();
                         break;
@@ -1297,12 +1414,12 @@ fn build_vm(
             // kernel command line internal avoids exposing a general-purpose
             // boot-argument escape hatch to sandbox users.
             let thp = thp_kernel_cmdline(vm.thp);
-            let k = k.krunfw_path(&vm.libkrunfw_path).cmdline(&thp);
-            if let Some(ref init_path) = vm.init_path {
-                k.init_path(init_path)
-            } else {
-                k
-            }
+            // libkrun's x86 i8042 reset endpoint terminates the VMM. Declare
+            // that platform contract so firmware can register POWER_OFF;
+            // without it Linux demotes systemd poweroff to a non-exiting HALT.
+            #[cfg(target_arch = "x86_64")]
+            let thp = format!("{thp} krun.poweroff=i8042");
+            k.krunfw_path(&vm.libkrunfw_path).cmdline(&thp)
         });
 
     // Root filesystem.
@@ -1919,6 +2036,24 @@ fn request_guest_shutdown_with_timeout(
     relay::push_guest_frame_until(shared, frame, timeout)
 }
 
+fn has_handoff_init(env: &[String]) -> bool {
+    // SDK init selection is an agentd boot parameter, not the VMM executable
+    // override that libkrun would take. Match the same last-value-wins env.
+    //
+    // `MSB_HANDOFF_INIT=auto` counts, deliberately: the window is armed by
+    // what the sandbox *asked* for, not by what agentd resolved in the guest.
+    // The host cannot see that resolution, and a request for a guest init is
+    // already a request for the longer, real deadline — an `auto` that finds
+    // no candidate fails the boot rather than quietly becoming a PID-1 agentd.
+    env.iter()
+        .rev()
+        .find_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            (key == microsandbox_protocol::ENV_HANDOFF_INIT).then_some(!value.is_empty())
+        })
+        .unwrap_or(false)
+}
+
 fn guest_shutdown_flush_timeout(has_handoff_init: bool) -> Duration {
     let override_ms = std::env::var("MSB_SHUTDOWN_FLUSH_TIMEOUT_MS").ok();
     guest_shutdown_flush_timeout_with_override(has_handoff_init, override_ms.as_deref())
@@ -1953,6 +2088,7 @@ fn spawn_parent_watchdog(
     parent_watchdog: OwnedFd,
     shared: Arc<ConsoleSharedState>,
     exit_reason: Arc<std::sync::atomic::AtomicU8>,
+    forced_exit: Arc<ForcedExit>,
     exit_handle: msb_krun::ExitHandle,
     sandbox_name: String,
     shutdown_flush_timeout: Duration,
@@ -1970,6 +2106,9 @@ fn spawn_parent_watchdog(
                         tracing::warn!(error = %err, "parent-watch shutdown request failed");
                     } else {
                         std::thread::sleep(shutdown_flush_timeout);
+                    }
+                    if forced_exit.force() {
+                        tracing::error!("guest poweroff deadline elapsed; shutdown is unclean");
                     }
                     exit_handle.trigger();
                 }
@@ -2316,6 +2455,92 @@ fn thp_kernel_cmdline(policy: microsandbox_types::TransparentHugePagePolicy) -> 
 }
 
 //--------------------------------------------------------------------------------------------------
+// Functions: Teardown
+//--------------------------------------------------------------------------------------------------
+
+/// Remove the host-side endpoint files that belong to `agent_sock_path`: the
+/// agent socket itself and the control socket derived from it.
+///
+/// Unlinking a bound unix socket only removes the name; connections already
+/// accepted keep working, so this is safe to call while the listeners are
+/// still up. Errors are ignored — a missing file is the desired state, and
+/// the caller is on a teardown path with nothing to report to. On Windows
+/// both endpoints are named pipes, which have no filesystem entry to remove,
+/// so this is a no-op there.
+pub fn remove_agent_endpoint_files(agent_sock_path: &Path) {
+    let _ = std::fs::remove_file(agent_sock_path);
+    let _ = std::fs::remove_file(crate::control::control_socket_path_for(agent_sock_path));
+}
+
+/// Retire a run and its sandbox row, endpoint files first.
+///
+/// The unlink leads the writes on purpose. Guard: a caller that stops a
+/// sandbox and immediately creates one under the same name races the unlink
+/// otherwise. Such callers wait on the sandbox status (`Stop`,
+/// `WaitUntilStopped`, `RemoveSandbox`), so if the row went terminal first the
+/// new sandbox could bind the same socket path and then lose it to this
+/// process's late unlink, leaving a live VM whose agent endpoint has no name:
+/// "has no agent endpoint (is it running?)". Removing the files first means
+/// every waiter the status releases sees paths that are already gone, and
+/// nothing this process does afterwards touches them.
+///
+/// This is also the only unlink the sandbox process gets on the exit path:
+/// the relay's own async cleanup never runs, because `_exit()` follows the
+/// exit observer immediately and bypasses task cleanup.
+///
+/// The two writes keep their order — run first, then sandbox. Failures are
+/// swallowed: this runs on the VMM thread just before `_exit()`, and the
+/// maintenance sweep reconciles a row this misses.
+pub(crate) async fn finish_terminated_run(
+    db: &DbWriteConnection,
+    agent_sock_path: &Path,
+    sandbox_id: i32,
+    run_id: i32,
+    termination: RunTermination,
+    now: chrono::NaiveDateTime,
+) {
+    let RunTermination {
+        exit_code,
+        reason,
+        detail,
+    } = termination;
+    use microsandbox_db::entity::sandbox as sandbox_entity;
+    use sea_orm::QueryFilter;
+    use sea_orm::sea_query::Expr;
+
+    remove_agent_endpoint_files(agent_sock_path);
+
+    // Mark run as terminated with exit code and reason.
+    let _ = run_entity::Entity::update_many()
+        .col_expr(
+            run_entity::Column::Status,
+            Expr::value(run_entity::RunStatus::Terminated),
+        )
+        .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
+        .col_expr(run_entity::Column::TerminationDetail, Expr::value(detail))
+        .col_expr(run_entity::Column::ExitCode, Expr::value(exit_code))
+        .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
+        .filter(run_entity::Column::Id.eq(run_id))
+        .exec(db)
+        .await;
+
+    // Mark sandbox as stopped.
+    let _ = sandbox_entity::Entity::update_many()
+        .col_expr(
+            sandbox_entity::Column::Status,
+            Expr::value(sandbox_entity::SandboxStatus::Stopped),
+        )
+        .col_expr(
+            sandbox_entity::Column::ActiveConfig,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
+        .filter(sandbox_entity::Column::Id.eq(sandbox_id))
+        .exec(db)
+        .await;
+}
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -2580,6 +2805,61 @@ mod tests {
     }
 
     #[test]
+    fn forced_exit_stays_disarmed_without_a_handoff_init() {
+        let forced = super::ForcedExit::new(false);
+        assert!(
+            !forced.force(),
+            "an agentd-as-PID-1 sandbox records no forced exit"
+        );
+        assert!(
+            !forced.observer_started(),
+            "so its exit stays clean, exactly as before"
+        );
+    }
+
+    #[test]
+    fn forced_exit_records_an_expired_deadline() {
+        let forced = super::ForcedExit::new(true);
+        assert!(forced.force(), "the first expired deadline forces the exit");
+        assert!(!forced.force(), "a second sleeper adds nothing");
+        assert!(
+            forced.observer_started(),
+            "the observer sees the forced exit"
+        );
+    }
+
+    #[test]
+    fn forced_exit_ignores_a_sleeper_that_lost_the_race() {
+        let forced = super::ForcedExit::new(true);
+        assert!(
+            !forced.observer_started(),
+            "a guest that powered off on its own is a clean exit"
+        );
+        assert!(
+            !forced.force(),
+            "a sleeper waking after the observer started must change nothing"
+        );
+        assert!(
+            !forced.observer_started(),
+            "the verdict stays clean once the observer has claimed it"
+        );
+    }
+
+    #[test]
+    fn sdk_handoff_env_selects_shutdown_grace() {
+        assert!(!super::has_handoff_init(&[]));
+        assert!(super::has_handoff_init(&[
+            "MSB_HANDOFF_INIT=/lib/systemd/systemd".into()
+        ]));
+        assert!(super::has_handoff_init(&["MSB_HANDOFF_INIT=auto".into()]));
+        assert!(!super::has_handoff_init(&["MSB_HANDOFF_INIT=".into()]));
+        assert!(!super::has_handoff_init(&[
+            "MSB_HANDOFF_INIT=/sbin/init".into(),
+            "MSB_HANDOFF_INIT=".into(),
+        ]));
+    }
+
+    #[test]
     fn test_guest_shutdown_flush_timeout_accepts_ms_override() {
         assert_eq!(
             guest_shutdown_flush_timeout_with_override(false, Some("0")),
@@ -2693,5 +2973,248 @@ mod tests {
         let mut env = vec!["PATH=/.msb/scripts:/usr/bin".to_string()];
         prepend_scripts_path(&mut env);
         assert_eq!(env, vec!["PATH=/.msb/scripts:/usr/bin".to_string()]);
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Tests: Teardown Ordering
+    //----------------------------------------------------------------------------------------------
+
+    mod teardown {
+        use std::time::Duration;
+
+        use microsandbox_db::DbWriteConnection;
+        use microsandbox_db::entity::{run as run_entity, sandbox as sandbox_entity};
+        use microsandbox_migration::{Migrator, MigratorTrait};
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
+        };
+        use tempfile::TempDir;
+
+        use crate::vm::{RunTermination, finish_terminated_run, remove_agent_endpoint_files};
+
+        /// A sandbox row, its running run, and the two endpoint files a live
+        /// sandbox process owns.
+        struct Fixture {
+            _dir: TempDir,
+            db_path: std::path::PathBuf,
+            db: DbWriteConnection,
+            sandbox_id: i32,
+            run_id: i32,
+            agent_sock: std::path::PathBuf,
+            control_sock: std::path::PathBuf,
+        }
+
+        async fn fixture() -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("test.db");
+            // A generous busy timeout: one test deliberately freezes the
+            // database under this connection and must not race SQLITE_BUSY.
+            let db =
+                DbWriteConnection::open(&db_path, Duration::from_secs(5), Duration::from_secs(30))
+                    .await
+                    .unwrap();
+            Migrator::up(db.inner(), None).await.unwrap();
+
+            let now = chrono::Utc::now().naive_utc();
+            let sandbox_id = sandbox_entity::ActiveModel {
+                name: Set("soft-reset".to_string()),
+                config: Set("{}".to_string()),
+                status: Set(sandbox_entity::SandboxStatus::Running),
+                ephemeral: Set(false),
+                created_at: Set(Some(now)),
+                updated_at: Set(Some(now)),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap()
+            .id;
+            let run_id = run_entity::ActiveModel {
+                sandbox_id: Set(sandbox_id),
+                pid: Set(Some(std::process::id() as i32)),
+                status: Set(run_entity::RunStatus::Running),
+                started_at: Set(Some(now)),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap()
+            .id;
+
+            let agent_sock = dir.path().join("soft-reset.sock");
+            let control_sock = crate::control::control_socket_path_for(&agent_sock);
+            std::fs::write(&agent_sock, b"").unwrap();
+            std::fs::write(&control_sock, b"").unwrap();
+
+            Fixture {
+                _dir: dir,
+                db_path,
+                db,
+                sandbox_id,
+                run_id,
+                agent_sock,
+                control_sock,
+            }
+        }
+
+        async fn status_of(db: &DbWriteConnection, id: i32) -> sandbox_entity::SandboxStatus {
+            sandbox_entity::Entity::find_by_id(id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+        }
+
+        #[test]
+        fn removes_both_endpoint_files() {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_sock = dir.path().join("name.sock");
+            let control_sock = crate::control::control_socket_path_for(&agent_sock);
+            std::fs::write(&agent_sock, b"").unwrap();
+            std::fs::write(&control_sock, b"").unwrap();
+
+            remove_agent_endpoint_files(&agent_sock);
+
+            assert!(!agent_sock.exists(), "agent socket should be gone");
+            assert!(!control_sock.exists(), "control socket should be gone");
+            // Idempotent: a second teardown pass must not panic or error.
+            remove_agent_endpoint_files(&agent_sock);
+        }
+
+        #[tokio::test]
+        async fn terminal_row_leaves_no_endpoint_files() {
+            let f = fixture().await;
+
+            finish_terminated_run(
+                &f.db,
+                &f.agent_sock,
+                f.sandbox_id,
+                f.run_id,
+                RunTermination {
+                    exit_code: 0,
+                    reason: run_entity::TerminationReason::ShutdownRequested,
+                    detail: None,
+                },
+                chrono::Utc::now().naive_utc(),
+            )
+            .await;
+
+            assert_eq!(
+                status_of(&f.db, f.sandbox_id).await,
+                sandbox_entity::SandboxStatus::Stopped
+            );
+            let run = run_entity::Entity::find_by_id(f.run_id)
+                .one(&f.db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.status, run_entity::RunStatus::Terminated);
+            assert_eq!(run.exit_code, Some(0));
+            assert!(!f.agent_sock.exists(), "agent socket should be gone");
+            assert!(!f.control_sock.exists(), "control socket should be gone");
+        }
+
+        /// The guarantee a caller depends on: by the time anything can read a
+        /// terminal row, the endpoint files are already unlinked.
+        ///
+        /// Proven by freezing the database — a second connection holds the
+        /// SQLite write lock — and watching the files disappear while no write
+        /// can possibly have landed. Fails if the unlink is ever moved after
+        /// either terminal write.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn endpoint_files_are_gone_before_any_terminal_write() {
+            let f = fixture().await;
+
+            // Freeze the database: an open write transaction on its own
+            // connection holds the single SQLite write lock.
+            let blocker = DbWriteConnection::open(
+                &f.db_path,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            let txn = blocker.inner().begin().await.unwrap();
+            sandbox_entity::Entity::update_many()
+                .col_expr(
+                    sandbox_entity::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(chrono::Utc::now().naive_utc()),
+                )
+                .filter(sandbox_entity::Column::Id.eq(f.sandbox_id))
+                .exec(&txn)
+                .await
+                .unwrap();
+
+            let db = f.db.clone();
+            let agent_sock = f.agent_sock.clone();
+            let finisher = tokio::spawn(async move {
+                finish_terminated_run(
+                    &db,
+                    &agent_sock,
+                    f.sandbox_id,
+                    f.run_id,
+                    RunTermination {
+                        exit_code: 0,
+                        reason: run_entity::TerminationReason::ShutdownRequested,
+                        detail: None,
+                    },
+                    chrono::Utc::now().naive_utc(),
+                )
+                .await;
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut unlinked_while_frozen = false;
+            while std::time::Instant::now() < deadline {
+                if !f.agent_sock.exists() && !f.control_sock.exists() {
+                    unlinked_while_frozen = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            // Read the rows on a connection of their own — `f.db` is a
+            // single-connection write pool and the blocked finisher is holding
+            // it — to show the frozen window really does precede both writes.
+            let reader = DbWriteConnection::open(
+                &f.db_path,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            let frozen_status = status_of(&reader, f.sandbox_id).await;
+            let frozen_run_status = run_entity::Entity::find_by_id(f.run_id)
+                .one(&reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+
+            // Nothing terminal can have been written yet: we still hold the
+            // write lock. Thaw, then let the writes land.
+            txn.rollback().await.unwrap();
+            finisher.await.unwrap();
+
+            assert_eq!(
+                frozen_status,
+                sandbox_entity::SandboxStatus::Running,
+                "the frozen window must precede the sandbox write"
+            );
+            assert_eq!(
+                frozen_run_status,
+                run_entity::RunStatus::Running,
+                "the frozen window must precede the run write"
+            );
+            assert!(
+                unlinked_while_frozen,
+                "endpoint files still present while the terminal writes were blocked"
+            );
+            assert_eq!(
+                status_of(&f.db, f.sandbox_id).await,
+                sandbox_entity::SandboxStatus::Stopped
+            );
+        }
     }
 }

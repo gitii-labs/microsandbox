@@ -49,6 +49,7 @@ use std::{
 };
 
 use base64::Engine;
+mod disk;
 use microsandbox::{
     AgentBridge, LogLevel, MicrosandboxError, RegistryAuth, Sandbox, Snapshot, UpperVerifyStatus,
     default_backend,
@@ -919,6 +920,14 @@ struct OAuthSecretOpts {
     broker_endpoint: String,
     grant_id: String,
     token_endpoint: String,
+    #[serde(default)]
+    device_code_endpoint: Option<String>,
+    #[serde(default)]
+    poll_endpoint: Option<String>,
+    #[serde(default)]
+    poll_secret_fields: Vec<String>,
+    #[serde(default)]
+    mint_endpoints: Vec<MintEndpointOpts>,
     inject_hosts: Vec<String>,
     access_token_field: String,
     refresh_token_field: String,
@@ -926,6 +935,15 @@ struct OAuthSecretOpts {
     refresh_env_var: String,
     access_sentinel: String,
     refresh_sentinel: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MintEndpointOpts {
+    host: String,
+    path: String,
+    field: String,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1725,12 +1743,25 @@ fn apply_oauth_secret(
     oauth: OAuthSecretOpts,
 ) -> microsandbox::sandbox::SandboxBuilder {
     use microsandbox::sandbox::OAuthSecret;
-    use microsandbox_network::secrets::config::HostPattern;
+    use microsandbox_network::secrets::config::{HostPattern, MintEndpoint};
 
     builder.oauth_secret(OAuthSecret {
         broker_endpoint: oauth.broker_endpoint,
         grant_id: oauth.grant_id,
         token_endpoint: oauth.token_endpoint,
+        device_code_endpoint: oauth.device_code_endpoint,
+        poll_endpoint: oauth.poll_endpoint,
+        poll_secret_fields: oauth.poll_secret_fields,
+        mint_endpoints: oauth
+            .mint_endpoints
+            .into_iter()
+            .map(|mint| MintEndpoint {
+                host: mint.host,
+                path: mint.path,
+                field: mint.field,
+                port: mint.port,
+            })
+            .collect(),
         inject_hosts: oauth
             .inject_hosts
             .iter()

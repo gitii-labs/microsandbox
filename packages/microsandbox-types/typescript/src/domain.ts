@@ -87,6 +87,34 @@ export type HostPermissions = "private" | "mirror";
 
 export type HostPattern = { "exact": string } | { "wildcard": string } | "any";
 
+export type MintEndpoint = {
+  /**
+   * Exact hostname the request is addressed to, matched case-insensitively
+   * against the TLS SNI. Bare host only: no scheme, port, path or userinfo.
+   */
+  host: string;
+  /**
+   * Exact request path, with no query string of its own.
+   *
+   * A request is matched on its path alone: whatever query the sandbox
+   * appends, the endpoint it reached is this one. Must start with `/`.
+   */
+  path: string;
+  /**
+   * TCP port the endpoint is reached on. `None` is 443.
+   *
+   * The other endpoints carry their port in their URL and match on it;
+   * this one is a host and a path, so it says its port here. A grant whose
+   * inject host is served on another port names that port, or its mint
+   * endpoint quietly never matches.
+   */
+  port?: number | null;
+  /**
+   * Top-level JSON field of the response that carries the minted secret.
+   */
+  field: string;
+};
+
 export type OAuthSecret = {
   /**
    * Host broker Unix-domain socket path.
@@ -101,6 +129,68 @@ export type OAuthSecret = {
    */
   token_endpoint: string;
   /**
+   * Exact HTTPS device-code endpoint (RFC 8628), when the grant is obtained
+   * by a device flow.
+   *
+   * Requests to it carry no grant material and are forwarded unmodified;
+   * the endpoint only has to be known so the grant is loaded for the
+   * connection that carries the rest of the device flow.
+   */
+  device_code_endpoint?: string | null;
+  /**
+   * Exact HTTPS device-code polling endpoint (RFC 8628).
+   *
+   * A `POST` here is a token request: a response carrying
+   * [`access_token_field`](Self::access_token_field) is committed to the
+   * broker and sanitized like a token-endpoint response, while the
+   * `authorization_pending`, `slow_down`, `expired_token` and
+   * `access_denied` errors are forwarded untouched. May be the same URL as
+   * [`token_endpoint`](Self::token_endpoint).
+   */
+  poll_endpoint?: string | null;
+  /**
+   * Extra secret JSON fields in a poll response, such as the proprietary
+   * `authorization_code` and `code_verifier` some providers return before
+   * the real token exchange.
+   *
+   * Each is replaced with a sentinel before the guest sees it, and
+   * substituted back on a later token request. The real values are held in
+   * memory for the life of the connection that received them, so the
+   * exchange has to happen on that connection.
+   *
+   * Only top-level string fields of the response object are inspected: a
+   * secret nested inside another object, or under a field name that is not
+   * listed here, stays on the verbatim path and reaches the sandbox.
+   */
+  poll_secret_fields: Array<string>;
+  /**
+   * Endpoints that mint a new long-lived secret in their response.
+   *
+   * A token endpoint hands back the grant's own tokens; these hand back
+   * something else. Anthropic's console mode, for instance, `POST`s to
+   * `https://api.anthropic.com/api/oauth/claude_cli/create_api_key` with
+   * the access token and gets a fresh API key in `raw_key`. Nothing about
+   * that key is known to the broker beforehand, so without an entry here
+   * it reaches the sandbox in the clear.
+   *
+   * A `POST` to an exact host and path listed here whose 2xx JSON response
+   * carries [`field`](MintEndpoint::field) as a top-level string is minted:
+   * the broker stores the value and names a sentinel, the sandbox is handed
+   * the sentinel instead, and later requests to this grant's inject hosts
+   * have the sentinel substituted back.
+   *
+   * The host must be one of [`inject_hosts`](Self::inject_hosts) or the
+   * token endpoint's host: a mint endpoint is loaded for its own host and
+   * port, so one naming a host the grant says nothing else about is a
+   * grant reaching somewhere it never declared.
+   *
+   * It is the endpoint's own host *and port* that load the grant, so an
+   * endpoint served anywhere but 443 has to name its port in
+   * [`port`](MintEndpoint::port) or the connection carrying it is never
+   * recognised.
+   */
+  mint_endpoints: Array<MintEndpoint>;
+  /**
    * Hosts where the access sentinel may be substituted.
    */
   inject_hosts: Array<HostPattern>;
@@ -110,6 +200,10 @@ export type OAuthSecret = {
   access_token_field: string;
   /**
    * JSON field carrying the refresh token in successful token responses.
+   *
+   * May be the same field as
+   * [`access_token_field`](Self::access_token_field): a device flow without
+   * a refresh grant hands the same value back for both.
    */
   refresh_token_field: string;
   /**
@@ -121,11 +215,23 @@ export type OAuthSecret = {
    */
   refresh_env_var: string;
   /**
-   * Per-sandbox access-token sentinel.
+   * Per-sandbox access-token sentinel, the value the guest starts with.
+   *
+   * It may be opaque, or JWT-shaped for a client that decodes the token to
+   * read its claims: the real token's header and payload copied verbatim
+   * with only the signature replaced. A JWT-shaped sentinel mirrors claims
+   * that change on every login and refresh, so the broker may hand back a
+   * replacement with the tokens it loads or commits, and that replacement
+   * supersedes this value for the connection that received it.
+   *
+   * Must be non-empty, at most 8192 bytes (`MAX_OAUTH_SENTINEL_BYTES`),
+   * and must not contain NUL, CR, or LF. No two sentinels, whether on this
+   * grant or another, may be equal or contain one another.
    */
   access_sentinel: string;
   /**
-   * Per-sandbox refresh-token sentinel.
+   * Per-sandbox refresh-token sentinel, under the same rules as the access
+   * sentinel above.
    */
   refresh_sentinel: string;
 };

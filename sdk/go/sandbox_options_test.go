@@ -2,12 +2,44 @@ package microsandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStopTimeoutMillis(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		opts []StopOption
+		want uint64
+	}{
+		{"default allows runtime grace and handoff", nil, 150_000},
+		{"explicit deadline", []StopOption{WithStopTimeout(2500 * time.Millisecond)}, 2500},
+		{"zero marshals as zero milliseconds", []StopOption{WithStopTimeout(0)}, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := stopTimeoutMillis(test.opts); got != test.want {
+				t.Fatalf("stopTimeoutMillis = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCheckedStopTimeoutMillisRejectsZero(t *testing.T) {
+	if _, err := checkedStopTimeoutMillis([]StopOption{WithStopTimeout(0)}); !errors.Is(err, errZeroStopTimeout) {
+		t.Fatalf("checkedStopTimeoutMillis(0) error = %v, want errZeroStopTimeout", err)
+	}
+	if _, err := checkedStopTimeoutMillis([]StopOption{WithStopTimeout(-1 * time.Second)}); !errors.Is(err, errZeroStopTimeout) {
+		t.Fatalf("a negative deadline must be rejected too, got %v", err)
+	}
+	millis, err := checkedStopTimeoutMillis([]StopOption{WithStopTimeout(2500 * time.Millisecond)})
+	if err != nil || millis != 2500 {
+		t.Fatalf("checkedStopTimeoutMillis = (%d, %v), want (2500, nil)", millis, err)
+	}
+}
 
 func marshalCreateOptions(t *testing.T, opts ...SandboxOption) map[string]any {
 	t.Helper()
@@ -648,9 +680,18 @@ func TestFFIWireShape_Secrets(t *testing.T) {
 
 func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 	got := marshalCreateOptions(t, WithOAuthSecrets(OAuthSecretConfig{
-		BrokerEndpoint:    "/run/msb/oauth.sock",
-		GrantID:           "opaque-42",
-		TokenEndpoint:     "https://login.example.com/oauth/token",
+		BrokerEndpoint:     "/run/msb/oauth.sock",
+		GrantID:            "opaque-42",
+		TokenEndpoint:      "https://login.example.com/oauth/token",
+		DeviceCodeEndpoint: "https://login.example.com/oauth/device/code",
+		PollEndpoint:       "https://login.example.com/oauth/device/token",
+		PollSecretFields:   []string{"authorization_code", "code_verifier"},
+		MintEndpoints: []OAuthMintEndpoint{{
+			Host:  "api.example.com",
+			Path:  "/api/oauth/claude_cli/create_api_key",
+			Field: "raw_key",
+			Port:  8443,
+		}},
 		InjectHosts:       []string{"api.example.com", "*.service.example.com"},
 		AccessTokenField:  "access_token",
 		RefreshTokenField: "refresh_token",
@@ -665,19 +706,42 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 	}
 	grant := grants[0].(map[string]any)
 	for key, want := range map[string]string{
-		"broker_endpoint":     "/run/msb/oauth.sock",
-		"grant_id":            "opaque-42",
-		"token_endpoint":      "https://login.example.com/oauth/token",
-		"access_token_field":  "access_token",
-		"refresh_token_field": "refresh_token",
-		"access_env_var":      "OAUTH_ACCESS_TOKEN",
-		"refresh_env_var":     "OAUTH_REFRESH_TOKEN",
-		"access_sentinel":     "$MSB_OAUTH_ACCESS_abc",
-		"refresh_sentinel":    "$MSB_OAUTH_REFRESH_abc",
+		"broker_endpoint":      "/run/msb/oauth.sock",
+		"grant_id":             "opaque-42",
+		"token_endpoint":       "https://login.example.com/oauth/token",
+		"device_code_endpoint": "https://login.example.com/oauth/device/code",
+		"poll_endpoint":        "https://login.example.com/oauth/device/token",
+		"access_token_field":   "access_token",
+		"refresh_token_field":  "refresh_token",
+		"access_env_var":       "OAUTH_ACCESS_TOKEN",
+		"refresh_env_var":      "OAUTH_REFRESH_TOKEN",
+		"access_sentinel":      "$MSB_OAUTH_ACCESS_abc",
+		"refresh_sentinel":     "$MSB_OAUTH_REFRESH_abc",
 	} {
 		if grant[key] != want {
 			t.Fatalf("%s = %v, want %q", key, grant[key], want)
 		}
+	}
+	mints, ok := grant["mint_endpoints"].([]any)
+	if !ok || len(mints) != 1 {
+		t.Fatalf("mint_endpoints = %v", grant["mint_endpoints"])
+	}
+	mint := mints[0].(map[string]any)
+	for key, want := range map[string]string{
+		"host":  "api.example.com",
+		"path":  "/api/oauth/claude_cli/create_api_key",
+		"field": "raw_key",
+	} {
+		if mint[key] != want {
+			t.Fatalf("mint_endpoints[0].%s = %v, want %q", key, mint[key], want)
+		}
+	}
+	if mint["port"] != float64(8443) {
+		t.Fatalf("mint_endpoints[0].port = %v", mint["port"])
+	}
+	fields, ok := grant["poll_secret_fields"].([]any)
+	if !ok || len(fields) != 2 || fields[0] != "authorization_code" || fields[1] != "code_verifier" {
+		t.Fatalf("poll_secret_fields = %v", grant["poll_secret_fields"])
 	}
 	for _, forbidden := range []string{"access", "refresh", "value"} {
 		if _, ok := grant[forbidden]; ok {

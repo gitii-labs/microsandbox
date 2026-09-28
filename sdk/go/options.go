@@ -1287,9 +1287,24 @@ type SecretEnvOptions struct {
 // OAuthSecretConfig configures provider-neutral OAuth token protection.
 // Token values are never part of this durable configuration.
 type OAuthSecretConfig struct {
-	BrokerEndpoint    string
-	GrantID           string
-	TokenEndpoint     string
+	BrokerEndpoint string
+	GrantID        string
+	TokenEndpoint  string
+	// DeviceCodeEndpoint is the exact HTTPS RFC 8628 device-code URL, when
+	// the grant is obtained by a device flow. Requests to it are forwarded
+	// unmodified.
+	DeviceCodeEndpoint string
+	// PollEndpoint is the exact HTTPS device-code polling URL. It may be the
+	// same URL as TokenEndpoint.
+	PollEndpoint string
+	// PollSecretFields names extra secret JSON fields in a poll response that
+	// are replaced with sentinels before the sandbox sees them.
+	PollSecretFields []string
+	// MintEndpoints names exact endpoints whose response mints a new
+	// long-lived secret, such as an API key created from an OAuth session.
+	// The secret is stored by the broker and the sandbox is handed a
+	// sentinel instead.
+	MintEndpoints     []OAuthMintEndpoint
 	InjectHosts       []string
 	AccessTokenField  string
 	RefreshTokenField string
@@ -1297,6 +1312,19 @@ type OAuthSecretConfig struct {
 	RefreshEnvVar     string
 	AccessSentinel    string
 	RefreshSentinel   string
+}
+
+// OAuthMintEndpoint is one exact endpoint whose response mints a new secret.
+type OAuthMintEndpoint struct {
+	// Host is the bare hostname the request is addressed to.
+	Host string
+	// Path is the exact request path, with no query string of its own: a
+	// request is matched on its path, whatever query the sandbox appends.
+	Path string
+	// Field is the top-level JSON response field carrying the new secret.
+	Field string
+	// Port is the TCP port the endpoint is reached on. Zero means 443.
+	Port uint16
 }
 
 // secretFactory is the factory namespace matching Node's `Secret.env(...)` and

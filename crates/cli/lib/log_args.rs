@@ -28,7 +28,9 @@ pub struct LogArgs {
     #[arg(long, global = true, conflicts_with_all = ["error", "warn", "info", "trace"])]
     pub debug: bool,
 
-    /// Show all diagnostic logs (most verbose).
+    /// Show all diagnostics, including complete intercepted HTTP headers and bodies.
+    ///
+    /// Traffic is not sanitized or redacted and may contain credentials.
     #[arg(long, global = true, conflicts_with_all = ["error", "warn", "info", "debug"])]
     pub trace: bool,
 }
@@ -36,6 +38,13 @@ pub struct LogArgs {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+const DENIAL_TARGET: &str = "microsandbox::network::policy::denial";
+
+/// Target of the credential-shaped-response detector's warnings. Like a
+/// denial, the finding is only ever seen by a consumer reading the runtime
+/// log, so it survives the silent default too.
+const DETECTOR_TARGET: &str = "microsandbox::network::secrets::detector";
 
 /// Install a tracing subscriber for the selected level.
 ///
@@ -57,6 +66,37 @@ pub fn init_tracing(log_level: Option<LogLevel>, ansi: bool) {
             .with_env_filter(filter)
             .with_ansi(ansi)
             .init();
+    }
+}
+
+/// Install tracing for a sandbox subprocess whose stderr is its runtime log.
+/// With no requested diagnostic level, only policy denials and
+/// credential-shaped-response warnings remain visible.
+pub fn init_sandbox_tracing(log_level: Option<LogLevel>) {
+    let filter = sandbox_filter(log_level);
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .init();
+}
+
+fn sandbox_filter(log_level: Option<LogLevel>) -> EnvFilter {
+    match log_level {
+        Some(level) => EnvFilter::new(level.as_tracing_level().to_string())
+            // oci_client logs auth tokens at debug level.
+            .add_directive("oci_client=info".parse::<Directive>().unwrap()),
+        None => EnvFilter::new("off")
+            .add_directive(
+                format!("{DENIAL_TARGET}=warn")
+                    .parse::<Directive>()
+                    .unwrap(),
+            )
+            .add_directive(
+                format!("{DETECTOR_TARGET}=warn")
+                    .parse::<Directive>()
+                    .unwrap(),
+            ),
     }
 }
 
@@ -91,6 +131,8 @@ impl LogArgs {
 mod tests {
     use super::*;
     use clap::{Parser, Subcommand};
+    use tracing::Level;
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[derive(Debug, Parser)]
     struct TestCli {
@@ -125,5 +167,41 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("--debug"));
         assert!(rendered.contains("--info"));
+    }
+
+    #[test]
+    fn test_sandbox_without_a_level_keeps_only_denial_warnings() {
+        let subscriber = tracing_subscriber::registry().with(sandbox_filter(None));
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(target: "microsandbox::runtime", Level::WARN));
+            assert!(tracing::enabled!(target: DENIAL_TARGET, Level::WARN));
+            assert!(!tracing::enabled!(target: DENIAL_TARGET, Level::INFO));
+            assert!(!tracing::enabled!(target: "oci_client", Level::INFO));
+        });
+    }
+
+    #[test]
+    fn test_sandbox_without_a_level_keeps_credential_detector_warnings() {
+        // The detector exists to say a credential reached the sandbox that
+        // nothing was watching for. A default that filtered it out would be
+        // the same silence it is built to break.
+        let subscriber = tracing_subscriber::registry().with(sandbox_filter(None));
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: DETECTOR_TARGET, Level::WARN));
+            assert!(!tracing::enabled!(target: DETECTOR_TARGET, Level::INFO));
+        });
+    }
+
+    #[test]
+    fn test_sandbox_with_debug_keeps_the_oci_safety_cap() {
+        let subscriber = tracing_subscriber::registry().with(sandbox_filter(Some(LogLevel::Debug)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(target: "microsandbox::runtime", Level::DEBUG));
+            assert!(tracing::enabled!(target: "oci_client", Level::INFO));
+            assert!(!tracing::enabled!(target: "oci_client", Level::DEBUG));
+        });
     }
 }
