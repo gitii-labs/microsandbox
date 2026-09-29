@@ -670,8 +670,18 @@ async fn handle_message(
             .await?;
             // The relay SIGKILLs the owner's exec sessions before this message;
             // their ExecExited frames still carry the owner's IDs, so release
-            // only once the last of them has passed.
-            if has_exec_sessions_in_owner_range(&state.sessions, &disconnected) {
+            // only once the last of them has passed. Detached, each exits once
+            // its direct child is reaped rather than when its output closes.
+            let mut owner_has_sessions = false;
+            for (_, session) in state
+                .sessions
+                .iter_mut()
+                .filter(|(id, _)| in_owner_range(**id, &disconnected))
+            {
+                session.detach();
+                owner_has_sessions = true;
+            }
+            if owner_has_sessions {
                 state.pending_releases.push(disconnected);
             } else {
                 queue_owner_release(&disconnected, session_tx)?;
@@ -914,10 +924,10 @@ fn complete_raw_session(
 /// Reports an exec session's exit and releases any disconnected owner whose
 /// last exec session it was.
 ///
-/// A session exits once its output reaches EOF, so a descendant that left the
-/// process group the relay SIGKILLs keeps its owner's release, and with it the
-/// relay slot, pending until it closes the output. Releasing earlier would hand
-/// its late frames to the slot's next client.
+/// A disconnected owner's sessions are detached: each exits once its direct
+/// child is reaped, even while a descendant that left the SIGKILLed process
+/// group holds the output open, and nothing carrying its ID follows the exit.
+/// So the release, and with it the relay slot, never waits on a descendant.
 fn finish_exec_session(
     id: u32,
     code: i32,
@@ -945,9 +955,11 @@ fn has_exec_sessions_in_owner_range(
     sessions: &HashMap<u32, ExecSession>,
     owner: &RelayClientDisconnected,
 ) -> bool {
-    sessions
-        .keys()
-        .any(|id| *id >= owner.id_start && *id < owner.id_end_exclusive)
+    sessions.keys().any(|id| in_owner_range(*id, owner))
+}
+
+fn in_owner_range(id: u32, owner: &RelayClientDisconnected) -> bool {
+    id >= owner.id_start && id < owner.id_end_exclusive
 }
 
 /// Queues the release barrier behind all old session output, not into the
@@ -1530,6 +1542,145 @@ mod tests {
         assert_eq!(id, 13);
         finish_exec_session(id, code, &mut state, &tx, &mut out).unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A disconnected owner's exec whose descendant left the process group
+    /// with the output inherited, released once the direct child is reaped.
+    struct DetachedDescendant {
+        tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
+        rx: mpsc::UnboundedReceiver<(u32, SessionOutput)>,
+        state: AgentState,
+        /// Leader of the descendant's own session and process group.
+        descendant: libc::pid_t,
+    }
+
+    async fn release_with_detached_descendant(tty: bool) -> DetachedDescendant {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AgentState::default();
+        let mut activity = ActivityTracker::new();
+        let mut out = Vec::new();
+        let config = AgentdConfig {
+            user: None,
+            security_profile: Default::default(),
+            handoff_init_path: None,
+        };
+        // The descendant escapes the exec's process group with stdout and
+        // stderr inherited, reports its PID, and writes once more on SIGUSR1.
+        let script = r#"setsid sh -c 'trap "echo late; exit 0" USR1; echo $$; sleep 60 & wait' &
+exec sleep 60"#;
+        let request = ExecRequest {
+            cmd: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+        handle_message(
+            Message::with_payload(MessageType::ExecRequest, 3, &request).unwrap(),
+            &mut state,
+            &mut activity,
+            &tx,
+            &mut out,
+            &config,
+        )
+        .await
+        .unwrap();
+        let started = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+        assert_eq!((started.id, started.t), (3, MessageType::ExecStarted));
+
+        let mut line = Vec::new();
+        while !line.contains(&b'\n') {
+            let (id, output) = time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let SessionOutput::Stdout(data) = output else {
+                panic!("expected the descendant's PID on stdout");
+            };
+            assert_eq!(id, 3);
+            line.extend_from_slice(&data);
+        }
+        let descendant: libc::pid_t = std::str::from_utf8(&line).unwrap().trim().parse().unwrap();
+
+        let owner = RelayClientDisconnected {
+            id_start: 1,
+            id_end_exclusive: 10,
+        };
+        for message in [
+            Message::with_payload(MessageType::ExecSignal, 3, &ExecSignal { signal: 9 }).unwrap(),
+            Message::with_payload(MessageType::RelayClientDisconnected, 0, &owner).unwrap(),
+        ] {
+            handle_message(message, &mut state, &mut activity, &tx, &mut out, &config)
+                .await
+                .unwrap();
+        }
+        assert!(out.is_empty());
+
+        // The descendant holds the output open for another minute; the exit
+        // must not wait for it.
+        let (id, output) = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the exit waited for the descendant")
+            .unwrap();
+        let SessionOutput::Exited(code) = output else {
+            panic!("expected the killed session's exit before the owner release");
+        };
+        assert_eq!((id, code), (3, -1));
+        finish_exec_session(id, code, &mut state, &tx, &mut out).unwrap();
+        let exited = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+        assert_eq!((exited.id, exited.t), (3, MessageType::ExecExited));
+        let (_, SessionOutput::Raw(mut raw)) = rx.try_recv().unwrap() else {
+            panic!("expected the owner release");
+        };
+        let released = codec::try_decode_from_buf(&mut raw.frame).unwrap().unwrap();
+        assert_eq!(released.t, MessageType::RelayClientReleased);
+        assert!(state.pending_releases.is_empty());
+        assert!(state.sessions.is_empty());
+        assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant died");
+
+        DetachedDescendant {
+            tx,
+            rx,
+            state,
+            descendant,
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_release_does_not_wait_for_detached_descendant() {
+        let DetachedDescendant {
+            tx,
+            mut rx,
+            state,
+            descendant,
+        } = release_with_detached_descendant(false).await;
+
+        // The descendant writes once more, then closes the output. The
+        // channel closes once the reporter has drained it; nothing it read
+        // may follow the release.
+        assert_eq!(unsafe { libc::kill(-descendant, libc::SIGUSR1) }, 0);
+        drop((tx, state));
+        let after_release = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the reporter outlived the descendant's output");
+        assert!(
+            after_release.is_none(),
+            "a frame for session 3 followed the owner release"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_release_does_not_wait_for_detached_pty_descendant() {
+        let released = release_with_detached_descendant(true).await;
+        assert!(released.rx.is_empty());
+        assert_eq!(
+            unsafe { libc::kill(-released.descendant, libc::SIGKILL) },
+            0
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use std::{iter, mem, ptr};
 use nix::pty;
 use nix::sys::signal::Signal;
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use microsandbox_protocol::exec::{ExecFailed, ExecFailureKind, ExecRequest};
 
@@ -131,6 +131,9 @@ pub struct ExecSession {
 
     /// The child's stdin (only for pipe mode).
     stdin: Option<tokio::process::ChildStdin>,
+
+    /// Tells the reporter task no client waits for this session's output.
+    detach: Option<oneshot::Sender<()>>,
 }
 
 /// Output from a session that the agent loop should forward to the host.
@@ -364,6 +367,18 @@ impl ExecSession {
     pub fn close_stdin(&mut self) {
         self.stdin.take();
     }
+
+    /// Reports the session as exited once its direct child is reaped, and
+    /// discards its output from then on.
+    ///
+    /// For a session whose client is gone: a descendant that left the process
+    /// group can hold the output open for as long as it lives, and the
+    /// session's ID must not wait for it.
+    pub fn detach(&mut self) {
+        if let Some(detach) = self.detach.take() {
+            let _ = detach.send(());
+        }
+    }
 }
 
 impl ExecSession {
@@ -569,13 +584,17 @@ impl ExecSession {
         let reader_fd = unsafe { OwnedFd::from_raw_fd(reader_fd) };
 
         // Spawn background reader task.
-        tokio::spawn(pty_reader_task(id, reader_fd, exit_watcher, tx));
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let (detach, detached) = oneshot::channel();
+        tokio::task::spawn_blocking(move || read_pty(reader_fd, output_tx));
+        tokio::spawn(report_session(id, output_rx, exit_watcher, detached, tx));
 
         Ok(Self {
             process_identity,
             process_manager: Arc::clone(process_manager),
             pty_master: Some(pty.master),
             stdin: None,
+            detach: Some(detach),
         })
     }
 
@@ -642,13 +661,22 @@ impl ExecSession {
         let process_identity = exit_watcher.identity();
 
         // Spawn background reader task.
-        tokio::spawn(pipe_reader_task(id, stdout, stderr, exit_watcher, tx));
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        let (detach, detached) = oneshot::channel();
+        if let Some(stdout) = stdout {
+            tokio::spawn(read_pipe(stdout, SessionOutput::Stdout, output_tx.clone()));
+        }
+        if let Some(stderr) = stderr {
+            tokio::spawn(read_pipe(stderr, SessionOutput::Stderr, output_tx));
+        }
+        tokio::spawn(report_session(id, output_rx, exit_watcher, detached, tx));
 
         Ok(Self {
             process_identity,
             process_manager: Arc::clone(process_manager),
             pty_master: None,
             stdin,
+            detach: Some(detach),
         })
     }
 }
@@ -1160,114 +1188,101 @@ fn wait_fd_writable(fd: RawFd) -> AgentdResult<()> {
     }
 }
 
-/// Background task that reads from a PTY master fd and sends output events.
-async fn pty_reader_task(
-    id: u32,
-    master_fd: OwnedFd,
-    exit_watcher: ProcessExitWatcher,
-    tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
-) {
-    let tx_output = tx.clone();
-    let read_result = tokio::task::spawn_blocking(move || {
-        // PTY masters are safer with a dedicated blocking read loop than with
-        // edge-driven readiness. Fast writers followed by process exit can
-        // strand the tail behind a missed wakeup/HUP transition.
-        let raw = master_fd.as_raw_fd();
-        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-        if flags >= 0 {
-            unsafe { libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
-        }
+/// Blocking loop that reads a PTY master until EOF and forwards each chunk.
+fn read_pty(master_fd: OwnedFd, output: mpsc::UnboundedSender<SessionOutput>) {
+    // PTY masters are safer with a dedicated blocking read loop than with
+    // edge-driven readiness. Fast writers followed by process exit can
+    // strand the tail behind a missed wakeup/HUP transition.
+    let raw = master_fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
 
-        loop {
-            let mut buf = [0u8; 4096];
-            let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    loop {
+        let mut buf = [0u8; 4096];
+        let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
-            if n > 0 {
-                if tx_output
-                    .send((id, SessionOutput::Stdout(buf[..n as usize].to_vec())))
-                    .is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-
-            if n == 0 {
+        if n > 0 {
+            if output
+                .send(SessionOutput::Stdout(buf[..n as usize].to_vec()))
+                .is_err()
+            {
                 break;
             }
-
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EIO) => break,
-                _ => break,
-            }
+            continue;
         }
-    })
-    .await;
 
-    let _ = read_result;
+        if n == 0 {
+            break;
+        }
 
-    let code = exit_watcher.await;
-    let _ = tx.send((id, SessionOutput::Exited(code)));
+        // EIO is the master's EOF once every slave fd has closed.
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break;
+        }
+    }
 }
 
-/// Background task that reads from piped stdout/stderr and sends output events.
-async fn pipe_reader_task(
-    id: u32,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
-    exit_watcher: ProcessExitWatcher,
-    tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
+/// Reads one output pipe until EOF and forwards each chunk.
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(
+    mut pipe: R,
+    wrap: fn(Vec<u8>) -> SessionOutput,
+    output: mpsc::UnboundedSender<SessionOutput>,
 ) {
-    let mut stdout = stdout;
-    let mut stderr = stderr;
-    let mut stdout_eof = stdout.is_none();
-    let mut stderr_eof = stderr.is_none();
-
-    while !stdout_eof || !stderr_eof {
-        let mut stdout_buf = [0u8; 4096];
-        let mut stderr_buf = [0u8; 4096];
-
-        tokio::select! {
-            result = async {
-                match stdout.as_mut() {
-                    Some(out) => out.read(&mut stdout_buf).await,
-                    None => std::future::pending().await,
-                }
-            }, if !stdout_eof => {
-                match result {
-                    Ok(0) | Err(_) => {
-                        stdout = None;
-                        stdout_eof = true;
-                    }
-                    Ok(n) => {
-                        let _ = tx.send((id, SessionOutput::Stdout(stdout_buf[..n].to_vec())));
-                    }
-                }
-            }
-            result = async {
-                match stderr.as_mut() {
-                    Some(err) => err.read(&mut stderr_buf).await,
-                    None => std::future::pending().await,
-                }
-            }, if !stderr_eof => {
-                match result {
-                    Ok(0) | Err(_) => {
-                        stderr = None;
-                        stderr_eof = true;
-                    }
-                    Ok(n) => {
-                        let _ = tx.send((id, SessionOutput::Stderr(stderr_buf[..n].to_vec())));
-                    }
+    let mut buf = [0u8; 4096];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if output.send(wrap(buf[..n].to_vec())).is_err() {
+                    break;
                 }
             }
         }
     }
+}
 
-    let code = exit_watcher.await;
-
-    let _ = tx.send((id, SessionOutput::Exited(code)));
+/// Forwards a session's output, then its exit, as the session's only
+/// reporter.
+///
+/// An attached session exits once its direct child is reaped and its output
+/// has reached EOF, so output a background descendant writes still reaches
+/// the client. A detached session exits as soon as its direct child is
+/// reaped: its output is drained unreported after that, so no frame carrying
+/// its ID follows the exit.
+async fn report_session(
+    id: u32,
+    mut output: mpsc::UnboundedReceiver<SessionOutput>,
+    mut exit_watcher: ProcessExitWatcher,
+    mut detached: oneshot::Receiver<()>,
+    tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
+) {
+    let mut output_open = true;
+    let mut is_detached = false;
+    let mut code = None;
+    loop {
+        tokio::select! {
+            chunk = output.recv(), if output_open => match chunk {
+                Some(chunk) => {
+                    let _ = tx.send((id, chunk));
+                }
+                None => output_open = false,
+            },
+            exited = &mut exit_watcher, if code.is_none() => code = Some(exited),
+            // A dropped session has no client left either.
+            _ = &mut detached, if !is_detached => is_detached = true,
+        }
+        if let Some(code) = code
+            && (is_detached || !output_open)
+        {
+            let _ = tx.send((id, SessionOutput::Exited(code)));
+            break;
+        }
+    }
+    // Keep reading so a surviving descendant never blocks on, or is killed
+    // by, a closed output.
+    while output.recv().await.is_some() {}
 }
 
 //--------------------------------------------------------------------------------------------------
