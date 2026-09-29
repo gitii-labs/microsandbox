@@ -71,14 +71,9 @@ fn errno_name(e: i32) -> Option<&'static str> {
 /// Classify a fork/exec-time `errno` into one of the
 /// `ExecFailureKind` buckets.
 ///
-/// ENOENT is ambiguous in principle (missing binary vs. missing
-/// cwd), but in practice it's overwhelmingly the binary — the cwd
-/// is set in `pre_exec` *before* execvp, and a bad cwd would more
-/// commonly produce ENOTDIR (path component isn't a directory) or
-/// EACCES (no permission to chdir). We classify ENOENT as
-/// `NotFound` and ENOTDIR as `BadCwd`. Edge cases of "bad cwd that
-/// happens to ENOENT" fall through with the message "spawn 'cmd':
-/// No such file or directory" which is still understandable.
+/// ENOENT is ambiguous (missing binary vs. missing cwd); the errno
+/// alone is classified as the binary. [`spawn_process`] reclassifies a
+/// failure as `BadCwd` when the requested cwd is not a directory.
 fn classify_spawn_errno(errno: i32) -> ExecFailureKind {
     match errno {
         libc::ENOENT => ExecFailureKind::NotFound,
@@ -192,8 +187,11 @@ pub enum RawSessionCompletion {
 struct ResolvedUser {
     uid: libc::uid_t,
     gid: libc::gid_t,
+    /// The passwd name, when the uid has an entry.
+    name: Option<String>,
     /// Supplementary groups, resolved before fork: `initgroups` reads the
-    /// group database, which a forked child must not do.
+    /// group database, which a forked child must not do. Filled in only for
+    /// a user the child switches to.
     groups: Vec<libc::gid_t>,
     home_dir: Option<CString>,
 }
@@ -598,11 +596,15 @@ fn spawn_process(
     // generation are registered.
     let spawn_guard = process_manager.spawn_guard()?;
     let mut child = command.spawn().map_err(|error| {
-        AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
-            &error,
-            &cmd_label,
-            "Command::spawn",
-        ))
+        let mut failed = exec_failed_from_io_error(&error, &cmd_label, "Command::spawn");
+        // std's chdir and execvp both fail with ENOENT or ENOTDIR; a missing
+        // cwd is the one to name, since the binary was never looked up.
+        if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+            && command.get_current_dir().is_some_and(|dir| !dir.is_dir())
+        {
+            failed.kind = ExecFailureKind::BadCwd;
+        }
+        AgentdError::ExecSpawnFailed(failed)
     })?;
     let pid = child.id() as i32;
     let exit_watcher = spawn_guard.track(pid)?;
@@ -742,7 +744,15 @@ fn resolve_requested_user(
         .filter(|value| !value.is_empty())
         .or(default_user);
 
-    requested.map(resolve_user_spec).transpose()
+    requested
+        .map(|spec| {
+            let mut user = resolve_user_spec(spec)?;
+            if let Some(ref name) = user.name {
+                user.groups = lookup_group_list(name, user.gid)?;
+            }
+            Ok(user)
+        })
+        .transpose()
 }
 
 fn resolve_user_spec(spec: &str) -> AgentdResult<ResolvedUser> {
@@ -779,15 +789,11 @@ fn resolve_user_spec(spec: &str) -> AgentdResult<ResolvedUser> {
             .unwrap_or_else(|| unsafe { libc::getgid() }),
     };
 
-    let groups = match passwd_entry {
-        Some(ref entry) => lookup_group_list(&entry.name, gid)?,
-        None => Vec::new(),
-    };
-
     Ok(ResolvedUser {
         uid,
         gid,
-        groups,
+        name: passwd_entry.as_ref().map(|entry| entry.name.clone()),
+        groups: Vec::new(),
         home_dir: passwd_entry
             .as_ref()
             .and_then(|entry| entry.home_dir.as_deref())
@@ -1715,6 +1721,7 @@ mod tests {
         let user = ResolvedUser {
             uid: 1000,
             gid: 1000,
+            name: None,
             groups: Vec::new(),
             home_dir: Some(CString::new("/home/tester").unwrap()),
         };
@@ -1768,6 +1775,7 @@ mod tests {
         let user = ResolvedUser {
             uid: 1000,
             gid: 1000,
+            name: None,
             groups: Vec::new(),
             home_dir: Some(CString::new("/home/tester").unwrap()),
         };
@@ -1890,8 +1898,10 @@ mod tests {
             std::thread::spawn(move || {
                 let mut round = 0u64;
                 while !stop_writer.load(std::sync::atomic::Ordering::Relaxed) {
-                    // SAFETY: this helper process reads its environment only
-                    // through std, which serialises with this writer.
+                    // SAFETY: the spawn path reads the environment through
+                    // std's Command, which holds std's env lock across fork;
+                    // libc's own readers in this helper (NSS lookups) only
+                    // ever see a complete environ array.
                     unsafe { std::env::set_var(ENV_WRITER_VAR, round.to_string()) };
                     round += 1;
                 }
@@ -1970,6 +1980,10 @@ mod tests {
         const HOLDER_ID: u32 = 40;
         const DEADLINE: Duration = Duration::from_secs(15);
 
+        // Terminal fds this test process may itself have inherited from its
+        // launcher reach every child; only more than those is a leak.
+        let baseline_terminals = terminal_fds_above_stdio(&list_child_fds(39, false).await);
+
         let (holder_tx, mut holder_rx) = mpsc::unbounded_channel();
         let holder_req = ExecRequest {
             cmd: "/bin/sh".to_string(),
@@ -2012,62 +2026,18 @@ mod tests {
         );
 
         for (id, tty) in [(41, true), (42, false)] {
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            let req = ExecRequest {
-                cmd: "/bin/sh".to_string(),
-                args: vec![
-                    "-c".to_string(),
-                    r#"for f in /proc/$$/fd/*; do echo "${f##*/} $(readlink "$f")"; done"#
-                        .to_string(),
-                ],
-                env: Vec::new(),
-                cwd: None,
-                user: None,
-                tty,
-                rows: 24,
-                cols: 80,
-                rlimits: Vec::new(),
-            };
-            let _session = ExecSession::spawn(id, &req, tx, None, SecurityProfile::Default)
-                .expect("spawn fd listing session");
-            let mut listing = Vec::new();
-            let code = time::timeout(DEADLINE, async {
-                loop {
-                    match rx.recv().await.expect("listing output") {
-                        (_, SessionOutput::Stdout(data)) => listing.extend_from_slice(&data),
-                        (_, SessionOutput::Exited(code)) => break code,
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .expect("fd listing session exits");
-            assert_eq!(code, 0);
-
-            let listing = String::from_utf8(listing).expect("fd listing is UTF-8");
-            let fds: Vec<(u32, &str)> = listing
-                .lines()
-                .filter_map(|line| {
-                    let (fd, target) = line.trim_end_matches('\r').split_once(' ')?;
-                    Some((fd.parse().ok()?, target))
-                })
-                .collect();
-            assert!(
-                fds.iter().any(|&(fd, _)| fd == 0),
-                "tty={tty}: no fd listing:\n{listing}"
-            );
-            for &(fd, target) in &fds {
+            let fds = list_child_fds(id, tty).await;
+            for (fd, target) in &fds {
                 assert_ne!(
-                    target, holder_tty,
+                    target, &holder_tty,
                     "tty={tty}: fd {fd} is the holder's slave"
                 );
-                if fd > 2 {
-                    assert!(
-                        target != "/dev/ptmx" && !target.starts_with("/dev/pts/"),
-                        "tty={tty}: fd {fd} leaked terminal {target}:\n{listing}"
-                    );
-                }
             }
+            assert!(
+                terminal_fds_above_stdio(&fds) <= baseline_terminals,
+                "tty={tty}: terminal fds leaked beyond the {baseline_terminals} this process \
+                 already passes on: {fds:?}"
+            );
         }
 
         holder
@@ -2087,7 +2057,20 @@ mod tests {
     #[test]
     fn test_resolved_user_groups_include_primary_group() {
         let uid = unsafe { libc::getuid() };
-        let resolved = resolve_user_spec(&uid.to_string()).expect("resolve current user");
+        let req = ExecRequest {
+            cmd: "/bin/true".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            user: Some(uid.to_string()),
+            tty: false,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+        let resolved = resolve_requested_user(&req, None)
+            .expect("resolve current user")
+            .expect("a requested user");
         assert!(
             resolved.groups.contains(&resolved.gid),
             "groups {:?} lack {}",
@@ -2118,7 +2101,65 @@ mod tests {
         let AgentdError::ExecSpawnFailed(payload) = &err else {
             panic!("expected ExecSpawnFailed, got: {err:?}");
         };
+        assert_eq!(payload.kind, ExecFailureKind::BadCwd);
         assert_eq!(payload.errno, Some(libc::ENOENT));
+    }
+
+    /// Runs a shell session that lists its own open fds as `(fd, target)`.
+    async fn list_child_fds(id: u32, tty: bool) -> Vec<(u32, String)> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = ExecRequest {
+            cmd: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                r#"for f in /proc/$$/fd/*; do echo "${f##*/} $(readlink "$f")"; done"#.to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+        let _session = ExecSession::spawn(id, &req, tx, None, SecurityProfile::Default)
+            .expect("spawn fd listing session");
+        let mut listing = Vec::new();
+        let code = time::timeout(Duration::from_secs(15), async {
+            loop {
+                match rx.recv().await.expect("listing output") {
+                    (_, SessionOutput::Stdout(data)) => listing.extend_from_slice(&data),
+                    (_, SessionOutput::Exited(code)) => break code,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("fd listing session exits");
+        assert_eq!(code, 0);
+
+        let listing = String::from_utf8(listing).expect("fd listing is UTF-8");
+        let fds: Vec<(u32, String)> = listing
+            .lines()
+            .filter_map(|line| {
+                let (fd, target) = line.trim_end_matches('\r').split_once(' ')?;
+                Some((fd.parse().ok()?, target.to_string()))
+            })
+            .collect();
+        assert!(
+            fds.iter().any(|&(fd, _)| fd == 0),
+            "tty={tty}: no fd listing:\n{listing}"
+        );
+        fds
+    }
+
+    /// Counts the fds above stdio that point at a terminal.
+    fn terminal_fds_above_stdio(fds: &[(u32, String)]) -> usize {
+        fds.iter()
+            .filter(|(fd, target)| {
+                *fd > 2 && (target == "/dev/ptmx" || target.starts_with("/dev/pts/"))
+            })
+            .count()
     }
 
     /// Kills a session's process group when a failing test unwinds, so the
