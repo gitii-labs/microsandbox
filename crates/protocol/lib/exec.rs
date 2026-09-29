@@ -137,7 +137,7 @@ pub struct ExecFailed {
     pub message: String,
 
     /// Which step failed when the kind alone isn't enough — e.g.
-    /// `"execvp"`, `"setrlimit(RLIMIT_NOFILE)"`, `"posix_openpt"`.
+    /// `"Command::spawn"`, `"setuid"`, `"setrlimit(RLIMIT_NOFILE)"`.
     #[serde(default)]
     pub stage: Option<String>,
 }
@@ -175,14 +175,15 @@ pub enum ExecFailureKind {
     ResourceLimit,
 
     /// User/group setup failed: requested user doesn't exist in the
-    /// sandbox, or `setuid`/`setgid` rejected (EPERM).
+    /// sandbox, or `setgroups`/`setgid`/`setuid` rejected (EPERM).
     UserSetupFailed,
 
     /// Memory pressure: kernel couldn't allocate (ENOMEM, or EAGAIN
     /// on fork without an explicit rlimit cause).
     OutOfMemory,
 
-    /// PTY allocation or attachment failed (pty mode only).
+    /// Terminal setup failed: `setsid`, or making the PTY the
+    /// controlling terminal (`TIOCSCTTY`).
     PtySetupFailed,
 
     /// Anything else: `errno` is carried verbatim, `message` and
