@@ -1,13 +1,16 @@
 //! Exec session management: spawning processes with PTY or pipe I/O.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::ptr;
 use std::sync::Arc;
-use std::{iter, mem, ptr};
 
+use nix::fcntl::OFlag;
 use nix::pty;
 use nix::sys::signal::Signal;
 use tokio::io::AsyncReadExt;
@@ -189,8 +192,19 @@ pub enum RawSessionCompletion {
 struct ResolvedUser {
     uid: libc::uid_t,
     gid: libc::gid_t,
-    initgroups_user: Option<CString>,
+    /// Supplementary groups, resolved before fork: `initgroups` reads the
+    /// group database, which a forked child must not do.
+    groups: Vec<libc::gid_t>,
     home_dir: Option<CString>,
+}
+
+/// Whether the child gets a controlling terminal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildTerminal {
+    /// Its stdin is a PTY slave, made its controlling terminal.
+    Pty,
+    /// No controlling terminal.
+    None,
 }
 
 struct PasswdEntry {
@@ -204,13 +218,10 @@ struct GroupEntry {
     gid: libc::gid_t,
 }
 
-struct ExecErrorPipe {
-    read_end: OwnedFd,
-    write_end: OwnedFd,
-}
-
-/// A piped process whose exit status is observed by [`ProcessManager`].
-struct PipedProcess {
+/// A spawned process whose exit status is observed by [`ProcessManager`].
+///
+/// The stdio handles are present only for the streams spawned as pipes.
+struct SpawnedProcess {
     stdin: Option<tokio::process::ChildStdin>,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
@@ -391,8 +402,7 @@ impl ExecSession {
         security_profile: SecurityProfile,
         process_manager: &Arc<ProcessManager>,
     ) -> AgentdResult<Self> {
-        let pty = pty::openpty(None, None)?;
-        let err_pipe = new_exec_error_pipe()?;
+        let (master, slave) = open_pty()?;
 
         // Set initial window size.
         let ws = libc::winsize {
@@ -401,187 +411,31 @@ impl ExecSession {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let ret = unsafe { libc::ioctl(pty.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+        let ret = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
         if ret < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
 
-        let slave_fd = pty.slave.as_raw_fd();
+        let mut cmd = exec_command(req, default_user, security_profile, ChildTerminal::Pty)?;
+        cmd.stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave));
 
-        // Pre-build all strings before fork to avoid allocating in the child.
-        let c_cmd = CString::new(req.cmd.as_str())
-            .map_err(|e| AgentdError::ExecSession(format!("invalid command: {e}")))?;
-        let mut c_args: Vec<CString> = vec![c_cmd.clone()];
-        for arg in &req.args {
-            c_args.push(
-                CString::new(arg.as_str())
-                    .map_err(|e| AgentdError::ExecSession(format!("invalid arg: {e}")))?,
-            );
-        }
-
-        // Build argv pointer array (null-terminated).
-        let argv_ptrs: Vec<*const libc::c_char> = c_args
-            .iter()
-            .map(|s| s.as_ptr())
-            .chain(iter::once(ptr::null()))
-            .collect();
-
-        // Pre-parse environment variables into CStrings.
-        let c_env: Vec<(CString, CString)> = req
-            .env
-            .iter()
-            .filter_map(|var| {
-                let (key, val) = var.split_once('=')?;
-                let k = CString::new(key).ok()?;
-                let v = CString::new(val).ok()?;
-                Some((k, v))
-            })
-            .collect();
-
-        // Pre-build cwd CString.
-        let c_cwd = req
-            .cwd
-            .as_ref()
-            .map(|dir| CString::new(dir.as_str()))
-            .transpose()
-            .map_err(|e| AgentdError::ExecSession(format!("invalid cwd: {e}")))?;
-
-        let resolved_user = resolve_requested_user(req, default_user)?;
-        let default_home = default_home_dir(req, resolved_user.as_ref())?;
-        let home_key = default_home
-            .as_ref()
-            .map(|_| {
-                CString::new("HOME")
-                    .map_err(|e| AgentdError::ExecSession(format!("invalid home env key: {e}")))
-            })
-            .transpose()?;
-
-        // Pre-parse rlimits before fork (no allocations in child).
-        let parsed_rlimits = rlimit::to_libc(&req.rlimits);
-
-        // Prevent the central reaper from observing this child before its PID
-        // and generation are registered.
-        let spawn_guard = process_manager.spawn_guard()?;
-
-        // Fork.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            let io_err = std::io::Error::last_os_error();
-            return Err(AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
-                &io_err, &req.cmd, "fork",
-            )));
-        }
-
-        #[allow(unreachable_code)]
-        if pid == 0 {
-            // Child process — only async-signal-safe operations from here.
-            drop(pty.master);
-            drop(err_pipe.read_end);
-
-            // Create new session.
-            if unsafe { libc::setsid() } < 0 {
-                unsafe { libc::_exit(1) };
-            }
-
-            // Set controlling terminal.
-            if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) } < 0 {
-                unsafe { libc::_exit(1) };
-            }
-
-            // Dup slave to stdin/stdout/stderr.
-            unsafe {
-                if libc::dup2(slave_fd, 0) < 0 {
-                    libc::_exit(1);
-                }
-                if libc::dup2(slave_fd, 1) < 0 {
-                    libc::_exit(1);
-                }
-                if libc::dup2(slave_fd, 2) < 0 {
-                    libc::_exit(1);
-                }
-                if slave_fd > 2 {
-                    libc::close(slave_fd);
-                }
-            }
-
-            // Set environment variables using pre-built CStrings.
-            for (key, val) in &c_env {
-                unsafe {
-                    libc::setenv(key.as_ptr(), val.as_ptr(), 1);
-                }
-            }
-
-            // Set working directory.
-            if let Some(ref dir) = c_cwd {
-                unsafe {
-                    libc::chdir(dir.as_ptr());
-                }
-            }
-
-            if apply_exec_security_profile(security_profile).is_err() {
-                unsafe { libc::_exit(1) };
-            }
-
-            if let Some(ref user) = resolved_user
-                && apply_resolved_user(user).is_err()
-            {
-                unsafe { libc::_exit(1) };
-            }
-
-            if let (Some(key), Some(home)) = (&home_key, &default_home) {
-                unsafe {
-                    libc::setenv(key.as_ptr(), home.as_ptr(), 1);
-                }
-            }
-
-            // Apply resource limits.
-            for (resource, limit) in &parsed_rlimits {
-                if unsafe { libc::setrlimit(*resource as _, limit) } != 0 {
-                    unsafe { libc::_exit(1) };
-                }
-            }
-
-            // execvp — on success this never returns.
-            unsafe {
-                libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
-            }
-
-            // If execvp returns, it failed.
-            write_exec_error_and_exit(err_pipe.write_end.as_raw_fd());
-        }
-
-        // Parent process.
-        drop(pty.slave);
-        drop(err_pipe.write_end);
-        let exit_watcher = spawn_guard.track(pid)?;
+        // `spawn_process` drops the command and with it the parent's slave
+        // fds, so the master reads EIO once the session's processes close theirs.
+        let SpawnedProcess { exit_watcher, .. } = spawn_process(cmd, process_manager)?;
         let process_identity = exit_watcher.identity();
 
-        match read_exec_error(err_pipe.read_end.as_raw_fd()) {
-            Ok(Some(exec_errno)) => {
-                drop(exit_watcher);
-                process_manager.release(process_identity);
-                let io_err = std::io::Error::from_raw_os_error(exec_errno);
-                return Err(AgentdError::ExecSpawnFailed(exec_failed_from_io_error(
-                    &io_err, &req.cmd, "execvp",
-                )));
-            }
-            Ok(None) => {}
+        // A second master fd for the reader task.
+        let reader_fd = match master.try_clone() {
+            Ok(fd) => fd,
             Err(error) => {
                 let _ =
                     process_manager.signal_process_group(process_identity, Signal::SIGKILL as i32);
                 process_manager.release(process_identity);
-                return Err(error);
+                return Err(error.into());
             }
-        }
-
-        // Dup the master fd for the reader task.
-        let reader_fd = unsafe { libc::dup(pty.master.as_raw_fd()) };
-        if reader_fd < 0 {
-            let _ = process_manager.signal_process_group(process_identity, Signal::SIGKILL as i32);
-            process_manager.release(process_identity);
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let reader_fd = unsafe { OwnedFd::from_raw_fd(reader_fd) };
+        };
 
         // Spawn background reader task.
         let (output_tx, output_rx) = mpsc::unbounded_channel();
@@ -592,7 +446,7 @@ impl ExecSession {
         Ok(Self {
             process_identity,
             process_manager: Arc::clone(process_manager),
-            pty_master: Some(pty.master),
+            pty_master: Some(master),
             stdin: None,
             detach: Some(detach),
         })
@@ -607,57 +461,17 @@ impl ExecSession {
         security_profile: SecurityProfile,
         process_manager: &Arc<ProcessManager>,
     ) -> AgentdResult<Self> {
-        let mut cmd = Command::new(&req.cmd);
-        cmd.args(&req.args)
-            .stdin(Stdio::piped())
+        let mut cmd = exec_command(req, default_user, security_profile, ChildTerminal::None)?;
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        for var in &req.env {
-            if let Some((key, val)) = var.split_once('=') {
-                cmd.env(key, val);
-            }
-        }
-
-        if let Some(ref dir) = req.cwd {
-            cmd.current_dir(dir);
-        }
-
-        let resolved_user = resolve_requested_user(req, default_user)?;
-        if let Some(home) = default_home_dir(req, resolved_user.as_ref())? {
-            cmd.env("HOME", home.to_string_lossy().into_owned());
-        }
-
-        // Apply the security profile and resource limits in the child before exec.
-        let parsed_rlimits = rlimit::to_libc(&req.rlimits);
-        unsafe {
-            cmd.pre_exec(move || {
-                // Become a session (and process-group) leader so signals sent
-                // to the group reach every descendant the command spawns, not
-                // just the direct child. The PTY path does the same for its
-                // controlling terminal; here it exists purely for group kills.
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                apply_exec_security_profile(security_profile).map_err(agentd_to_io_error)?;
-                if let Some(ref user) = resolved_user {
-                    apply_resolved_user(user).map_err(agentd_to_io_error)?;
-                }
-                for (resource, limit) in &parsed_rlimits {
-                    if libc::setrlimit(*resource as _, limit) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
-
-        let PipedProcess {
+        let SpawnedProcess {
             stdin,
             stdout,
             stderr,
             exit_watcher,
-        } = spawn_piped_process(cmd, process_manager)?;
+        } = spawn_process(cmd, process_manager)?;
         let process_identity = exit_watcher.identity();
 
         // Spawn background reader task.
@@ -698,10 +512,86 @@ impl Drop for ExecSession {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-fn spawn_piped_process(
+/// Builds the command for an exec request.
+///
+/// Everything the child needs is prepared here, in the parent: std builds the
+/// environment block and argv before it forks, and the `pre_exec` hook only
+/// makes async-signal-safe system calls. A child forked from this
+/// multithreaded process must not allocate or take a lock before `exec`, or
+/// it can deadlock on a lock another thread held at the fork.
+fn exec_command(
+    req: &ExecRequest,
+    default_user: Option<&str>,
+    security_profile: SecurityProfile,
+    terminal: ChildTerminal,
+) -> AgentdResult<Command> {
+    let mut cmd = Command::new(&req.cmd);
+    cmd.args(&req.args);
+
+    for var in &req.env {
+        if let Some((key, val)) = var.split_once('=') {
+            cmd.env(key, val);
+        }
+    }
+
+    if let Some(ref dir) = req.cwd {
+        cmd.current_dir(dir);
+    }
+
+    let resolved_user = resolve_requested_user(req, default_user)?;
+    if let Some(home) = default_home_dir(req, resolved_user.as_ref())? {
+        cmd.env("HOME", OsStr::from_bytes(home.as_bytes()));
+    }
+
+    let parsed_rlimits = rlimit::to_libc(&req.rlimits);
+    unsafe {
+        cmd.pre_exec(move || {
+            // Become a session (and process-group) leader so signals sent to
+            // the group reach every descendant the command spawns, not just
+            // the direct child.
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // std has already made the PTY slave the child's stdin.
+            if terminal == ChildTerminal::Pty && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            apply_exec_security_profile(security_profile)?;
+            if let Some(ref user) = resolved_user {
+                apply_resolved_user(user)?;
+            }
+            for (resource, limit) in &parsed_rlimits {
+                if libc::setrlimit(*resource as _, limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+
+    Ok(cmd)
+}
+
+/// Opens a PTY pair with both ends close-on-exec, so no other session's
+/// child inherits them. The child gets its slave as stdio through `dup2`,
+/// which clears the flag on the copies.
+fn open_pty() -> AgentdResult<(OwnedFd, OwnedFd)> {
+    let master = pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
+    pty::grantpt(&master)?;
+    pty::unlockpt(&master)?;
+    let slave_path = pty::ptsname_r(&master)?;
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(slave_path)?;
+    Ok((master.into(), slave.into()))
+}
+
+fn spawn_process(
     mut command: Command,
     process_manager: &ProcessManager,
-) -> AgentdResult<PipedProcess> {
+) -> AgentdResult<SpawnedProcess> {
     let cmd_label = command.get_program().to_string_lossy().into_owned();
 
     // Prevent the central reaper from observing this child before its PID and
@@ -754,7 +644,7 @@ fn spawn_piped_process(
     // operation; terminal teardown may reap it directly as a fallback.
     drop(child);
 
-    Ok(PipedProcess {
+    Ok(SpawnedProcess {
         stdin,
         stdout,
         stderr,
@@ -762,61 +652,23 @@ fn spawn_piped_process(
     })
 }
 
-fn new_exec_error_pipe() -> AgentdResult<ExecErrorPipe> {
-    let mut fds = [0; 2];
-    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    Ok(ExecErrorPipe {
-        read_end: unsafe { OwnedFd::from_raw_fd(fds[0]) },
-        write_end: unsafe { OwnedFd::from_raw_fd(fds[1]) },
-    })
-}
-
-fn write_exec_error_and_exit(err_fd: RawFd) -> ! {
-    let errno = unsafe { *libc::__errno_location() };
-    let bytes = errno.to_ne_bytes();
-    let _ = unsafe { libc::write(err_fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
-    unsafe { libc::_exit(127) }
-}
-
-fn read_exec_error(err_fd: RawFd) -> AgentdResult<Option<i32>> {
-    let mut buf = [0u8; mem::size_of::<i32>()];
-    let n = unsafe { libc::read(err_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    if n == 0 {
-        return Ok(None);
-    }
-    if n as usize != buf.len() {
-        return Err(AgentdError::ExecSession(format!(
-            "short exec error report: expected {} bytes, got {n}",
-            buf.len()
-        )));
-    }
-    Ok(Some(i32::from_ne_bytes(buf)))
-}
-
-fn apply_exec_security_profile(profile: SecurityProfile) -> AgentdResult<()> {
+fn apply_exec_security_profile(profile: SecurityProfile) -> std::io::Result<()> {
     match profile {
         SecurityProfile::Default => Ok(()),
         SecurityProfile::Restricted => drop_mount_admin_privileges(),
     }
 }
 
-fn drop_mount_admin_privileges() -> AgentdResult<()> {
+fn drop_mount_admin_privileges() -> std::io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
 
     let ret = unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINVAL) {
-            return Err(err.into());
+            return Err(err);
         }
     }
 
@@ -831,7 +683,7 @@ fn drop_mount_admin_privileges() -> AgentdResult<()> {
     }; 2];
 
     if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
 
     let index = (CAP_SYS_ADMIN / CAP_WORD_BITS) as usize;
@@ -846,7 +698,7 @@ fn drop_mount_admin_privileges() -> AgentdResult<()> {
         data[index].inheritable &= !mask;
 
         if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
     }
 
@@ -857,7 +709,7 @@ fn drop_mount_admin_privileges() -> AgentdResult<()> {
         // Already-unprivileged callers may also lack CAP_SETPCAP for the bounding-set drop.
         let already_unprivileged = !had_sys_admin && errno == Some(libc::EPERM);
         if errno != Some(libc::EINVAL) && !already_unprivileged {
-            return Err(err.into());
+            return Err(err);
         }
     }
 
@@ -927,16 +779,15 @@ fn resolve_user_spec(spec: &str) -> AgentdResult<ResolvedUser> {
             .unwrap_or_else(|| unsafe { libc::getgid() }),
     };
 
-    let initgroups_user = passwd_entry
-        .as_ref()
-        .map(|entry| CString::new(entry.name.as_str()))
-        .transpose()
-        .map_err(|e| AgentdError::ExecSession(format!("invalid guest user name: {e}")))?;
+    let groups = match passwd_entry {
+        Some(ref entry) => lookup_group_list(&entry.name, gid)?,
+        None => Vec::new(),
+    };
 
     Ok(ResolvedUser {
         uid,
         gid,
-        initgroups_user,
+        groups,
         home_dir: passwd_entry
             .as_ref()
             .and_then(|entry| entry.home_dir.as_deref())
@@ -1078,25 +929,49 @@ fn lookup_group_by_name(name: &str) -> AgentdResult<Option<GroupEntry>> {
     Ok(Some(GroupEntry { gid: grp.gr_gid }))
 }
 
+/// The supplementary groups `initgroups(name, gid)` would set.
+fn lookup_group_list(name: &str, gid: libc::gid_t) -> AgentdResult<Vec<libc::gid_t>> {
+    const INITIAL_GROUPS: usize = 32;
+
+    let c_name = CString::new(name)
+        .map_err(|e| AgentdError::ExecSession(format!("invalid guest user name: {e}")))?;
+    let mut groups: Vec<libc::gid_t> = vec![0; INITIAL_GROUPS];
+    loop {
+        let mut count = groups.len() as libc::c_int;
+        let rc =
+            unsafe { libc::getgrouplist(c_name.as_ptr(), gid, groups.as_mut_ptr(), &mut count) };
+        if rc >= 0 {
+            groups.truncate(count as usize);
+            return Ok(groups);
+        }
+        // Too small: `count` now holds the number of groups the user has.
+        // A count that does not grow the buffer means the lookup failed.
+        let needed = count as usize;
+        if needed <= groups.len() {
+            return Err(AgentdError::ExecSession(format!(
+                "failed to list groups of guest user {name:?}"
+            )));
+        }
+        groups.resize(needed, 0);
+    }
+}
+
 fn lookup_buffer_len() -> usize {
     let size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
     if size > 0 { size as usize } else { 16 * 1024 }
 }
 
-fn apply_resolved_user(user: &ResolvedUser) -> AgentdResult<()> {
-    if let Some(ref name) = user.initgroups_user {
-        if unsafe { libc::initgroups(name.as_ptr(), user.gid) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    } else if unsafe { libc::setgroups(0, ptr::null()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+/// Switches the calling process to `user`. Runs in a forked child: system
+/// calls only.
+fn apply_resolved_user(user: &ResolvedUser) -> std::io::Result<()> {
+    if unsafe { libc::setgroups(user.groups.len(), user.groups.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-
     if unsafe { libc::setgid(user.gid) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
     if unsafe { libc::setuid(user.uid) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
 
     Ok(())
@@ -1124,10 +999,6 @@ fn env_contains_key(env: &[String], key: &str) -> bool {
             .map(|(entry_key, _)| entry_key == key)
             .unwrap_or(false)
     })
-}
-
-fn agentd_to_io_error(err: AgentdError) -> std::io::Error {
-    std::io::Error::other(err.to_string())
 }
 
 /// Writes data to a raw fd using a blocking task, handling short writes.
@@ -1316,6 +1187,10 @@ mod tests {
     const PIPE_OWNER_HELPER_SENTINEL: &str = "pipe-owner-helper-passed";
     const PIPE_OWNER_TEST_NAME: &str =
         "session::tests::test_piped_process_exit_outlives_spawning_runtime";
+    const ENV_SPAWN_HELPER_ENV: &str = "MSB_AGENTD_ENV_SPAWN_HELPER";
+    const ENV_SPAWN_HELPER_SENTINEL: &str = "env-spawn-helper-passed";
+    const ENV_SPAWN_TEST_NAME: &str =
+        "session::tests::test_concurrent_pty_spawns_with_env_while_env_changes";
 
     #[test]
     fn test_spawn_reaps_adopted_descendant() {
@@ -1672,9 +1547,8 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let process =
-                spawn_piped_process(command, &process_manager).expect("spawn piped process");
-            let PipedProcess { exit_watcher, .. } = process;
+            let process = spawn_process(command, &process_manager).expect("spawn piped process");
+            let SpawnedProcess { exit_watcher, .. } = process;
             exit_watcher
         };
         drop(spawning_runtime);
@@ -1841,7 +1715,7 @@ mod tests {
         let user = ResolvedUser {
             uid: 1000,
             gid: 1000,
-            initgroups_user: None,
+            groups: Vec::new(),
             home_dir: Some(CString::new("/home/tester").unwrap()),
         };
 
@@ -1894,7 +1768,7 @@ mod tests {
         let user = ResolvedUser {
             uid: 1000,
             gid: 1000,
-            initgroups_user: None,
+            groups: Vec::new(),
             home_dir: Some(CString::new("/home/tester").unwrap()),
         };
 
@@ -1958,5 +1832,302 @@ mod tests {
         assert!(!message.contains("path_probe="));
         assert!(!message.contains("cwd_probe="));
         assert!(!message.contains("target_probe="));
+    }
+
+    /// Spawns PTY sessions carrying env vars from several threads while
+    /// another thread keeps rewriting the process environment. A child that
+    /// runs `setenv` between fork and exec deadlocks once it is forked while
+    /// the writer holds libc's environment lock; the helper's own deadline
+    /// turns that hang into a failure.
+    #[test]
+    fn test_concurrent_pty_spawns_with_env_while_env_changes() {
+        if std::env::var_os(ENV_SPAWN_HELPER_ENV).is_some() {
+            run_concurrent_env_spawn_scenario();
+            println!("{ENV_SPAWN_HELPER_SENTINEL}");
+            return;
+        }
+
+        let mut helper = StdCommand::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", ENV_SPAWN_TEST_NAME, "--nocapture"])
+            .env(ENV_SPAWN_HELPER_ENV, "1")
+            .stdout(StdStdio::piped())
+            .spawn()
+            .expect("spawn isolated env spawn test");
+        let mut output = String::new();
+        helper
+            .stdout
+            .take()
+            .expect("helper stdout")
+            .read_to_string(&mut output)
+            .expect("read helper stdout");
+
+        match helper.wait() {
+            Ok(status) => assert!(status.success(), "helper failed: {status}\n{output}"),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+            Err(error) => panic!("wait for helper: {error}"),
+        }
+        assert!(
+            output.contains(ENV_SPAWN_HELPER_SENTINEL),
+            "helper did not complete the env spawn scenario:\n{output}"
+        );
+    }
+
+    fn run_concurrent_env_spawn_scenario() {
+        const SPAWN_THREADS: u32 = 8;
+        const SPAWNS_PER_THREAD: u32 = 25;
+        const SESSION_COUNT: usize = (SPAWN_THREADS * SPAWNS_PER_THREAD) as usize;
+        const EXPECTED_EXIT: i32 = 23;
+        const DEADLINE: Duration = Duration::from_secs(60);
+        const ENV_WRITER_VAR: &str = "MSB_AGENTD_ENV_WRITER";
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("env spawn test runtime");
+        let stop_writer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop_writer = Arc::clone(&stop_writer);
+            std::thread::spawn(move || {
+                let mut round = 0u64;
+                while !stop_writer.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: this helper process reads its environment only
+                    // through std, which serialises with this writer.
+                    unsafe { std::env::set_var(ENV_WRITER_VAR, round.to_string()) };
+                    round += 1;
+                }
+            })
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (sessions_tx, sessions_rx) = std::sync::mpsc::channel();
+        for thread in 0..SPAWN_THREADS {
+            let handle = runtime.handle().clone();
+            let tx = tx.clone();
+            let sessions_tx = sessions_tx.clone();
+            std::thread::spawn(move || {
+                let _runtime = handle.enter();
+                for n in 0..SPAWNS_PER_THREAD {
+                    let id = thread * SPAWNS_PER_THREAD + n;
+                    let req = ExecRequest {
+                        cmd: "/bin/sh".to_string(),
+                        args: vec![
+                            "-c".to_string(),
+                            format!("[ \"$SPAWN_MARK\" = mark-{id} ] && exit {EXPECTED_EXIT}"),
+                        ],
+                        env: vec![format!("SPAWN_MARK=mark-{id}")],
+                        cwd: None,
+                        user: None,
+                        tty: true,
+                        rows: 24,
+                        cols: 80,
+                        rlimits: Vec::new(),
+                    };
+                    let session =
+                        ExecSession::spawn(id, &req, tx.clone(), None, SecurityProfile::Default)
+                            .expect("spawn PTY session with env");
+                    if sessions_tx.send(session).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        drop(sessions_tx);
+
+        let exits = runtime.block_on(async {
+            time::timeout(DEADLINE, async {
+                let mut exits = HashMap::new();
+                while exits.len() < SESSION_COUNT {
+                    let (id, output) = rx.recv().await.expect("session output");
+                    if let SessionOutput::Exited(code) = output {
+                        exits.insert(id, code);
+                    }
+                }
+                exits
+            })
+            .await
+        });
+        let Ok(exits) = exits else {
+            // A deadlocked child pins its spawning thread and the runtime's
+            // PTY readers, so neither can be joined: leave without unwinding.
+            eprintln!("PTY spawns with env did not all finish within {DEADLINE:?}");
+            std::process::exit(1);
+        };
+        stop_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().expect("env writer thread");
+
+        for id in 0..SESSION_COUNT as u32 {
+            assert_eq!(exits.get(&id), Some(&EXPECTED_EXIT), "session {id}");
+        }
+        drop(sessions_rx.into_iter().collect::<Vec<_>>());
+        drop(runtime);
+    }
+
+    /// A session's PTY fds stay out of every other session's children, in
+    /// both exec modes.
+    #[tokio::test]
+    async fn test_exec_session_does_not_inherit_other_session_pty_fds() {
+        const HOLDER_ID: u32 = 40;
+        const DEADLINE: Duration = Duration::from_secs(15);
+
+        let (holder_tx, mut holder_rx) = mpsc::unbounded_channel();
+        let holder_req = ExecRequest {
+            cmd: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "tty; read _".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty: true,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+        let holder = KillOnDrop(
+            ExecSession::spawn(
+                HOLDER_ID,
+                &holder_req,
+                holder_tx,
+                None,
+                SecurityProfile::Default,
+            )
+            .expect("spawn PTY holder session"),
+        );
+        let mut holder_out = Vec::new();
+        time::timeout(DEADLINE, async {
+            while !holder_out.contains(&b'\n') {
+                match holder_rx.recv().await.expect("holder output") {
+                    (_, SessionOutput::Stdout(data)) => holder_out.extend_from_slice(&data),
+                    (_, SessionOutput::Exited(code)) => panic!("holder exited with {code}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("holder prints its terminal");
+        let holder_tty = String::from_utf8(holder_out).expect("holder tty is UTF-8");
+        let holder_tty = holder_tty.trim().to_string();
+        assert!(
+            holder_tty.starts_with("/dev/pts/"),
+            "holder terminal: {holder_tty:?}"
+        );
+
+        for (id, tty) in [(41, true), (42, false)] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let req = ExecRequest {
+                cmd: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    r#"for f in /proc/$$/fd/*; do echo "${f##*/} $(readlink "$f")"; done"#
+                        .to_string(),
+                ],
+                env: Vec::new(),
+                cwd: None,
+                user: None,
+                tty,
+                rows: 24,
+                cols: 80,
+                rlimits: Vec::new(),
+            };
+            let _session = ExecSession::spawn(id, &req, tx, None, SecurityProfile::Default)
+                .expect("spawn fd listing session");
+            let mut listing = Vec::new();
+            let code = time::timeout(DEADLINE, async {
+                loop {
+                    match rx.recv().await.expect("listing output") {
+                        (_, SessionOutput::Stdout(data)) => listing.extend_from_slice(&data),
+                        (_, SessionOutput::Exited(code)) => break code,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("fd listing session exits");
+            assert_eq!(code, 0);
+
+            let listing = String::from_utf8(listing).expect("fd listing is UTF-8");
+            let fds: Vec<(u32, &str)> = listing
+                .lines()
+                .filter_map(|line| {
+                    let (fd, target) = line.trim_end_matches('\r').split_once(' ')?;
+                    Some((fd.parse().ok()?, target))
+                })
+                .collect();
+            assert!(
+                fds.iter().any(|&(fd, _)| fd == 0),
+                "tty={tty}: no fd listing:\n{listing}"
+            );
+            for &(fd, target) in &fds {
+                assert_ne!(
+                    target, holder_tty,
+                    "tty={tty}: fd {fd} is the holder's slave"
+                );
+                if fd > 2 {
+                    assert!(
+                        target != "/dev/ptmx" && !target.starts_with("/dev/pts/"),
+                        "tty={tty}: fd {fd} leaked terminal {target}:\n{listing}"
+                    );
+                }
+            }
+        }
+
+        holder
+            .0
+            .send_signal(libc::SIGKILL)
+            .expect("kill holder session");
+        time::timeout(DEADLINE, async {
+            while !matches!(
+                holder_rx.recv().await.expect("holder output"),
+                (_, SessionOutput::Exited(_))
+            ) {}
+        })
+        .await
+        .expect("holder exits");
+    }
+
+    #[test]
+    fn test_resolved_user_groups_include_primary_group() {
+        let uid = unsafe { libc::getuid() };
+        let resolved = resolve_user_spec(&uid.to_string()).expect("resolve current user");
+        assert!(
+            resolved.groups.contains(&resolved.gid),
+            "groups {:?} lack {}",
+            resolved.groups,
+            resolved.gid
+        );
+    }
+
+    /// A PTY session with a missing working directory fails to spawn, as a
+    /// pipe session does, instead of running in agentd's directory.
+    #[tokio::test]
+    async fn test_spawn_pty_rejects_missing_cwd() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let req = ExecRequest {
+            cmd: "/bin/true".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: Some("/definitely/not/a/real/dir".to_string()),
+            user: None,
+            tty: true,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+
+        let err = ExecSession::spawn(43, &req, tx, None, SecurityProfile::Default)
+            .expect_err("spawn with a missing cwd should fail");
+        let AgentdError::ExecSpawnFailed(payload) = &err else {
+            panic!("expected ExecSpawnFailed, got: {err:?}");
+        };
+        assert_eq!(payload.errno, Some(libc::ENOENT));
+    }
+
+    /// Kills a session's process group when a failing test unwinds, so the
+    /// runtime's PTY reader sees EOF and the runtime can shut down.
+    struct KillOnDrop(ExecSession);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send_signal(libc::SIGKILL);
+        }
     }
 }
