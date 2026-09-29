@@ -515,7 +515,7 @@ impl SetupReport {
         let stage = match step {
             SetupStep::Setsid => "setsid".to_string(),
             SetupStep::ControllingTerminal => "ioctl(TIOCSCTTY)".to_string(),
-            SetupStep::CapabilityDrop => "drop CAP_SYS_ADMIN".to_string(),
+            SetupStep::CapabilityDrop => "drop mount privileges".to_string(),
             SetupStep::Setgroups => "setgroups".to_string(),
             SetupStep::Setgid => "setgid".to_string(),
             SetupStep::Setuid => "setuid".to_string(),
