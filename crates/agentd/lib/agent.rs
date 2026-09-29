@@ -340,12 +340,8 @@ pub async fn run(
                         activity.add_exec_output_bytes(len);
                     }
                     SessionOutput::Exited(code) => {
-                        let msg = Message::with_payload(MessageType::ExecExited, id, &ExecExited { code })
-                            .map_err(|e| AgentdError::ExecSession(format!("encode exited: {e}")))?;
-                        codec::encode_to_buf(&msg, &mut serial_out_buf)
-                            .map_err(|e| AgentdError::ExecSession(format!("encode exited frame: {e}")))?;
+                        finish_exec_session(id, code, &mut state, &session_tx, &mut serial_out_buf)?;
                         activity.record_guest_message();
-                        finish_exec_session(id, &mut state, &session_tx)?;
                     }
                     SessionOutput::Raw(output) => {
                         apply_raw_activity(output.activity, &mut activity);
@@ -915,13 +911,24 @@ fn complete_raw_session(
     }
 }
 
-/// Removes an exited exec session and releases any disconnected owner whose
+/// Reports an exec session's exit and releases any disconnected owner whose
 /// last exec session it was.
+///
+/// A session exits once its output reaches EOF, so a descendant that left the
+/// process group the relay SIGKILLs keeps its owner's release, and with it the
+/// relay slot, pending until it closes the output. Releasing earlier would hand
+/// its late frames to the slot's next client.
 fn finish_exec_session(
     id: u32,
+    code: i32,
     state: &mut AgentState,
     session_tx: &mpsc::UnboundedSender<(u32, SessionOutput)>,
+    out_buf: &mut Vec<u8>,
 ) -> AgentdResult<()> {
+    let msg = Message::with_payload(MessageType::ExecExited, id, &ExecExited { code })
+        .map_err(|e| AgentdError::ExecSession(format!("encode exited: {e}")))?;
+    codec::encode_to_buf(&msg, out_buf)
+        .map_err(|e| AgentdError::ExecSession(format!("encode exited frame: {e}")))?;
     state.sessions.remove(&id);
     let sessions = &state.sessions;
     let (drained, pending) = std::mem::take(&mut state.pending_releases)
@@ -1495,7 +1502,9 @@ mod tests {
             panic!("expected the killed session's exit before the owner release");
         };
         assert_eq!((id, code), (3, -1));
-        finish_exec_session(id, &mut state, &tx).unwrap();
+        finish_exec_session(id, code, &mut state, &tx, &mut out).unwrap();
+        let exited = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+        assert_eq!((exited.id, exited.t), (3, MessageType::ExecExited));
         let (_, SessionOutput::Raw(mut raw)) = rx.try_recv().unwrap() else {
             panic!("expected the owner release");
         };
@@ -1515,9 +1524,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(output, SessionOutput::Exited(_)));
+        let SessionOutput::Exited(code) = output else {
+            panic!("expected session 13 to exit");
+        };
         assert_eq!(id, 13);
-        finish_exec_session(id, &mut state, &tx).unwrap();
+        finish_exec_session(id, code, &mut state, &tx, &mut out).unwrap();
         assert!(rx.try_recv().is_err());
     }
 
