@@ -69,6 +69,9 @@ struct AgentState {
     read_sessions: HashMap<u32, FsReadSession>,
     tcp_sessions: HashMap<u32, TcpSession>,
     fs: FsState,
+    /// Disconnected relay owners whose release waits for their exec sessions'
+    /// terminal frames, so the relay cannot hand a new client their IDs early.
+    pending_releases: Vec<RelayClientDisconnected>,
 }
 
 struct ActivityTracker {
@@ -337,11 +340,7 @@ pub async fn run(
                         activity.add_exec_output_bytes(len);
                     }
                     SessionOutput::Exited(code) => {
-                        let msg = Message::with_payload(MessageType::ExecExited, id, &ExecExited { code })
-                            .map_err(|e| AgentdError::ExecSession(format!("encode exited: {e}")))?;
-                        codec::encode_to_buf(&msg, &mut serial_out_buf)
-                            .map_err(|e| AgentdError::ExecSession(format!("encode exited frame: {e}")))?;
-                        state.sessions.remove(&id);
+                        finish_exec_session(id, code, &mut state, &session_tx, &mut serial_out_buf)?;
                         activity.record_guest_message();
                     }
                     SessionOutput::Raw(output) => {
@@ -669,25 +668,14 @@ async fn handle_message(
                 disconnected.id_end_exclusive,
             )
             .await?;
-            // Queue the release barrier behind all old socket output, not into
-            // out_buf (which would overtake the task output channel).
-            let released =
-                Message::with_payload(MessageType::RelayClientReleased, 0, &disconnected)
-                    .map_err(|e| AgentdError::ExecSession(format!("encode owner release: {e}")))?;
-            let mut frame = Vec::new();
-            codec::encode_to_buf(&released, &mut frame).map_err(|e| {
-                AgentdError::ExecSession(format!("encode owner release frame: {e}"))
-            })?;
-            session_tx
-                .send((
-                    0,
-                    SessionOutput::Raw(RawSessionOutput::new(
-                        frame,
-                        RawActivity::guest_message(),
-                        None,
-                    )),
-                ))
-                .map_err(|_| AgentdError::ExecSession("owner release output closed".into()))?;
+            // The relay SIGKILLs the owner's exec sessions before this message;
+            // their ExecExited frames still carry the owner's IDs, so release
+            // only once the last of them has passed.
+            if has_exec_sessions_in_owner_range(&state.sessions, &disconnected) {
+                state.pending_releases.push(disconnected);
+            } else {
+                queue_owner_release(&disconnected, session_tx)?;
+            }
         }
 
         MessageType::ClockSync => {
@@ -921,6 +909,68 @@ fn complete_raw_session(
         }
         None => {}
     }
+}
+
+/// Reports an exec session's exit and releases any disconnected owner whose
+/// last exec session it was.
+///
+/// A session exits once its output reaches EOF, so a descendant that left the
+/// process group the relay SIGKILLs keeps its owner's release, and with it the
+/// relay slot, pending until it closes the output. Releasing earlier would hand
+/// its late frames to the slot's next client.
+fn finish_exec_session(
+    id: u32,
+    code: i32,
+    state: &mut AgentState,
+    session_tx: &mpsc::UnboundedSender<(u32, SessionOutput)>,
+    out_buf: &mut Vec<u8>,
+) -> AgentdResult<()> {
+    let msg = Message::with_payload(MessageType::ExecExited, id, &ExecExited { code })
+        .map_err(|e| AgentdError::ExecSession(format!("encode exited: {e}")))?;
+    codec::encode_to_buf(&msg, out_buf)
+        .map_err(|e| AgentdError::ExecSession(format!("encode exited frame: {e}")))?;
+    state.sessions.remove(&id);
+    let sessions = &state.sessions;
+    let (drained, pending) = std::mem::take(&mut state.pending_releases)
+        .into_iter()
+        .partition::<Vec<_>, _>(|owner| !has_exec_sessions_in_owner_range(sessions, owner));
+    state.pending_releases = pending;
+    for owner in &drained {
+        queue_owner_release(owner, session_tx)?;
+    }
+    Ok(())
+}
+
+fn has_exec_sessions_in_owner_range(
+    sessions: &HashMap<u32, ExecSession>,
+    owner: &RelayClientDisconnected,
+) -> bool {
+    sessions
+        .keys()
+        .any(|id| *id >= owner.id_start && *id < owner.id_end_exclusive)
+}
+
+/// Queues the release barrier behind all old session output, not into the
+/// serial buffer (which would overtake the task output channel).
+fn queue_owner_release(
+    owner: &RelayClientDisconnected,
+    session_tx: &mpsc::UnboundedSender<(u32, SessionOutput)>,
+) -> AgentdResult<()> {
+    let released = Message::with_payload(MessageType::RelayClientReleased, 0, owner)
+        .map_err(|e| AgentdError::ExecSession(format!("encode owner release: {e}")))?;
+    let mut frame = Vec::new();
+    codec::encode_to_buf(&released, &mut frame)
+        .map_err(|e| AgentdError::ExecSession(format!("encode owner release frame: {e}")))?;
+    session_tx
+        .send((
+            0,
+            SessionOutput::Raw(RawSessionOutput::new(
+                frame,
+                RawActivity::guest_message(),
+                None,
+            )),
+        ))
+        .map_err(|_| AgentdError::ExecSession("owner release output closed".into()))
 }
 
 fn abort_read_sessions_in_owner_range(
@@ -1388,6 +1438,98 @@ mod tests {
         assert_eq!(failed.id, 17);
         assert_eq!(failed.t, MessageType::TcpFailed);
         assert_eq!(second.read(&mut [0]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn owner_release_waits_for_killed_exec_exit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AgentState::default();
+        let mut activity = ActivityTracker::new();
+        let mut out = Vec::new();
+        let config = AgentdConfig {
+            user: None,
+            security_profile: Default::default(),
+            handoff_init_path: None,
+        };
+        let sleep = ExecRequest {
+            cmd: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty: false,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        };
+        // Session 3 belongs to the disconnecting owner; 13 to another client.
+        for id in [3, 13] {
+            handle_message(
+                Message::with_payload(MessageType::ExecRequest, id, &sleep).unwrap(),
+                &mut state,
+                &mut activity,
+                &tx,
+                &mut out,
+                &config,
+            )
+            .await
+            .unwrap();
+            let started = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+            assert_eq!((started.id, started.t), (id, MessageType::ExecStarted));
+        }
+        let owner = RelayClientDisconnected {
+            id_start: 1,
+            id_end_exclusive: 10,
+        };
+        // The relay's cleanup order: SIGKILL each live session, then disconnect.
+        for message in [
+            Message::with_payload(MessageType::ExecSignal, 3, &ExecSignal { signal: 9 }).unwrap(),
+            Message::with_payload(MessageType::RelayClientDisconnected, 0, &owner).unwrap(),
+        ] {
+            handle_message(message, &mut state, &mut activity, &tx, &mut out, &config)
+                .await
+                .unwrap();
+        }
+        assert!(out.is_empty());
+
+        // The killed session's terminal must reach the relay before the
+        // release; after it the slot may carry a new client's ID 3.
+        let (id, output) = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SessionOutput::Exited(code) = output else {
+            panic!("expected the killed session's exit before the owner release");
+        };
+        assert_eq!((id, code), (3, -1));
+        finish_exec_session(id, code, &mut state, &tx, &mut out).unwrap();
+        let exited = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+        assert_eq!((exited.id, exited.t), (3, MessageType::ExecExited));
+        let (_, SessionOutput::Raw(mut raw)) = rx.try_recv().unwrap() else {
+            panic!("expected the owner release");
+        };
+        let released = codec::try_decode_from_buf(&mut raw.frame).unwrap().unwrap();
+        assert_eq!(released.t, MessageType::RelayClientReleased);
+        let released: RelayClientDisconnected = released.payload().unwrap();
+        assert_eq!(
+            (released.id_start, released.id_end_exclusive),
+            (owner.id_start, owner.id_end_exclusive)
+        );
+        assert!(state.pending_releases.is_empty());
+
+        // Another owner's session is untouched and its exit releases nothing.
+        assert!(state.sessions.contains_key(&13));
+        state.sessions[&13].send_signal(libc::SIGKILL).unwrap();
+        let (id, output) = time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let SessionOutput::Exited(code) = output else {
+            panic!("expected session 13 to exit");
+        };
+        assert_eq!(id, 13);
+        finish_exec_session(id, code, &mut state, &tx, &mut out).unwrap();
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
