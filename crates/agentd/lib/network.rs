@@ -477,7 +477,11 @@ mod linux {
     /// Opens a netlink socket, sends a message, and waits for the ACK.
     fn netlink_send(msg: &[u8]) -> io::Result<()> {
         unsafe {
-            let sock = libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, libc::NETLINK_ROUTE);
+            let sock = libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            );
             if sock < 0 {
                 return Err(io::Error::last_os_error());
             }
