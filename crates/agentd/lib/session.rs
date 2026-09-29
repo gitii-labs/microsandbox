@@ -2,7 +2,7 @@
 
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -88,6 +88,26 @@ fn classify_spawn_errno(errno: i32) -> ExecFailureKind {
         libc::ENOMEM => ExecFailureKind::OutOfMemory,
         libc::EINVAL => ExecFailureKind::Other,
         _ => ExecFailureKind::Other,
+    }
+}
+
+/// Build an `ExecFailed` payload for a setup step the child's `pre_exec`
+/// hook reported as failed. The step, not the errno, picks the kind: an EPERM
+/// from `setuid` is a user switch the sandbox refused, not a binary without
+/// its execute bit.
+fn exec_failed_from_setup_step(
+    err: &std::io::Error,
+    cmd: &str,
+    step: SetupStep,
+    stage: String,
+) -> ExecFailed {
+    let errno = err.raw_os_error();
+    ExecFailed {
+        kind: step.kind(),
+        errno,
+        errno_name: errno.and_then(errno_name).map(str::to_string),
+        message: format!("spawn {cmd:?}: {stage} failed: {err}"),
+        stage: Some(stage),
     }
 }
 
@@ -194,6 +214,43 @@ struct ResolvedUser {
     /// a user the child switches to.
     groups: Vec<libc::gid_t>,
     home_dir: Option<CString>,
+}
+
+/// A command for an exec request, with the channel its `pre_exec` hook names
+/// a failed setup step through.
+struct ExecCommand {
+    command: Command,
+    setup: SetupReport,
+}
+
+/// The pipe an exec child reports a failed `pre_exec` setup step through.
+///
+/// std reports only the errno of a failed `pre_exec` hook, and the same errno
+/// comes from different steps: EPERM from `setuid` and from `execve` mean
+/// different things. Before failing, the child writes the step as two bytes
+/// with `write(2)`, which is async-signal-safe and allocates nothing: the
+/// [`SetupStep`] and a detail byte, the failed rlimit's `RLIMIT_*` id. std has
+/// the child report its errno only after the hook returns, so once `spawn`
+/// returns the error the bytes are already in the pipe. Both ends are
+/// close-on-exec, so a child that reaches `exec` writes nothing.
+struct SetupReport {
+    read: OwnedFd,
+    write: OwnedFd,
+    /// The `RLIMIT_*` id and wire name of each rlimit the child sets.
+    rlimits: Vec<(libc::c_int, String)>,
+}
+
+/// A `pre_exec` setup step, as the byte the child reports it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SetupStep {
+    Setsid = 1,
+    ControllingTerminal = 2,
+    CapabilityDrop = 3,
+    Setgroups = 4,
+    Setgid = 5,
+    Setuid = 6,
+    Setrlimit = 7,
 }
 
 /// Whether the child gets a controlling terminal.
@@ -390,6 +447,91 @@ impl ExecSession {
     }
 }
 
+impl SetupStep {
+    fn from_byte(byte: u8) -> Option<Self> {
+        [
+            Self::Setsid,
+            Self::ControllingTerminal,
+            Self::CapabilityDrop,
+            Self::Setgroups,
+            Self::Setgid,
+            Self::Setuid,
+            Self::Setrlimit,
+        ]
+        .into_iter()
+        .find(|step| *step as u8 == byte)
+    }
+
+    fn kind(self) -> ExecFailureKind {
+        match self {
+            Self::Setsid | Self::ControllingTerminal => ExecFailureKind::PtySetupFailed,
+            Self::Setgroups | Self::Setgid | Self::Setuid => ExecFailureKind::UserSetupFailed,
+            Self::Setrlimit => ExecFailureKind::ResourceLimit,
+            // No kind names a privilege drop; the stage does.
+            Self::CapabilityDrop => ExecFailureKind::Other,
+        }
+    }
+}
+
+impl SetupReport {
+    fn new(rlimits: Vec<(libc::c_int, String)>) -> std::io::Result<Self> {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 just returned both fds, and nothing else owns them.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        Ok(Self {
+            read,
+            write,
+            rlimits,
+        })
+    }
+
+    /// Runs in the forked child: reports `step` and passes `err` through.
+    /// Makes one `write(2)` from the stack and nothing else.
+    fn fail(fd: RawFd, step: SetupStep, detail: u8, err: std::io::Error) -> std::io::Error {
+        let report = [step as u8, detail];
+        // A failed write leaves the parent to classify by errno alone.
+        let _ = unsafe { libc::write(fd, report.as_ptr().cast(), report.len()) };
+        err
+    }
+
+    /// The step a failed spawn's child reported, with its stage name, or
+    /// `None` when the spawn failed outside the `pre_exec` hook.
+    fn failed_step(&self) -> Option<(SetupStep, String)> {
+        let mut report = [0u8; 2];
+        let n = unsafe {
+            libc::read(
+                self.read.as_raw_fd(),
+                report.as_mut_ptr().cast(),
+                report.len(),
+            )
+        };
+        if n != report.len() as isize {
+            return None;
+        }
+        let step = SetupStep::from_byte(report[0])?;
+        let stage = match step {
+            SetupStep::Setsid => "setsid".to_string(),
+            SetupStep::ControllingTerminal => "ioctl(TIOCSCTTY)".to_string(),
+            SetupStep::CapabilityDrop => "drop CAP_SYS_ADMIN".to_string(),
+            SetupStep::Setgroups => "setgroups".to_string(),
+            SetupStep::Setgid => "setgid".to_string(),
+            SetupStep::Setuid => "setuid".to_string(),
+            SetupStep::Setrlimit => match self
+                .rlimits
+                .iter()
+                .find(|(id, _)| *id == libc::c_int::from(report[1]))
+            {
+                Some((_, name)) => format!("setrlimit(RLIMIT_{})", name.to_ascii_uppercase()),
+                None => "setrlimit".to_string(),
+            },
+        };
+        Some((step, stage))
+    }
+}
+
 impl ExecSession {
     /// Spawns a process with a PTY.
     fn spawn_pty(
@@ -415,7 +557,8 @@ impl ExecSession {
         }
 
         let mut cmd = exec_command(req, default_user, security_profile, ChildTerminal::Pty)?;
-        cmd.stdin(Stdio::from(slave.try_clone()?))
+        cmd.command
+            .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave));
 
@@ -460,7 +603,8 @@ impl ExecSession {
         process_manager: &Arc<ProcessManager>,
     ) -> AgentdResult<Self> {
         let mut cmd = exec_command(req, default_user, security_profile, ChildTerminal::None)?;
-        cmd.stdin(Stdio::piped())
+        cmd.command
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -511,18 +655,31 @@ impl Drop for ExecSession {
 //--------------------------------------------------------------------------------------------------
 
 /// Builds the command for an exec request.
+fn exec_command(
+    req: &ExecRequest,
+    default_user: Option<&str>,
+    security_profile: SecurityProfile,
+    terminal: ChildTerminal,
+) -> AgentdResult<ExecCommand> {
+    let resolved_user = resolve_requested_user(req, default_user)?;
+    let home = default_home_dir(req, resolved_user.as_ref())?;
+    build_command(req, resolved_user, home, security_profile, terminal)
+}
+
+/// Builds the command for an exec request whose user is already resolved.
 ///
 /// Everything the child needs is prepared here, in the parent: std builds the
 /// environment block and argv before it forks, and the `pre_exec` hook only
 /// makes async-signal-safe system calls. A child forked from this
 /// multithreaded process must not allocate or take a lock before `exec`, or
 /// it can deadlock on a lock another thread held at the fork.
-fn exec_command(
+fn build_command(
     req: &ExecRequest,
-    default_user: Option<&str>,
+    resolved_user: Option<ResolvedUser>,
+    home: Option<CString>,
     security_profile: SecurityProfile,
     terminal: ChildTerminal,
-) -> AgentdResult<Command> {
+) -> AgentdResult<ExecCommand> {
     let mut cmd = Command::new(&req.cmd);
     cmd.args(&req.args);
 
@@ -536,38 +693,59 @@ fn exec_command(
         cmd.current_dir(dir);
     }
 
-    let resolved_user = resolve_requested_user(req, default_user)?;
-    if let Some(home) = default_home_dir(req, resolved_user.as_ref())? {
+    if let Some(home) = home {
         cmd.env("HOME", OsStr::from_bytes(home.as_bytes()));
     }
 
-    let parsed_rlimits = rlimit::to_libc(&req.rlimits);
+    let (rlimit_names, rlimits): (Vec<_>, Vec<_>) = req
+        .rlimits
+        .iter()
+        .filter_map(|rl| {
+            let resource = rlimit::parse_rlimit_resource(&rl.resource)?;
+            let limit = libc::rlimit {
+                rlim_cur: rl.soft,
+                rlim_max: rl.hard,
+            };
+            Some(((resource, rl.resource.clone()), (resource, limit)))
+        })
+        .unzip();
+    let setup = SetupReport::new(rlimit_names)?;
+    let report = setup.write.as_raw_fd();
+
     unsafe {
         cmd.pre_exec(move || {
+            let fail = |step, detail, err| SetupReport::fail(report, step, detail, err);
             // Become a session (and process-group) leader so signals sent to
             // the group reach every descendant the command spawns, not just
             // the direct child.
             if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(fail(SetupStep::Setsid, 0, std::io::Error::last_os_error()));
             }
             // std has already made the PTY slave the child's stdin.
             if terminal == ChildTerminal::Pty && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                return Err(fail(SetupStep::ControllingTerminal, 0, err));
             }
-            apply_exec_security_profile(security_profile)?;
+            apply_exec_security_profile(security_profile)
+                .map_err(|err| fail(SetupStep::CapabilityDrop, 0, err))?;
             if let Some(ref user) = resolved_user {
-                apply_resolved_user(user)?;
+                apply_resolved_user(user).map_err(|(step, err)| fail(step, 0, err))?;
             }
-            for (resource, limit) in &parsed_rlimits {
+            for (resource, limit) in &rlimits {
                 if libc::setrlimit(*resource as _, limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
+                    let err = std::io::Error::last_os_error();
+                    // `RLIMIT_*` ids run from 0 to 15.
+                    return Err(fail(SetupStep::Setrlimit, *resource as u8, err));
                 }
             }
             Ok(())
         });
     }
 
-    Ok(cmd)
+    Ok(ExecCommand {
+        command: cmd,
+        setup,
+    })
 }
 
 /// Opens a PTY pair with both ends close-on-exec, so no other session's
@@ -587,15 +765,21 @@ fn open_pty() -> AgentdResult<(OwnedFd, OwnedFd)> {
 }
 
 fn spawn_process(
-    mut command: Command,
+    command: ExecCommand,
     process_manager: &ProcessManager,
 ) -> AgentdResult<SpawnedProcess> {
+    let ExecCommand { mut command, setup } = command;
     let cmd_label = command.get_program().to_string_lossy().into_owned();
 
     // Prevent the central reaper from observing this child before its PID and
     // generation are registered.
     let spawn_guard = process_manager.spawn_guard()?;
     let mut child = command.spawn().map_err(|error| {
+        if let Some((step, stage)) = setup.failed_step() {
+            return AgentdError::ExecSpawnFailed(exec_failed_from_setup_step(
+                &error, &cmd_label, step, stage,
+            ));
+        }
         let mut failed = exec_failed_from_io_error(&error, &cmd_label, "Command::spawn");
         // std's chdir and execvp both fail with ENOENT or ENOTDIR; a missing
         // cwd is the one to name, since the binary was never looked up.
@@ -969,15 +1153,15 @@ fn lookup_buffer_len() -> usize {
 
 /// Switches the calling process to `user`. Runs in a forked child: system
 /// calls only.
-fn apply_resolved_user(user: &ResolvedUser) -> std::io::Result<()> {
+fn apply_resolved_user(user: &ResolvedUser) -> Result<(), (SetupStep, std::io::Error)> {
     if unsafe { libc::setgroups(user.groups.len(), user.groups.as_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err((SetupStep::Setgroups, std::io::Error::last_os_error()));
     }
     if unsafe { libc::setgid(user.gid) } != 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err((SetupStep::Setgid, std::io::Error::last_os_error()));
     }
     if unsafe { libc::setuid(user.uid) } != 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err((SetupStep::Setuid, std::io::Error::last_os_error()));
     }
 
     Ok(())
@@ -1176,7 +1360,7 @@ mod tests {
 
     use tokio::time;
 
-    use microsandbox_protocol::exec::ExecRequest;
+    use microsandbox_protocol::exec::{ExecRequest, ExecRlimit};
 
     use super::*;
 
@@ -1553,6 +1737,10 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            let command = ExecCommand {
+                command,
+                setup: SetupReport::new(Vec::new()).expect("setup report pipe"),
+            };
             let process = spawn_process(command, &process_manager).expect("spawn piped process");
             let SpawnedProcess { exit_watcher, .. } = process;
             exit_watcher
@@ -2103,6 +2291,114 @@ mod tests {
         };
         assert_eq!(payload.kind, ExecFailureKind::BadCwd);
         assert_eq!(payload.errno, Some(libc::ENOENT));
+    }
+
+    /// Spawns a pipe session for `req` and returns the `ExecFailed` it fails with.
+    fn spawn_failure(id: u32, req: &ExecRequest) -> ExecFailed {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = ExecSession::spawn(id, req, tx, None, SecurityProfile::Default)
+            .expect_err("spawn should fail");
+        match err {
+            AgentdError::ExecSpawnFailed(payload) => payload,
+            other => panic!("expected ExecSpawnFailed, got: {other:?}"),
+        }
+    }
+
+    fn true_request() -> ExecRequest {
+        ExecRequest {
+            cmd: "/bin/true".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            user: None,
+            tty: false,
+            rows: 24,
+            cols: 80,
+            rlimits: Vec::new(),
+        }
+    }
+
+    /// A user switch the kernel refuses is a user setup failure naming the
+    /// step, not a binary lacking its execute bit. More supplementary groups
+    /// than `NGROUPS_MAX` fail `setgroups` with or without privilege: EPERM
+    /// unprivileged, EINVAL as root.
+    #[tokio::test]
+    async fn test_user_switch_failure_names_step() {
+        const NGROUPS_MAX: usize = 65536;
+        let user = ResolvedUser {
+            uid: 54321,
+            gid: 54321,
+            name: None,
+            groups: vec![54321; NGROUPS_MAX + 1],
+            home_dir: None,
+        };
+        let command = build_command(
+            &true_request(),
+            Some(user),
+            None,
+            SecurityProfile::Default,
+            ChildTerminal::None,
+        )
+        .expect("build command");
+        let process_manager = ProcessManager::get().expect("get process manager");
+        let err = spawn_process(command, &process_manager)
+            .err()
+            .expect("the user switch should fail");
+        let AgentdError::ExecSpawnFailed(payload) = &err else {
+            panic!("expected ExecSpawnFailed, got: {err:?}");
+        };
+
+        assert_eq!(payload.kind, ExecFailureKind::UserSetupFailed);
+        assert_eq!(payload.stage.as_deref(), Some("setgroups"));
+        assert!(
+            matches!(payload.errno, Some(libc::EPERM | libc::EINVAL)),
+            "errno {:?}",
+            payload.errno
+        );
+        assert!(
+            payload.message.contains("setgroups failed"),
+            "{}",
+            payload.message
+        );
+    }
+
+    /// A rejected rlimit is a resource limit failure naming the resource.
+    #[tokio::test]
+    async fn test_rlimit_failure_names_resource() {
+        let mut req = true_request();
+        // A soft limit above the hard limit is EINVAL for every caller.
+        req.rlimits = vec![ExecRlimit {
+            resource: "nofile".to_string(),
+            soft: 64,
+            hard: 32,
+        }];
+
+        let payload = spawn_failure(44, &req);
+
+        assert_eq!(payload.kind, ExecFailureKind::ResourceLimit);
+        assert_eq!(payload.stage.as_deref(), Some("setrlimit(RLIMIT_NOFILE)"));
+        assert_eq!(payload.errno, Some(libc::EINVAL));
+    }
+
+    /// A file without its execute bit is still a permission failure of the
+    /// binary: no setup step failed.
+    #[tokio::test]
+    async fn test_non_executable_file_is_permission_denied() {
+        let path = std::env::temp_dir().join(format!(
+            "agentd-not-executable-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "#!/bin/sh\n").expect("write script");
+        let mut req = true_request();
+        req.cmd = path.to_string_lossy().into_owned();
+
+        let payload = spawn_failure(45, &req);
+        std::fs::remove_file(&path).expect("remove script");
+
+        assert_eq!(payload.kind, ExecFailureKind::PermissionDenied);
+        assert_eq!(payload.stage.as_deref(), Some("Command::spawn"));
+        assert_eq!(payload.errno, Some(libc::EACCES));
     }
 
     /// Runs a shell session that lists its own open fds as `(fd, target)`.

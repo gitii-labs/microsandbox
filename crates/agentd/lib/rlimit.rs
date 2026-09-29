@@ -15,23 +15,6 @@ pub(crate) fn parse_rlimit_resource(name: &str) -> Option<libc::c_int> {
     RlimitResource::try_from(name).ok().map(resource_to_libc_id)
 }
 
-/// Pre-parses rlimits into `(resource_id, rlimit)` tuples ready for
-/// `setrlimit()`. Unknown resource names are filtered out.
-pub(crate) fn to_libc(rlimits: &[ExecRlimit]) -> Vec<(libc::c_int, libc::rlimit)> {
-    rlimits
-        .iter()
-        .filter_map(|rl| {
-            Some((
-                parse_rlimit_resource(&rl.resource)?,
-                libc::rlimit {
-                    rlim_cur: rl.soft,
-                    rlim_max: rl.hard,
-                },
-            ))
-        })
-        .collect()
-}
-
 /// Applies sandbox-wide resource limits to the current process (PID 1).
 ///
 /// Applied before other init work so every later guest process inherits the

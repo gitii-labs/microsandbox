@@ -30,16 +30,7 @@ use crate::ui::{self, ErrorLine};
 /// stage, then dim-cyan hint lines.
 pub fn render(cmd: &str, err: &ExecFailed) {
     let header = format!("failed to exec {:?}", cmd);
-    let stage_label = stage_label(err.kind);
-
-    let cause = match err.errno_name.as_deref() {
-        Some(name) => format!("{stage_label}: {} ({name})", err.message),
-        None => match err.errno {
-            Some(no) => format!("{stage_label}: {} (errno {no})", err.message),
-            None => format!("{stage_label}: {}", err.message),
-        },
-    };
-
+    let cause = cause_line(err);
     let hint = stage_hint(cmd, err);
 
     let mut lines: Vec<ErrorLine<'_>> = Vec::with_capacity(2);
@@ -49,6 +40,19 @@ pub fn render(cmd: &str, err: &ExecFailed) {
     }
 
     ui::error_with_lines(&header, &lines);
+}
+
+/// The cause line: the kind's label, agentd's message (which names a
+/// failed setup step), and the errno.
+fn cause_line(err: &ExecFailed) -> String {
+    let stage_label = stage_label(err.kind);
+    match err.errno_name.as_deref() {
+        Some(name) => format!("{stage_label}: {} ({name})", err.message),
+        None => match err.errno {
+            Some(no) => format!("{stage_label}: {} (errno {no})", err.message),
+            None => format!("{stage_label}: {}", err.message),
+        },
+    }
 }
 
 /// Map a kind to the cause-line prefix.
@@ -98,14 +102,14 @@ fn stage_hint(cmd: &str, err: &ExecFailed) -> Option<String> {
         ),
         ExecFailureKind::UserSetupFailed => Some(
             "the requested user/group could not be applied — check that the user \
-             exists in the sandbox's `/etc/passwd`"
+             exists in the sandbox's `/etc/passwd` and that the sandbox may switch to it"
                 .into(),
         ),
         ExecFailureKind::OutOfMemory => {
             Some("the sandbox is memory-constrained — try a larger `--memory`".into())
         }
         ExecFailureKind::PtySetupFailed => {
-            Some("pty allocation failed; try `--no-tty` or pipe stdin (`< /dev/null`)".into())
+            Some("terminal setup failed; try `--no-tty` or pipe stdin (`< /dev/null`)".into())
         }
         ExecFailureKind::Other => None,
     }
@@ -173,6 +177,33 @@ mod tests {
     #[test]
     fn other_kind_has_no_hint() {
         assert!(stage_hint("foo", &err(ExecFailureKind::Other)).is_none());
+    }
+
+    /// A user switch agentd could not make names the step and does not
+    /// suggest `chmod`.
+    #[test]
+    fn user_setup_failure_names_step_without_chmod_hint() {
+        let failed = ExecFailed {
+            kind: ExecFailureKind::UserSetupFailed,
+            errno: Some(1),
+            errno_name: Some("EPERM".into()),
+            message: "spawn \"/bin/true\": setuid failed: Operation not permitted (os error 1)"
+                .into(),
+            stage: Some("setuid".into()),
+        };
+
+        let cause = cause_line(&failed);
+        assert!(cause.starts_with("user setup: "), "{cause}");
+        assert!(cause.contains("setuid failed"), "{cause}");
+        let hint = stage_hint("/bin/true", &failed).unwrap();
+        assert!(!hint.contains("chmod"), "{hint}");
+        assert_eq!(exit_code_for(failed.kind), 1);
+    }
+
+    #[test]
+    fn permission_denied_hint_suggests_chmod() {
+        let h = stage_hint("./run.sh", &err(ExecFailureKind::PermissionDenied)).unwrap();
+        assert!(h.contains("chmod +x ./run.sh"), "{h}");
     }
 
     #[test]
