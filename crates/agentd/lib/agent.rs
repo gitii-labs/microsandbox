@@ -1544,17 +1544,22 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// A disconnected owner's exec whose descendant left the process group
-    /// with the output inherited, released once the direct child is reaped.
-    struct DetachedDescendant {
-        tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
-        rx: mpsc::UnboundedReceiver<(u32, SessionOutput)>,
-        state: AgentState,
-        /// Leader of the descendant's own session and process group.
-        descendant: libc::pid_t,
+    /// Kills a test's escaped descendant should the test fail before it lets
+    /// the descendant exit on its own.
+    struct KillGroupOnDrop(Option<libc::pid_t>);
+
+    impl Drop for KillGroupOnDrop {
+        fn drop(&mut self) {
+            if let Some(group) = self.0 {
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
+        }
     }
 
-    async fn release_with_detached_descendant(tty: bool) -> DetachedDescendant {
+    /// A disconnected owner's exec whose descendant left the process group
+    /// with the output inherited is released once its direct child is reaped,
+    /// and nothing the descendant writes afterwards follows the release.
+    async fn owner_release_skips_detached_descendant(tty: bool) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = AgentState::default();
         let mut activity = ActivityTracker::new();
@@ -1565,12 +1570,24 @@ mod tests {
             handoff_init_path: None,
         };
         // The descendant escapes the exec's process group with stdout and
-        // stderr inherited, reports its PID, and writes once more on SIGUSR1.
-        let script = r#"setsid sh -c 'trap "echo late; exit 0" USR1; echo $$; sleep 60 & wait' &
-exec sleep 60"#;
+        // stderr inherited, and writes once more when the FIFO's writer
+        // closes.
+        let fifo = std::env::temp_dir().join(format!(
+            "microsandbox-agentd-detached-{}-{tty}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&fifo);
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        // The path goes in the script, not the environment: the PTY child
+        // sets its environment between fork and exec.
+        let script = format!(
+            "setsid sh -c 'echo $$; read _ < {}; echo late' &\nexec sleep 60",
+            fifo.display()
+        );
         let request = ExecRequest {
             cmd: "/bin/sh".into(),
-            args: vec!["-c".into(), script.into()],
+            args: vec!["-c".into(), script],
             env: Vec::new(),
             cwd: None,
             user: None,
@@ -1605,6 +1622,7 @@ exec sleep 60"#;
             line.extend_from_slice(&data);
         }
         let descendant: libc::pid_t = std::str::from_utf8(&line).unwrap().trim().parse().unwrap();
+        let mut guard = KillGroupOnDrop(Some(descendant));
 
         let owner = RelayClientDisconnected {
             id_start: 1,
@@ -1642,27 +1660,12 @@ exec sleep 60"#;
         assert!(state.sessions.is_empty());
         assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant died");
 
-        DetachedDescendant {
-            tx,
-            rx,
-            state,
-            descendant,
-        }
-    }
-
-    #[tokio::test]
-    async fn owner_release_does_not_wait_for_detached_descendant() {
-        let DetachedDescendant {
-            tx,
-            mut rx,
-            state,
-            descendant,
-        } = release_with_detached_descendant(false).await;
-
-        // The descendant writes once more, then closes the output. The
-        // channel closes once the reporter has drained it; nothing it read
-        // may follow the release.
-        assert_eq!(unsafe { libc::kill(-descendant, libc::SIGUSR1) }, 0);
+        // The descendant writes once more, then exits and closes the output.
+        // The channel closes once the reporter has drained it; nothing it
+        // read may follow the release.
+        drop(std::fs::File::create(&fifo).unwrap());
+        guard.0 = None;
+        std::fs::remove_file(&fifo).unwrap();
         drop((tx, state));
         let after_release = time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -1674,13 +1677,13 @@ exec sleep 60"#;
     }
 
     #[tokio::test]
+    async fn owner_release_does_not_wait_for_detached_descendant() {
+        owner_release_skips_detached_descendant(false).await;
+    }
+
+    #[tokio::test]
     async fn owner_release_does_not_wait_for_detached_pty_descendant() {
-        let released = release_with_detached_descendant(true).await;
-        assert!(released.rx.is_empty());
-        assert_eq!(
-            unsafe { libc::kill(-released.descendant, libc::SIGKILL) },
-            0
-        );
+        owner_release_skips_detached_descendant(true).await;
     }
 
     #[tokio::test]

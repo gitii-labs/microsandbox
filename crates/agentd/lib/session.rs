@@ -688,7 +688,8 @@ impl ExecSession {
 impl Drop for ExecSession {
     fn drop(&mut self) {
         // The registration deliberately outlives the direct child so signals
-        // can still reach descendants while their output is being drained.
+        // can still reach descendants while their output is being drained. A
+        // detached session drops at the reap: no client is left to signal.
         self.process_manager.release(self.process_identity);
     }
 }
