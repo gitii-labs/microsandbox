@@ -186,7 +186,7 @@ _, err = conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
 
 Open a TCP connection from inside the guest to `host:port`, without publishing a port. The guest resolves `host`, so loopback reaches the guest's own listeners. `ctx` bounds the dial only. Each connection has its own agent connection, so many can be open at once.
 
-Both directions are bounded by bulk credit: the guest admits written bytes only up to the window it granted, and gets credit back for bytes it sent only as `Read` takes them. A destination that stops reading stops `Write` after at most that window plus socket buffers.
+Both directions are bounded by bulk credit. The guest admits written bytes only up to the window it granted, and grants more only as its destination takes them. The destination's bytes are credited once written into the connection's local socket, which fills when `Read` stops taking them. Either side that stops reading holds the other back after at most one credit window plus socket buffers.
 
 <p className="msb-label">Parameters</p>
 
@@ -694,8 +694,8 @@ A `net.Conn` to a guest-side TCP destination, with deadlines.
 | `Read` | Returns `io.EOF` once the destination ended its side in order, and an error if the guest connection failed first. |
 | `Write` | Blocks while the guest withholds credit; honours the write deadline. |
 | `CloseWrite()` | Half-close: the destination reads end of stream after every byte written before it. `Read` continues. |
-| `Close()` | Orderly close: delivers every written byte, then releases the guest connection without a reset. Bytes the guest stops accepting for longer than an idle bound are discarded with an error. |
-| `Abort()` | Discards unwritten bytes and resets the destination. |
+| `Close()` | Orderly close: delivers every written byte, finishes the stream, and releases the guest connection without a reset. If the guest stops accepting bytes for longer than an idle bound of 2 s, the connection is aborted instead and `Close` returns an error, as it does whenever a written byte did not reach the destination. |
+| `Abort()` | Discards unwritten bytes and resets the destination. A `TCPConn` that becomes unreachable without `Close` or `Abort` is aborted. |
 | `SetDeadline`, `SetReadDeadline`, `SetWriteDeadline` | As on `net.Conn`. |
 
 `Close` and `Abort` return `ErrTCPCleanupUnknown` when the guest did not confirm, in time, that it released its socket.
