@@ -33,8 +33,9 @@ labels, Docker metadata (including `metadata.db` and `opts.json`), retained file
 data, ownership and modes, native containers, missing-submount readiness failure,
 root agent and non-root PTY execution, HTTPS, SSH and metrics. A real Docker
 `ExecStopPost` waits three seconds before writing a retained shutdown marker.
-A final injected 180-second service stop must exceed the 120-second VMM deadline
-and surface as SDK failure, not successful shutdown. Console checks require
+A final injected 180-second service stop makes a bounded stop return a stop
+timeout without killing the guest, and makes an idle-timeout shutdown exceed the
+120-second VMM deadline and be recorded as a forced, non-zero exit. Console checks require
 systemd poweroff and reject reboot or halt-instead-of-poweroff. On ARM64 the
 fixture also runs the bundled static amd64 container through explicit
 `qemu-x86_64-static` user-mode emulation.

@@ -769,7 +769,7 @@ println!("exited: {}", status.success());
 
 </Accordion>
 
-Stop the sandbox and wait for runtime completion. An owned child-process handle supplies its actual exit status. Detached or connected handles retain the existing synthetic success status; use [`stop()`](#sb-stop) or [`stop_with_timeout()`](#sb-stop_with_timeout) when you only need completion.
+Stop the sandbox and wait for runtime completion. An owned child-process handle supplies its actual exit status. Requires lifecycle ownership: a detached or reconnected handle returns an error without stopping anything; use [`stop()`](#sb-stop) or [`stop_with_timeout()`](#sb-stop_with_timeout) instead.
 
 <p className="msb-label">Returns</p>
 

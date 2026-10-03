@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
   "packages": {
     "rustup": "1.28.2",
-    "just": "1.42.4",
+    "just": "1.58.0",
     "pre-commit": "4.3.0",
     "gcc": "14.3.0",
     "gnumake": "4.4.1",

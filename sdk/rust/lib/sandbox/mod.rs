@@ -956,17 +956,18 @@ impl Sandbox {
     /// **Local backend only.** Cloud sandboxes have no host process to wait
     /// on; use [`stop`](Self::stop) and poll [`status`](Self::status) instead.
     ///
-    /// With no owned child-process handle, preserves the existing synthetic success status
-    /// after runtime completion; this is not the guest's actual exit code.
+    /// Requires lifecycle ownership: a reconnected or detached handle has no child process
+    /// whose exit status it could return, so it is rejected before anything is stopped.
     #[cfg(feature = "local")]
     pub async fn stop_and_wait(&self) -> MicrosandboxResult<ExitStatus> {
         let local = self.require_local(Operation::SandboxStopAndWait)?;
-        self.stop().await?;
         if local.handle.is_none() {
-            Ok(std::process::ExitStatus::default())
-        } else {
-            self.wait().await
+            return Err(crate::MicrosandboxError::Runtime(
+                "cannot stop_and_wait: not the lifecycle owner; use stop instead".into(),
+            ));
         }
+        self.stop().await?;
+        self.wait().await
     }
 
     /// Kill the sandbox immediately and wait until stopped state is observed.
@@ -2089,6 +2090,78 @@ mod tests {
         remove_dir_if_exists(&sandbox_dir).unwrap();
 
         assert!(!sandbox_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_rejects_a_handle_without_lifecycle_ownership() {
+        use tokio::io::AsyncWriteExt;
+
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let backend = std::sync::Arc::new(
+            crate::test_support::local_backend_builder(home.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let row = super::sandbox_entity::ActiveModel {
+            name: Set("reconnected".to_string()),
+            config: Set("{}".to_string()),
+            status: Set(SandboxStatus::Running),
+            ephemeral: Set(false),
+            ..Default::default()
+        }
+        .insert(backend.db().await.unwrap().write())
+        .await
+        .unwrap();
+
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let handshake = tokio::spawn(async move {
+            use microsandbox_protocol::{
+                codec,
+                core::Ready,
+                message::{Message, MessageType},
+            };
+            server_io.write_all(&1u32.to_be_bytes()).await.unwrap();
+            server_io.write_all(&1024u32.to_be_bytes()).await.unwrap();
+            codec::write_message(
+                &mut server_io,
+                &Message::with_payload(MessageType::Ready, 0, &Ready::default()).unwrap(),
+            )
+            .await
+            .unwrap();
+            server_io
+        });
+        let client = crate::agent::AgentClient::connect_stream_with_timeout(
+            client_io,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let _server_io = handshake.await.unwrap();
+        let mut config = super::SandboxConfig::default();
+        config.spec.name = "reconnected".into();
+        let reconnected = super::Sandbox::from_local(
+            backend.clone(),
+            crate::backend::SandboxLocalState {
+                db_id: row.id,
+                handle: None,
+                client: std::sync::Arc::new(client),
+            },
+            config,
+        );
+
+        let error = reconnected.stop_and_wait().await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("not the lifecycle owner"),
+            "{error}"
+        );
+        let stored = super::sandbox_entity::Entity::find_by_id(row.id)
+            .one(backend.db().await.unwrap().read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SandboxStatus::Running);
     }
 
     #[tokio::test]

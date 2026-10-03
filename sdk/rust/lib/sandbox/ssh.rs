@@ -2396,8 +2396,12 @@ async fn run_tcp_forward(
                 ),
             );
         };
-        // Finished relays still leave the guest stream to close once the SSH channel does.
-        tokio::join!(relays, channel_stopped(&mut stop));
+        // A closed SSH channel cancels relays still waiting on the guest or the peer; relays that
+        // finished first still leave the guest stream to close once the SSH channel does.
+        tokio::select! {
+            () = relays => channel_stopped(&mut stop).await,
+            () = channel_stopped(&mut stop) => {}
+        }
     }
 
     let cleanup = async {
@@ -3696,7 +3700,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "local"))]
 #[path = "ssh_tcp_tests.rs"]
 mod tcp_tests;
 

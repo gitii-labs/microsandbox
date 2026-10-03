@@ -444,15 +444,8 @@ disks. Extra disks are not included in root snapshots. A sandbox that keeps
 agentd as PID 1 has no such deadline: its short flush window is a hint, not a
 verdict, and its exit stays clean.
 
-A stop is confirmed only once the SDK can take the lock on every disk image the
-sandbox attached, which is what proves the runtime let go of them. Two limits
-are worth knowing. An image that no longer exists, or that the caller cannot
-open, counts as released — nothing can be holding it, and a stop must not fail
-over an image nobody can prove anything about. A read-only attachment gives no
-evidence either: shared locks coexist, so a successful probe there says only
-that no writer holds the image. On Windows the probe is skipped entirely,
-because the parent process holds the sidecar lock for as long as it lives; an
-identity-checked reap of the VM process covers that platform instead.
+A stop is confirmed only once the runtime process has exited and released the
+lifecycle lock and every disk it owned, which is what proves the disks are free.
 
 ## Reference
 

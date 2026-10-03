@@ -3826,7 +3826,6 @@ dependencies = [
  "keyring",
  "libc",
  "microsandbox-agent-client",
- "microsandbox-agentd",
  "microsandbox-control-client",
  "microsandbox-db",
  "microsandbox-filesystem",

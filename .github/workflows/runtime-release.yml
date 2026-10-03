@@ -187,7 +187,7 @@ jobs:
 
       - name: Build msb
         run: |
-          cargo build --locked --release --no-default-features --features net,ssh -p microsandbox-cli
+          cargo build --locked --release --no-default-features --features net,ssh,embed-binaries -p microsandbox-cli
           cp target/release/msb build/msb
           if [ "${{ matrix.os }}" = darwin ]; then
             codesign --entitlements msb-entitlements.plist --force -s - build/msb

@@ -1570,10 +1570,7 @@ fn run(
                 }
             }
 
-            if startup_shared
-                .resident_paused
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if paused_guest_exit_is_forced(&startup_shared.resident_paused, &startup_forced_exit) {
                 startup_exit_handle.trigger();
                 return;
             }
@@ -3420,6 +3417,22 @@ fn guest_shutdown_flush_timeout_with_override(
     }
 }
 
+/// Whether the resident VM is paused, in which case the caller ends it without asking the
+/// guest to shut down: a suspended guest cannot process shutdown, so it never powers off.
+/// For a handoff guest that is a host-forced exit and is recorded as one.
+fn paused_guest_exit_is_forced(
+    resident_paused: &std::sync::atomic::AtomicBool,
+    forced_exit: &ForcedExit,
+) -> bool {
+    if !resident_paused.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    if forced_exit.force() {
+        tracing::error!("paused guest released without a poweroff; shutdown is unclean");
+    }
+    true
+}
+
 #[cfg(unix)]
 fn spawn_parent_watchdog(
     parent_watchdog: OwnedFd,
@@ -3439,12 +3452,8 @@ fn spawn_parent_watchdog(
                 Ok(ParentWatchdogSignal::ParentExited) => {
                     tracing::info!("creator process exited; stopping attached sandbox");
                     exit_reason.store(EXIT_REASON_PARENT_EXIT, std::sync::atomic::Ordering::SeqCst);
-                    // A suspended guest cannot process shutdown. Release the resident VM
-                    // directly without thawing user workloads merely to stop them.
-                    if shared
-                        .resident_paused
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
+                    // Released directly, without thawing user workloads merely to stop them.
+                    if paused_guest_exit_is_forced(&shared.resident_paused, &forced_exit) {
                         exit_handle.trigger();
                         return;
                     }
@@ -4524,6 +4533,33 @@ mod tests {
         assert!(
             !forced.observer_started(),
             "the verdict stays clean once the observer has claimed it"
+        );
+    }
+
+    #[test]
+    fn paused_handoff_guest_exit_is_recorded_as_forced() {
+        let running = std::sync::atomic::AtomicBool::new(false);
+        let paused = std::sync::atomic::AtomicBool::new(true);
+
+        let forced = super::ForcedExit::new(true);
+        assert!(
+            !super::paused_guest_exit_is_forced(&running, &forced),
+            "a running guest is asked to power off instead"
+        );
+        assert!(
+            super::paused_guest_exit_is_forced(&paused, &forced),
+            "a paused guest is released without a poweroff"
+        );
+        assert!(
+            forced.observer_started(),
+            "so a handoff guest's exit is never clean"
+        );
+
+        let disarmed = super::ForcedExit::new(false);
+        assert!(super::paused_guest_exit_is_forced(&paused, &disarmed));
+        assert!(
+            !disarmed.observer_started(),
+            "an agentd-as-PID-1 guest keeps its clean exit"
         );
     }
 

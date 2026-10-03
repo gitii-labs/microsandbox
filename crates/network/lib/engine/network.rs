@@ -495,13 +495,6 @@ impl SmoltcpNetwork {
         for secret in &self.config.config().secrets.secrets {
             vars.push((secret.env_var.clone(), secret.placeholder.clone()));
         }
-        for oauth in &self.config.config().secrets.oauth {
-            vars.push((oauth.access_env_var.clone(), oauth.access_sentinel.clone()));
-            vars.push((
-                oauth.refresh_env_var.clone(),
-                oauth.refresh_sentinel.clone(),
-            ));
-        }
 
         vars
     }
@@ -543,16 +536,25 @@ impl SmoltcpNetwork {
     /// Real secret values stay in the host-side network handler and never
     /// enter this payload.
     pub fn guest_secret_env(&self) -> Vec<BootstrapEnvVar> {
-        self.config
-            .config()
-            .secrets
-            .secrets
-            .iter()
-            .map(|secret| BootstrapEnvVar {
-                key: secret.env_var.clone(),
-                value: secret.placeholder.clone(),
-            })
-            .collect()
+        let secrets = &self.config.config().secrets;
+        let placeholders = secrets.secrets.iter().map(|secret| BootstrapEnvVar {
+            key: secret.env_var.clone(),
+            value: secret.placeholder.clone(),
+        });
+        // OAuth grants expose sentinels only; the broker keeps the real tokens.
+        let sentinels = secrets.oauth.iter().flat_map(|oauth| {
+            [
+                BootstrapEnvVar {
+                    key: oauth.access_env_var.clone(),
+                    value: oauth.access_sentinel.clone(),
+                },
+                BootstrapEnvVar {
+                    key: oauth.refresh_env_var.clone(),
+                    value: oauth.refresh_sentinel.clone(),
+                },
+            ]
+        });
+        placeholders.chain(sentinels).collect()
     }
 
     /// CA certificate PEM bytes if TLS interception is enabled.
@@ -1194,6 +1196,35 @@ mod tests {
         assert_eq!(
             format_mac([0x02, 0x6d, 0x73, 0x00, 0x00, 0x01]),
             "02:6d:73:00:00:01"
+        );
+    }
+
+    #[test]
+    fn guest_secret_env_exposes_oauth_sentinels() {
+        let mut config = NetworkConfig::default();
+        config
+            .secrets
+            .oauth
+            .push(oauth_secret("/platform/broker.sock"));
+        let net = SmoltcpNetwork::build(
+            resolved(config),
+            0,
+            DeploymentProfile::SingleTenant,
+            routes(true, false),
+        )
+        .unwrap();
+
+        let env: Vec<(String, String)> = net
+            .guest_secret_env()
+            .into_iter()
+            .map(|var| (var.key, var.value))
+            .collect();
+        assert_eq!(
+            env,
+            vec![
+                ("ACCESS_TOKEN".into(), "$ACCESS".into()),
+                ("REFRESH_TOKEN".into(), "$REFRESH".into()),
+            ]
         );
     }
 

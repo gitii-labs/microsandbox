@@ -4,7 +4,16 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use microsandbox::Sandbox;
+use microsandbox::{MicrosandboxError, Sandbox};
+use microsandbox_db::entity::{run as run_row, sandbox as sandbox_row};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Inactivity after the last guest exec before the runtime requests an idle shutdown.
+const IDLE_TIMEOUT_SECS: u64 = 10;
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -19,7 +28,13 @@ fn prerequisite(name: &str) -> PathBuf {
     path
 }
 
-async fn boot(name: &str, root: &Path, working: &Path, retained: Option<&Path>) -> Sandbox {
+async fn boot(
+    name: &str,
+    root: &Path,
+    working: &Path,
+    retained: Option<&Path>,
+    idle_timeout_secs: Option<u64>,
+) -> Sandbox {
     let mut builder = Sandbox::builder(name)
         .image(root.to_path_buf())
         .init("/sbin/init")
@@ -33,7 +48,29 @@ async fn boot(name: &str, root: &Path, working: &Path, retained: Option<&Path>) 
             mount.disk(retained).fstype("ext4")
         });
     }
+    if let Some(secs) = idle_timeout_secs {
+        builder = builder.idle_timeout(secs);
+    }
     builder.create().await.expect("boot managed Docker VM")
+}
+
+/// The newest run row of the sandbox named `name`, read without reconciling it.
+async fn latest_run(name: &str) -> run_row::Model {
+    let backend = microsandbox::backend::default_backend();
+    let pools = backend.as_local().unwrap().db().await.unwrap();
+    let sandbox = sandbox_row::Entity::find()
+        .filter(sandbox_row::Column::Name.eq(name))
+        .one(pools.read())
+        .await
+        .unwrap()
+        .expect("sandbox row");
+    run_row::Entity::find()
+        .filter(run_row::Column::SandboxId.eq(sandbox.id))
+        .order_by_desc(run_row::Column::Id)
+        .one(pools.read())
+        .await
+        .unwrap()
+        .expect("run row")
 }
 
 async fn shell(sandbox: &Sandbox, command: &str) -> String {
@@ -132,7 +169,7 @@ async fn managed_docker_retains_complete_volumes_and_reports_shutdown_failure() 
     microsandbox::disk::create(&retained, 512 * 1024 * 1024).unwrap();
     let name = format!("docker-runtime-{}", std::process::id());
 
-    let first = boot(&name, &root, &working, Some(&retained)).await;
+    let first = boot(&name, &root, &working, Some(&retained), None).await;
     eprintln!(
         "{}",
         shell(&first, "bash -x /usr/local/bin/docker-runtime-proof ready").await
@@ -175,7 +212,7 @@ async fn managed_docker_retains_complete_volumes_and_reports_shutdown_failure() 
     std::fs::remove_file(&working).expect("delete working disk only after stop");
     microsandbox::disk::create(&working, 2 * 1024 * 1024 * 1024).unwrap();
 
-    let second = boot(&name, &root, &working, Some(&retained)).await;
+    let second = boot(&name, &root, &working, Some(&retained), None).await;
     shell(&second, "bash -x /usr/local/bin/docker-runtime-proof ready").await;
     shell(&second, "/usr/local/bin/docker-runtime-proof verify").await;
     stop(second, &name).await;
@@ -183,28 +220,86 @@ async fn managed_docker_retains_complete_volumes_and_reports_shutdown_failure() 
         "PASS complete volumes identity/metadata/options/data/modes after working disk replacement"
     );
 
-    let missing = boot(&name, &root, &working, None).await;
+    let missing = boot(&name, &root, &working, None, None).await;
     shell(&missing, "for i in $(seq 1 30); do systemctl is-failed docker.service && break; sleep 1; done; ! docker info; ! mountpoint -q /var/lib/docker/volumes; systemctl is-failed docker.service").await;
     missing.stop().await.expect("stop missing-mount VM");
     Sandbox::remove(&name).await.unwrap();
     eprintln!("PASS missing retained mount fails Docker readiness");
 
-    let hung = boot(&name, &root, &working, Some(&retained)).await;
-    shell(&hung, "bash -x /usr/local/bin/docker-runtime-proof ready").await;
-    shell(&hung, "touch /var/lib/docker/volumes/proof-hang").await;
+    // Stop records intent and waits: it never forces a hung guest's exit.
+    let hung = boot(&name, &root, &working, Some(&retained), None).await;
+    shell(
+        &hung,
+        "bash -x /usr/local/bin/docker-runtime-proof ready && touch /var/lib/docker/volumes/proof-hang",
+    )
+    .await;
     hung.detach().await;
     let handle = Sandbox::get(&name).await.unwrap();
+    let budget = Duration::from_secs(30);
+    let result = handle.stop_with_timeout(budget).await;
+    assert!(
+        matches!(result, Err(MicrosandboxError::StopTimeout { timeout, .. }) if timeout == budget),
+        "hung service stop must time out: {result:?}"
+    );
+    let backend = microsandbox::backend::default_backend();
+    let local = backend.as_local().unwrap();
+    assert!(
+        microsandbox_runtime::ipc::try_acquire_lifecycle_guard(&local.config().run_dir(), &name)
+            .unwrap()
+            .is_none(),
+        "a stop timeout must leave the runtime running"
+    );
+    let run = latest_run(&name).await;
+    assert_eq!(run.status, run_row::RunStatus::Running, "{run:?}");
+    handle.kill().await.expect("kill ends the hung sandbox");
+    assert!(
+        microsandbox_runtime::ipc::try_acquire_lifecycle_guard(&local.config().run_dir(), &name)
+            .unwrap()
+            .is_some(),
+        "kill must release the runtime"
+    );
+    handle.remove().await.unwrap();
+    eprintln!("PASS stop timeout leaves the hung sandbox running until kill: {result:?}");
+
+    // An idle timeout requests shutdown and forces the exit once the handoff grace expires.
+    let idle = boot(
+        &name,
+        &root,
+        &working,
+        Some(&retained),
+        Some(IDLE_TIMEOUT_SECS),
+    )
+    .await;
+    shell(
+        &idle,
+        "bash -x /usr/local/bin/docker-runtime-proof ready && touch /var/lib/docker/volumes/proof-hang",
+    )
+    .await;
+    idle.detach().await;
     let started = Instant::now();
-    let result = handle.stop_with_timeout(Duration::from_secs(150)).await;
+    let handle = Sandbox::get(&name).await.unwrap();
+    let stopped = handle.wait_until_stopped().await.unwrap();
     assert!(
-        result.is_err(),
-        "host shutdown deadline must not report success"
+        started.elapsed() >= microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT,
+        "exit forced before the handoff grace expired: {stopped:?}"
+    );
+    let run = latest_run(&name).await;
+    assert_eq!(
+        run.termination_reason,
+        Some(run_row::TerminationReason::IdleTimeout),
+        "{run:?}"
+    );
+    assert_eq!(
+        run.exit_code,
+        Some(1),
+        "a forced exit is never clean: {run:?}"
     );
     assert!(
-        started.elapsed() >= Duration::from_secs(120),
-        "failure happened before VMM service deadline: {result:?}"
+        run.termination_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("host forced the exit")),
+        "{run:?}"
     );
-    eprintln!("PASS shutdown deadline reports failure: {result:?}");
-    handle.kill().await.ok();
+    eprintln!("PASS idle shutdown deadline records a forced exit: {run:?}");
     handle.remove().await.unwrap();
 }
