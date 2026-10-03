@@ -197,6 +197,21 @@ func TestDialTCP(t *testing.T) {
 		}
 	})
 
+	t.Run("the destination's end of stream reads as EOF", func(t *testing.T) {
+		startGuestServer(t, ctx, sb, 9004, "nc -l -p 9004 -e echo banner")
+		conn, err := sb.DialTCP(ctx, "127.0.0.1", 9004)
+		if err != nil {
+			t.Fatalf("DialTCP: %v", err)
+		}
+		got, err := io.ReadAll(conn)
+		if err != nil || string(got) != "banner\n" {
+			t.Fatalf("read to EOF: %q %v", got, err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+
 	t.Run("a refused port fails the dial", func(t *testing.T) {
 		if _, err := sb.DialTCP(ctx, "127.0.0.1", 9); err == nil {
 			t.Fatal("dial to a closed port succeeded")

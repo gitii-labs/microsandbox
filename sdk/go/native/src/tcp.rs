@@ -138,7 +138,8 @@ async fn relay_to_guest(
     let mut buffer = vec![0; SOCKET_CHUNK];
     let outcome = loop {
         let read = tokio::select! {
-            () = stop.cancelled() => break Ok(()),
+            // An abort or a failed guest stream: Go's further writes have nowhere to go.
+            () = stop.cancelled() => break Err("guest TCP stream ended".into()),
             read = async {
                 loop {
                     socket.readable().await?;
