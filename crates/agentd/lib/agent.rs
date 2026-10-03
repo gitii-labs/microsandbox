@@ -4646,13 +4646,23 @@ mod tests {
             for retired in [false, true] {
                 if retired {
                     for expected in [MessageType::BulkFinish, MessageType::TcpClosed] {
-                        let envelope = control.try_recv().unwrap();
-                        let SessionOutput::Raw(mut output) = envelope.output else {
-                            panic!()
+                        // Reports that the host-to-guest side drained may come in between.
+                        let (output, message) = loop {
+                            let envelope = control.try_recv().unwrap();
+                            let SessionOutput::Raw(mut output) = envelope.output else {
+                                panic!()
+                            };
+                            let message = codec::try_decode_from_buf(&mut output.frame)
+                                .unwrap()
+                                .unwrap();
+                            if message.t == MessageType::BulkCredit
+                                && message.payload::<BulkCredit>().unwrap().flow
+                                    == BulkFlow::HostToGuest
+                            {
+                                continue;
+                            }
+                            break (output, message);
                         };
-                        let message = codec::try_decode_from_buf(&mut output.frame)
-                            .unwrap()
-                            .unwrap();
                         assert_eq!(message.t, expected);
                         if expected == MessageType::BulkFinish {
                             assert_eq!(

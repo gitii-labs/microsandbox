@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -244,8 +244,6 @@ enum ChannelState {
 struct TcpBulkSender {
     state: Mutex<BulkSendState>,
     credit_ready: Notify,
-    /// Bytes the guest has reported written to its destination.
-    consumed: AtomicU64,
     closed: AtomicBool,
 }
 
@@ -1102,7 +1100,6 @@ impl TcpBulkSender {
         Self {
             state: Mutex::new(state),
             credit_ready: Notify::new(),
-            consumed: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         }
     }
@@ -1172,16 +1169,19 @@ impl TcpBulkSender {
             })?;
         // A repeated or stale grant is no progress, so it must not look like one.
         if advanced {
-            self.consumed
-                .fetch_max(credit.consumed_offset, Ordering::AcqRel);
             self.credit_ready.notify_waiters();
         }
         Ok(())
     }
 
-    /// Whether the guest has not yet reported every sent byte written to its destination.
-    async fn unconsumed(&self) -> bool {
-        self.consumed.load(Ordering::Acquire) < self.state.lock().await.next_offset()
+    /// Bytes the guest has reported written to its destination, and whether that is every byte
+    /// sent to it.
+    async fn consumed(&self) -> (u64, bool) {
+        let state = self.state.lock().await;
+        (
+            state.consumed_offset(),
+            state.consumed_offset() == state.next_offset(),
+        )
     }
 
     async fn finish(&self, client: &AgentClient, id: u32) -> MicrosandboxResult<()> {
@@ -2436,9 +2436,12 @@ async fn run_tcp_forward(
             }
         }
         // The relays keep running: the guest pump applies credit and the output relay discards
-        // and credits guest output. The deadline is idle time: every credit grant re-arms it
-        // until the guest has written every byte sent to it, and from then on it bounds the wait
-        // for the guest's terminal reply.
+        // and credits guest output. The deadline is idle time. While the input drains, every
+        // credit grant re-arms it; after the finish only the guest reporting more bytes written
+        // does, until it has written all of them. From then on it bounds the wait for the guest's
+        // terminal reply.
+        let mut deadline = tokio::time::Instant::now() + SSH_TCP_CLOSE_TIMEOUT;
+        let mut last_consumed = 0;
         loop {
             if let Some(terminal) = terminated {
                 break terminal;
@@ -2447,7 +2450,7 @@ async fn run_tcp_forward(
                 break false;
             }
             let awaiting_credit = match bulk_sender.as_deref() {
-                Some(bulk) => finished.is_none() || bulk.unconsumed().await,
+                Some(bulk) => finished.is_none() || !bulk.consumed().await.1,
                 None => false,
             };
             let credited = async {
@@ -2457,11 +2460,22 @@ async fn run_tcp_forward(
                 }
             };
             tokio::select! {
-                delivered = &mut input, if finished.is_none() => finished = Some(delivered),
+                delivered = &mut input, if finished.is_none() => {
+                    finished = Some(delivered);
+                    deadline = tokio::time::Instant::now() + SSH_TCP_CLOSE_TIMEOUT;
+                }
                 () = &mut output, if !output_done => output_done = true,
                 terminal = &mut guest, if terminated.is_none() => terminated = Some(terminal),
-                () = credited => {}
-                () = tokio::time::sleep(SSH_TCP_CLOSE_TIMEOUT) => break false,
+                () = credited => {
+                    if let Some(bulk) = bulk_sender.as_deref() {
+                        let (consumed, _) = bulk.consumed().await;
+                        if finished.is_none() || consumed > last_consumed {
+                            deadline = tokio::time::Instant::now() + SSH_TCP_CLOSE_TIMEOUT;
+                        }
+                        last_consumed = consumed;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => break false,
             }
         }
     } else {

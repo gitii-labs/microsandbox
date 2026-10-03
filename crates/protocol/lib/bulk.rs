@@ -430,6 +430,11 @@ impl BulkSendState {
         self.credit_limit
     }
 
+    /// Return how many bytes the receiver has reported consuming.
+    pub fn consumed_offset(&self) -> u64 {
+        self.consumed_offset
+    }
+
     /// Return the maximum payload negotiated for this flow.
     pub fn max_record_payload(&self) -> u32 {
         self.max_record_payload
