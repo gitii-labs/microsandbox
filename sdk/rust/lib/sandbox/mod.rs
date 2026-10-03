@@ -41,6 +41,7 @@ mod restore_builder;
 pub(crate) mod restore_resources;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+pub mod tcp;
 // Windows-only in shipping builds, but kept compiled under `test` so the
 // platform-independent encoding logic is covered on every host.
 mod status;

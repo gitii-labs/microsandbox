@@ -77,6 +77,7 @@ pub use sandbox::ssh::{
     SshClient, SshClientOptionsBuilder, SshExecOptionsBuilder, SshOutput, SshServer,
     SshServerOptionsBuilder, SshStdioStream,
 };
+pub use sandbox::tcp::{GUEST_TCP_CLOSE_IDLE_TIMEOUT, GuestTcpCleanup, GuestTcpStream};
 #[cfg(feature = "local")]
 pub use sandbox::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
