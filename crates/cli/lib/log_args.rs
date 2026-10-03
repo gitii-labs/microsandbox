@@ -58,7 +58,7 @@ pub fn init_tracing(log_level: Option<LogLevel>, ansi: bool) {
     if let Some(level) = log_level {
         // Silence oci_client logs — the crate logs the auth token in debug mode
         // See: https://github.com/oras-project/rust-oci-client/issues/254
-        let filter = EnvFilter::new(level.as_tracing_level().to_string())
+        let filter = EnvFilter::new(level.as_str())
             .add_directive("oci_client=info".parse::<Directive>().unwrap());
 
         tracing_subscriber::fmt()
@@ -83,7 +83,7 @@ pub fn init_sandbox_tracing(log_level: Option<LogLevel>) {
 
 fn sandbox_filter(log_level: Option<LogLevel>) -> EnvFilter {
     match log_level {
-        Some(level) => EnvFilter::new(level.as_tracing_level().to_string())
+        Some(level) => EnvFilter::new(level.as_str())
             // oci_client logs auth tokens at debug level.
             .add_directive("oci_client=info".parse::<Directive>().unwrap()),
         None => EnvFilter::new("off")
@@ -145,7 +145,7 @@ mod tests {
 
     #[derive(Debug, Subcommand)]
     enum TestCommand {
-        Sandbox,
+        Machine,
         Run,
     }
 
@@ -157,13 +157,13 @@ mod tests {
 
     #[test]
     fn test_no_log_flag_means_silent() {
-        let cli = TestCli::parse_from(["msb", "sandbox"]);
+        let cli = TestCli::parse_from(["msb", "machine"]);
         assert_eq!(cli.logs.selected_level(), None);
     }
 
     #[test]
     fn test_log_flags_conflict() {
-        let err = TestCli::try_parse_from(["msb", "--info", "--debug", "sandbox"]).unwrap_err();
+        let err = TestCli::try_parse_from(["msb", "--info", "--debug", "machine"]).unwrap_err();
         let rendered = err.to_string();
         assert!(rendered.contains("--debug"));
         assert!(rendered.contains("--info"));

@@ -1,0 +1,16 @@
+//! Placeholder-based secret injection for TLS-intercepted connections.
+//!
+//! Secrets use placeholder protection: the sandbox receives a placeholder
+//! string (e.g. `$MSB_a8f3b2c1`), never the real value. The TLS proxy
+//! substitutes the real value only when the request goes to an allowed host.
+
+pub mod config;
+pub(crate) mod sentinel;
+#[cfg(feature = "engine")]
+pub use crate::engine::secrets::detector;
+#[cfg(feature = "engine")]
+pub use crate::engine::secrets::handle;
+#[cfg(feature = "engine")]
+pub use crate::engine::secrets::handler;
+#[cfg(feature = "engine")]
+pub use crate::engine::secrets::oauth;

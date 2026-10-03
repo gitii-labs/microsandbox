@@ -31,6 +31,7 @@ Repository layout:
 |-- AGENTS.md
 |-- Cargo.lock
 |-- Cargo.toml
+|-- COMPATIBILITY.md
 |-- DEVELOPMENT.md
 |-- Dockerfile.agentd
 |-- justfile
@@ -48,9 +49,10 @@ Repository layout:
 |   |-- network/
 |   |-- protocol/
 |   |-- runtime/
-|   |-- test-init/
-|   |-- test-macros/
-|   |-- test-utils/
+|   |-- testing/
+|   |   |-- init/
+|   |   |-- macros/
+|   |   `-- utils/
 |   `-- utils/
 |-- docs/
 |   |-- changelog/
@@ -91,11 +93,90 @@ Repository layout:
 
 ## Design Principles
 
-- Before making or continuing a change that may introduce a regression or breaking change, stop and alert the human with the likely impact and affected workflows.
+- Before making or continuing a change that may introduce a regression, breaking change, or backward-compatibility risk identified below, stop and alert the human with the likely impact and affected workflows.
 - Keep changes narrowly scoped to the requested behavior. Avoid drive-by refactors, unrelated formatting, or dependency churn.
 - Treat sandbox isolation, host filesystem access, networking, and secret handling as security-sensitive. Validate inputs at boundaries and avoid exposing host paths, credentials, or ambient privileges.
 - For public APIs, keep the Rust SDK, CLI, Python SDK, Node SDK, Go SDK, docs, and examples consistent when they describe the same capability.
 - Prefer explicit errors with useful context over silent fallbacks.
+
+## Host Path Handling
+
+- For every path input, identify whether it belongs to the local host, a remote backend, or the guest before resolving it. Never resolve cloud or guest paths against the SDK client's working directory.
+- Resolve local host paths against their documented base once, before deferred use or persistence. Retained handles and asynchronous operations must reuse that resolved path, including their final writes. Sandbox and SDK configuration-file inputs use the contributing file's directory, including managed SDK settings.
+- Making a path absolute must preserve its symlink policy. Do not substitute filesystem canonicalization or collapse parent components across symlinks without reviewing the behavior change.
+- Preserve existing persisted relative paths and their legacy startup/resource-inheritance behavior. They have no reliable original base unless it was saved: do not reject, migrate, prompt about, or rewrite them during restart. Capture absolute host inputs only for new sandboxes, including new restore/branch children, without modifying their source sandbox.
+- Path changes need regression coverage with different creation and consumption directories, plus missing targets and symlinks where applicable. Change process cwd only inside an isolated test subprocess. Review sandbox mounts, rootfs paths, TLS files, backend storage roots, snapshots, transfers, and generated commands when adding a new path input.
+
+## Backward Compatibility Review
+
+Backward-compatibility detection is a required part of working on this project. Surface potential compatibility breaks before making or continuing the affected change.
+
+The review's immediate goal is proactive detection and reporting, not automatically implementing compatibility fixes. Do not silently add compatibility layers, migrations, legacy codecs, fallback paths, or downgrade behavior. When a material risk is found, explain the affected releases, components, persisted artifacts, users or workflows, the likely failure mode, and the available options; then wait for human direction as required by the Design Principles above.
+
+SDK-to-`msb` compatibility is required in both directions for future changes:
+
+- Newer SDKs must continue to work with older `msb` binaries for existing supported workflows.
+- Newer `msb` binaries must continue to work with older SDKs for existing supported workflows.
+- Apply this requirement to every language SDK and the complete SDK/runtime interaction, including binary resolution, launch arguments and JSON, inherited descriptors, startup responses, control and agent protocols, and shared persisted state. Compatibility with an already-running agent alone does not establish launch compatibility.
+- A new feature unavailable in an older peer must be detected and produce a clear unsupported-feature or upgrade-required error, or use an explicitly approved fallback. It must not silently lose requested behavior or break unrelated existing functionality.
+- Do not assume matching package versions or bundled binaries satisfy this requirement. Review independently installed runtimes, including those resolved from `MSB_HOME`, and use cross-version tests or historical fixtures for affected boundaries; same-version tests alone are insufficient evidence.
+
+Bidirectional SDK/runtime compatibility does not mean freezing the shared catalog at the oldest installed or running version. Newer SDKs and CLIs may apply validated catalog upgrades while older VM runtimes remain running. Do not add a blanket "stop all sandboxes before upgrading" gate or preserve an old catalog solely because an older runtime is present. Distinguish an older VM process continuing its database writes from an older SDK/CLI reopening the catalog and running its own schema-admission checks; test and report these separately rather than treating one as evidence for the other.
+
+For online catalog upgrades, preserve migration serialization, transaction safety, recovery journals, and active maintenance leases. Evaluate the actual SQL and persisted-data contracts used by older runtimes; neither an additive-looking migration nor a version difference alone proves safety or incompatibility. Live tests must exercise an older VM across the upgrade, verify retained execution and data, and cover new-SDK launch, control, restart, and cleanup through older runtimes. If a concrete incompatible migration is found, report that specific conflict for a decision rather than reintroducing a blanket compatibility blocker.
+
+If a proposed change may violate either direction, flag it before implementation and wait for human direction; this requirement does not authorize silently building adapters or choosing a breaking change. Any exception or change to the supported compatibility horizon requires explicit human direction. The known v0.6.9 ↔ v0.6.10 launch incompatibility is an accepted historical exception and must not be repaired as part of unrelated work. It does not exempt future changes from this review or requirement.
+
+By explicit user direction on 2026-09-13, the historical SDK/runtime compatibility target for this work is v0.6.x, with v0.6.0 as the floor, against the current implementation candidate in both directions. Releases older than v0.6.0, including all v0.4.x and v0.5.x releases, are excluded from required compatibility. Preserve their historical results as diagnostic evidence. This supersedes the earlier exact-v0.5.0 exclusion. Existing codecs and capability gates are not removed or changed by this scope decision. The known v0.6.9 ↔ v0.6.10 exception remains unchanged; other v0.6.x failures are not waived.
+
+Before changing an existing cross-version boundary, determine:
+
+- What older component, binary, sandbox, or persisted state may interact with the change.
+- Which side is the old producer or consumer.
+- Whether failure would be a clean refusal, loss of functionality, stranded state, silent misinterpretation, data loss, or possible corruption.
+- Whether the repository has a fixture or test using an actual older artifact or binary, rather than only same-version round trips.
+
+Always perform this review when a change affects any of these areas:
+
+- Host-to-guest framing, message names, flags, IDs, payload fields, version negotiation, bootstrap, or lifecycle handshakes.
+- Unix sockets, Windows named pipes, path hashing, relay routing, control messages, inherited file descriptors, signals, or process-launch JSON.
+- SQLite schemas, migration history, persisted configuration, downgrade behavior, journals, leases, or runtime recovery state.
+- ext4, EROFS, VMDK, OCI layers, filesystem metadata, device IDs, mount tags, block paths, or other on-disk formats.
+- Snapshots, archives, manifests, canonical serialization, digests, parent identities, filenames, or atomic publication order.
+- Cache keys, materializer ABIs, layer ordering, whiteouts, hardlinks, xattrs, or content-addressed storage.
+- The runtime, agentd, libkrun, firmware, kernel patches, virtio devices, shared-memory layouts, or package-version coupling.
+- Network address derivation, MACs, interface names, DNS aliases, published ports, TCP/UDP behavior, vsock, SSH, or SFTP behavior.
+- Heartbeats, boot errors, metrics, logs, lock files, runtime directories, or other files consumed across process or release boundaries.
+
+Check each applicable compatibility direction:
+
+1. A new host interacting with an old running sandbox and old agentd.
+2. A new release opening an existing `MSB_HOME` and its database.
+3. A new release reading old disks, snapshots, archives, caches, and filesystem metadata.
+4. An older release encountering state written by the new release, including downgrade refusal behavior.
+5. Exported artifacts moving between releases, platforms, or architectures.
+6. Independently running components from different releases communicating during an upgrade.
+7. A newer SDK launching and operating an older `msb` binary.
+8. An older SDK launching and operating a newer `msb` binary.
+
+Treat stable strings, numeric constants, paths, hashes, serialized field details, ordering guarantees, timing, and error interpretations as compatibility-sensitive even when they are not part of the public API.
+
+For changes affecting persisted data or cross-version communication, read [COMPATIBILITY.md](COMPATIBILITY.md) before implementation. Follow its contract-version naming, module ownership, migration, and validation guidelines.
+
+## Path Handling
+
+- Every relative path must have an explicit base directory. Never rely on the working directory at the time of eventual use.
+- Resolve CLI paths against the invocation directory, config-file paths against the config file’s directory, and SDK paths against a documented base.
+- Capture that base and resolve host paths before spawning asynchronous work or passing them to another process.
+- Persist absolute host paths when they reference a fixed local resource that must remain the same across restarts.
+- Distinguish host paths, guest paths, volume-relative paths, and resource identifiers. Do not apply host-path normalization to all strings.
+- Making a path absolute, collapsing `..`, and resolving symlinks are different operations. Choose deliberately; they can select different destinations.
+- Use structured path fields internally. Avoid concatenating paths into delimiter-separated strings that become ambiguous with valid filenames.
+- Return explicit errors when resolution fails. Never silently substitute another directory or panic.
+- Enforce filesystem containment during the operation, accounting for symlinks and concurrent changes. String-prefix checks alone are insufficient.
+- Centralize path-resolution rules so CLI, SDK, and background execution cannot drift.
+
+For path-related changes, test creation in directory A followed by use from directory B, plus relevant symlink, `..`, missing-path, and platform-specific cases. Assert the exact file or directory accessed—not just whether the operation succeeded.
 
 ## Rust Layout And Style
 

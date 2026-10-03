@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
-/// Transport mailbox budget, including per-frame metadata. Large enough for
-/// both TCP windows fragmented into one-byte data and credit frames.
+/// Transport mailbox budget, including per-frame metadata. A route whose
+/// consumer leaves this much unread closes the transport instead of stalling
+/// dispatch for every other route.
 pub const TRANSPORT_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 
 // Covers the mpsc block links and allocator bookkeeping per queued item.
@@ -76,33 +77,12 @@ impl<T> Sender<T> {
         };
         self.tx.send((item, permit)).map_err(|e| e.0.0)
     }
-
-    /// Wait for byte space. Only dedicated producers use this, never dispatchers.
-    pub async fn send(&self, item: T, bytes: usize) -> Result<(), T> {
-        let Some(charge) = self.charge(bytes) else {
-            return Err(item);
-        };
-        let Ok(permit) = Arc::clone(&self.budget).acquire_many_owned(charge).await else {
-            return Err(item);
-        };
-        self.tx.send((item, permit)).map_err(|e| e.0.0)
-    }
 }
 
 impl<T> Receiver<T> {
-    /// Receive an immediately available item without waiting.
-    pub fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
-        self.rx.try_recv().map(|(item, _permit)| item)
-    }
     /// Receive the next item, or `None` when every sender has closed.
     pub async fn recv(&mut self) -> Option<T> {
         self.rx.recv().await.map(|(item, _permit)| item)
-    }
-
-    /// Stop accepting new items while preserving already queued items.
-    pub fn close(&mut self) {
-        self.budget.close();
-        self.rx.close();
     }
 }
 
@@ -124,7 +104,7 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().len(), 800);
         assert!(tx.try_send(vec![0; 800], 800).is_ok());
         drop(rx);
-        assert!(tx.send(vec![0; 800], 800).await.is_err());
+        assert!(tx.try_send(vec![0; 8], 8).is_err());
         assert!(tx.try_send(Vec::new(), usize::MAX).is_err());
     }
 }

@@ -17,12 +17,15 @@ go run ./examples/basic
 | `errors` | Typed error handling with `IsKind` and `errors.As` |
 | `filesystem` | Filesystem read/write/list/stat/copy/streaming operations |
 | `image-cache` | List, get, inspect, and garbage-collect cached OCI images |
+| `lifecycle-convergence` | Live convergence and stale-handle identity-safety checks with timing metrics |
 | `metrics` | Point-in-time and streaming metrics |
 | `network` | Presets, DNS, TLS, and custom network settings |
 | `patches` | Pre-boot rootfs patches |
 | `ports` | Publish guest TCP ports on host ports |
 | `secrets` | Secret placeholder injection |
-| `snapshot-fork` | Create a stopped-sandbox snapshot and boot a fork from it |
+| `snapshot-fork` | Create a stopped-sandbox snapshot and restore a fresh sandbox from it |
 | `streaming` | Streaming exec, signals, and cancellation |
 | `tls` | TLS interception configuration |
 | `volumes` | Named volume lifecycle |
+
+The `snapshot-fork` example keeps its historical directory name; it demonstrates restoring a saved disk snapshot. Live forking uses the `Fork` API.

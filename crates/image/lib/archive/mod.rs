@@ -1,6 +1,7 @@
 //! Docker archive load/save support.
 
 mod docker;
+mod tar_ext;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
@@ -8,5 +9,8 @@ mod docker;
 
 pub use docker::{
     ImageArchiveFormat, ImageLoadOptions, ImageSaveConfig, ImageSaveLayer, ImageSaveRequest,
-    LoadedImage, load_archive, save_archive, save_docker_archive,
+    LoadedImage, load_archive, load_archive_into, load_archive_with, save_archive,
+    save_docker_archive,
 };
+
+pub(crate) use docker::StagedLayerGuard;

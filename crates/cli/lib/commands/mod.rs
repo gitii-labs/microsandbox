@@ -8,6 +8,7 @@ use crate::ui;
 // Exports
 //--------------------------------------------------------------------------------------------------
 
+pub mod branch;
 pub mod common;
 pub mod completion;
 pub mod context;
@@ -21,22 +22,27 @@ pub mod list;
 pub mod logs;
 pub mod metrics;
 pub mod modify;
+pub mod pause;
 pub mod ping;
 pub mod ps;
 pub mod pull;
 pub mod registry;
 pub mod remove;
 pub mod restart;
+pub mod restore;
 pub mod run;
+pub mod sandbox;
 pub mod self_cmd;
 pub mod snapshot;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod start;
 pub mod stop;
+pub mod storage;
 pub mod touch;
 pub mod uninstall;
 pub mod volume;
+pub mod wait;
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -46,10 +52,21 @@ pub mod volume;
 ///
 /// When connecting to an already-running sandbox, this is a no-op.
 pub async fn maybe_stop(sandbox: &Sandbox) {
-    if sandbox.owns_lifecycle()
-        && let Err(e) = sandbox.stop().await
-    {
-        ui::warn(&format!("failed to stop sandbox: {e}"));
+    if sandbox.owns_lifecycle() {
+        if let Err(e) = sandbox.stop().await {
+            ui::warn(&format!("failed to stop sandbox: {e}"));
+        }
+        // Exec, run and SSH can exit with the guest's status before main's
+        // finalizer runs. Complete any scheduled cleanup before that exit.
+        finish_stopped_memory_cleanup().await;
+    }
+}
+
+/// Finish local stop cleanup before a command calls `process::exit`.
+pub(crate) async fn finish_stopped_memory_cleanup() {
+    let backend = microsandbox::backend::default_backend();
+    if let Some(local) = backend.as_local() {
+        local.finish_stopped_memory_cleanup().await;
     }
 }
 

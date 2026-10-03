@@ -1,6 +1,6 @@
 //! `msb run` command — create and start a new sandbox.
 
-use std::io::{IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 use clap::Args;
@@ -8,8 +8,8 @@ use futures::{FutureExt, StreamExt};
 use microsandbox::logs::{LogSource, LogStreamOptions, LogStreamStart};
 use microsandbox::sandbox::{ExecOutput, RlimitResource, Sandbox};
 
-use super::common::{SandboxOpts, apply_sandbox_opts};
-use crate::ui;
+use super::common::{self, SandboxOpts, apply_sandbox_opts, apply_sandbox_opts_after_config};
+use crate::{sandbox_config, ui};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -20,24 +20,8 @@ use crate::ui;
 pub struct RunArgs {
     /// Image to use (e.g. alpine, python, ./rootfs, ./disk.qcow2).
     ///
-    /// Mutually exclusive with `--from-snapshot`; one of the two is required.
-    #[arg(
-        required_unless_present = "from_snapshot",
-        conflicts_with = "from_snapshot"
-    )]
+    /// May be omitted when a config file supplies `image`.
     pub image: Option<String>,
-
-    /// Boot a fresh sandbox from a snapshot artifact (path or name).
-    ///
-    /// The snapshot pins the image; passing `--from-snapshot` is equivalent
-    /// to specifying the snapshot's image plus pre-populating the
-    /// upper layer from the artifact.
-    #[arg(
-        long = "from-snapshot",
-        alias = "from-snap",
-        value_name = "PATH_OR_NAME"
-    )]
-    pub from_snapshot: Option<String>,
 
     /// Run the resolved image command in the background and print the sandbox name.
     ///
@@ -52,6 +36,10 @@ pub struct RunArgs {
     /// Disable pseudo-terminal allocation and run non-interactively.
     #[arg(long = "no-tty", conflicts_with = "tty")]
     pub no_tty: bool,
+
+    /// Leave host stdin untouched and give the command EOF (disables automatic TTY).
+    #[arg(long, conflicts_with = "tty")]
+    pub no_stdin: bool,
 
     /// Kill the command after this duration (e.g. 30s, 5m, 1h).
     #[arg(long)]
@@ -79,6 +67,7 @@ pub struct RunArgs {
 /// Parsed per-command execution options for `msb run`.
 struct ExecOpts {
     tty: bool,
+    no_stdin: bool,
     timeout: Option<Duration>,
     rlimits: Vec<(RlimitResource, u64, u64)>,
     detach_keys: Option<String>,
@@ -89,16 +78,17 @@ impl ExecOpts {
         let rlimits: Vec<_> = args
             .rlimit
             .iter()
-            .map(|s| super::common::parse_rlimit(s))
+            .map(|s| common::parse_rlimit(s))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         let timeout = match &args.timeout {
-            Some(t) => Some(Duration::from_secs(super::common::parse_duration_secs(t)?)),
+            Some(t) => Some(Duration::from_secs(common::parse_duration_secs(t)?)),
             None => None,
         };
 
         Ok(Self {
             tty: args.tty,
+            no_stdin: args.no_stdin,
             timeout,
             rlimits,
             detach_keys: args.detach_keys.clone(),
@@ -146,11 +136,10 @@ async fn run_existing(name: String, args: RunArgs) -> anyhow::Result<()> {
 
     let exec_opts = ExecOpts::parse(&args)?;
     let interactive =
-        super::common::use_interactive_tty(std::io::stdin().is_terminal(), args.no_tty);
+        common::use_interactive_tty(io::stdin().is_terminal(), args.no_tty || args.no_stdin);
 
     let result: anyhow::Result<i32> = async {
-        let (cmd, cmd_args) =
-            super::common::resolve_command(sandbox.config(), args.command, interactive)?;
+        let (cmd, cmd_args) = common::resolve_command(sandbox.config(), args.command, interactive)?;
         match cmd {
             Some(cmd) => exec_in_sandbox(&sandbox, &cmd, cmd_args, interactive, &exec_opts).await,
             None => Ok(0),
@@ -173,20 +162,23 @@ async fn run_new(
     log_level: Option<microsandbox::LogLevel>,
 ) -> anyhow::Result<()> {
     let launch_started_at = chrono::Utc::now();
-    let mut builder = Sandbox::builder(&name);
-    if let Some(ref snap) = args.from_snapshot {
-        builder = builder.from_snapshot(snap.clone());
-    } else if let Some(ref image) = args.image {
-        builder = builder.image(image.as_str());
-    } else {
-        anyhow::bail!("either an image or --from-snapshot is required");
+    let resolved = sandbox_config::resolve(&args.sandbox.config)?;
+    let image = resolved.image(args.image.as_deref(), None)?;
+    if matches!(image, sandbox_config::ResolvedImage::Snapshot(_)) {
+        anyhow::bail!("snapshot sources require `msb snap restore SNAPSHOT --name NAME`");
     }
+    let builder = resolved.apply(Sandbox::builder(&name))?;
+    let builder = image.apply(builder)?;
     if args.sandbox.log_level.is_none()
         && let Some(log_level) = log_level
     {
         args.sandbox.log_level = Some(log_level.to_string());
     }
-    let mut builder = apply_sandbox_opts(builder, &args.sandbox)?;
+    let mut builder = if resolved.loaded() {
+        apply_sandbox_opts_after_config(builder, &args.sandbox)?
+    } else {
+        apply_sandbox_opts(builder, &args.sandbox)?
+    };
     if !is_named {
         // Unnamed `msb run` (including `--detach`) is a one-off: mark it
         // ephemeral so the host runtime removes its persisted state on exit.
@@ -203,16 +195,12 @@ async fn run_new(
     // Create sandbox with pull progress — select attached vs detached mode.
     let builder = builder.detached(args.detach);
     let (mut progress, task) = if args.detach {
-        builder.create_detached_with_pull_progress()?
+        builder.create_detached_with_progress()?
     } else {
-        builder.create_with_pull_progress()?
+        builder.create_with_progress()?
     };
 
-    let display_label = args
-        .from_snapshot
-        .clone()
-        .or_else(|| args.image.clone())
-        .unwrap_or_else(|| name.clone());
+    let display_label = image.display();
     let mut display = if args.sandbox.quiet {
         ui::PullProgressDisplay::quiet(&display_label)
     } else {
@@ -220,13 +208,31 @@ async fn run_new(
     };
 
     while let Some(event) = progress.recv().await {
-        display.handle_event(event);
+        display.handle_creation_event(event);
     }
 
     display.finish();
     let sandbox = task
         .await
         .map_err(|e| anyhow::anyhow!("create task panicked: {e}"))??;
+
+    common::display_restore_warnings(&sandbox).await;
+
+    if sandbox.config().resumed_from_full_snapshot() {
+        if !args.command.is_empty() {
+            ui::warn(&format!(
+                "command ignored because snapshot restore resumed its captured workload (use `msb exec {name} -- ...` after restore)"
+            ));
+        }
+        if !args.detach {
+            ui::warn(
+                "full snapshot restore resumes in the background because it has no new foreground command to attach",
+            );
+        }
+        sandbox.detach().await;
+        println!("{name}");
+        return Ok(());
+    }
 
     // Detach mode: just print the name and exit.
     if args.detach {
@@ -237,7 +243,7 @@ async fn run_new(
 
     let exec_opts = ExecOpts::parse(&args)?;
     let interactive =
-        super::common::use_interactive_tty(std::io::stdin().is_terminal(), args.no_tty);
+        common::use_interactive_tty(io::stdin().is_terminal(), args.no_tty || args.no_stdin);
 
     if sandbox.config().init_owns_boot_workload() {
         let observe = observe_init_owned_workload(&sandbox, launch_started_at);
@@ -254,17 +260,18 @@ async fn run_new(
         {
             ui::warn(&format!("failed to stop sandbox: {error}"));
         }
+        super::finish_stopped_memory_cleanup().await;
         return handle_exit(result?);
     }
 
-    let (cmd, cmd_args) =
-        super::common::resolve_command(sandbox.config(), args.command, interactive)?;
+    let (cmd, cmd_args) = common::resolve_command(sandbox.config(), args.command, interactive)?;
     let (cmd, cmd_args) = match (cmd, cmd_args) {
         (Some(cmd), args) => (cmd, args),
         (None, _) => {
             if let Err(e) = sandbox.stop().await {
                 ui::warn(&format!("failed to stop sandbox: {e}"));
             }
+            super::finish_stopped_memory_cleanup().await;
             return Ok(());
         }
     };
@@ -276,6 +283,7 @@ async fn run_new(
     if let Err(e) = sandbox.stop().await {
         ui::warn(&format!("failed to stop sandbox: {e}"));
     }
+    super::finish_stopped_memory_cleanup().await;
 
     handle_exit(result?)
 }
@@ -375,11 +383,14 @@ async fn exec_in_sandbox(
         let rlimits = opts.rlimits.clone();
         let timeout = opts.timeout;
         let tty = opts.tty;
-        let has_opts = tty || timeout.is_some() || !rlimits.is_empty();
+        let has_opts = tty || opts.no_stdin || timeout.is_some() || !rlimits.is_empty();
         let output: ExecOutput = if has_opts {
             sandbox
                 .exec_with(cmd, |e| {
                     let mut e = e.args(cmd_args);
+                    if opts.no_stdin {
+                        e = e.stdin_bytes(Vec::new());
+                    }
                     if tty {
                         e = e.tty(true);
                     }
@@ -396,8 +407,8 @@ async fn exec_in_sandbox(
             sandbox.exec(cmd, cmd_args).await?
         };
 
-        std::io::stdout().write_all(output.stdout_bytes())?;
-        std::io::stderr().write_all(output.stderr_bytes())?;
+        io::stdout().write_all(output.stdout_bytes())?;
+        io::stderr().write_all(output.stderr_bytes())?;
 
         Ok(if output.status().success {
             0
@@ -418,15 +429,9 @@ fn handle_exit(exit_code: i32) -> anyhow::Result<()> {
 /// Describe creation-only inputs that are ignored when reusing an
 /// existing named sandbox.
 fn ignored_existing_inputs(args: &RunArgs) -> Option<&'static str> {
-    match (
-        args.from_snapshot.is_some(),
-        args.sandbox.has_creation_flags(),
-    ) {
-        (true, true) => Some("--from-snapshot and creation flags"),
-        (true, false) => Some("--from-snapshot"),
-        (false, true) => Some("creation flags"),
-        (false, false) => None,
-    }
+    args.sandbox
+        .has_creation_flags()
+        .then_some("creation flags")
 }
 
 /// Warn when a detached run reuses an existing sandbox and includes a command.
@@ -446,10 +451,13 @@ fn warn_detached_command_ignored(name: &str, args: &RunArgs) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
     use clap::error::ErrorKind;
 
     use super::*;
+    use crate::commands::common::SandboxConfigKind;
 
     #[derive(Debug, Parser)]
     struct TestCli {
@@ -486,11 +494,36 @@ mod tests {
     }
 
     #[test]
-    fn no_tty_conflicts_with_tty() {
-        let err =
-            TestCli::try_parse_from(["msb", "--tty", "--no-tty", "python:3-alpine"]).unwrap_err();
+    fn entrypoint_executable_and_arguments_parse_separately() {
+        let args = parse_run_args(&[
+            "--entrypoint",
+            "/bin/sh",
+            "alpine",
+            "--",
+            "-c",
+            "echo foo; exec something",
+            "-",
+        ]);
 
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        assert_eq!(args.sandbox.entrypoint.as_deref(), Some("/bin/sh"));
+        assert_eq!(args.image.as_deref(), Some("alpine"));
+        assert_eq!(
+            args.command,
+            vec![
+                "-c".to_string(),
+                "echo foo; exec something".to_string(),
+                "-".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn noninteractive_flags_conflict_with_tty() {
+        for flag in ["--no-tty", "--no-stdin"] {
+            let err =
+                TestCli::try_parse_from(["msb", "--tty", flag, "python:3-alpine"]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]
@@ -539,6 +572,104 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "net")]
+    #[test]
+    fn net_conf_conflicts_with_policy_cli_flags() {
+        for policy_args in [
+            &["--net", "public"][..],
+            &["--no-net"][..],
+            &["--net-rule", "allow@public"][..],
+            &["--net-default", "deny"][..],
+            &["--net-default-egress", "deny"][..],
+            &["--net-default-ingress", "deny"][..],
+        ] {
+            let argv = ["msb", "--net-conf", "network.yaml"]
+                .into_iter()
+                .chain(policy_args.iter().copied())
+                .chain(["alpine"]);
+            let err = TestCli::try_parse_from(argv).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn net_conf_allows_non_policy_network_overrides() {
+        let args = parse_run_args(&[
+            "--net-conf",
+            "network.yaml",
+            "--net-ipv4-pool",
+            "172.20.0.0/16",
+            "alpine",
+        ]);
+
+        assert_eq!(args.sandbox.net_ipv4_pool.as_deref(), Some("172.20.0.0/16"));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn root_conf_allows_policy_cli_overrides() {
+        let args = parse_run_args(&["--conf", "sandbox.yaml", "--no-net", "alpine"]);
+
+        assert!(args.sandbox.no_net);
+    }
+
+    #[test]
+    fn config_can_supply_the_image_before_a_trailing_command() {
+        let args = parse_run_args(&[
+            "--conf",
+            "sandbox.yaml",
+            "--net-conf",
+            "network.yaml",
+            "--",
+            "python",
+            "app.py",
+        ]);
+
+        assert!(args.image.is_none());
+        assert_eq!(
+            args.sandbox
+                .config
+                .iter()
+                .map(|source| (source.kind, source.path.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (SandboxConfigKind::Root, PathBuf::from("sandbox.yaml")),
+                (SandboxConfigKind::Network, PathBuf::from("network.yaml")),
+            ]
+        );
+        assert_eq!(args.command, ["python", "app.py"]);
+    }
+
+    #[test]
+    fn repeated_config_flags_preserve_cross_flag_command_line_order() {
+        let args = parse_run_args(&[
+            "python",
+            "--resource-conf",
+            "first.yaml",
+            "--conf",
+            "base.yaml",
+            "--resource-conf",
+            "second.yaml",
+            "--net-conf",
+            "network.yaml",
+        ]);
+
+        assert_eq!(
+            args.sandbox
+                .config
+                .iter()
+                .map(|source| (source.kind, source.path.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (SandboxConfigKind::Resources, PathBuf::from("first.yaml")),
+                (SandboxConfigKind::Root, PathBuf::from("base.yaml")),
+                (SandboxConfigKind::Resources, PathBuf::from("second.yaml")),
+                (SandboxConfigKind::Network, PathBuf::from("network.yaml")),
+            ]
+        );
+    }
+
     #[test]
     fn existing_reuse_does_not_warn_for_required_image() {
         let args = parse_run_args(&["--name", "box", "alpine", "--", "echo", "hello"]);
@@ -547,17 +678,114 @@ mod tests {
     }
 
     #[test]
-    fn existing_reuse_warns_for_snapshot() {
-        let args = parse_run_args(&["--name", "box", "--detach", "--from-snapshot", "clean"]);
+    fn existing_reuse_cannot_silently_ignore_a_snapshot_source() {
+        assert!(
+            TestCli::try_parse_from([
+                "msb",
+                "--name",
+                "box",
+                "--detach",
+                "--from-snapshot",
+                "clean"
+            ])
+            .is_err()
+        );
+    }
 
-        assert_eq!(ignored_existing_inputs(&args), Some("--from-snapshot"));
+    #[cfg(feature = "net")]
+    #[test]
+    fn existing_reuse_warns_for_proxy_creation_flag() {
+        let args = parse_run_args(&[
+            "--name",
+            "box",
+            "--proxy",
+            "socks5://127.0.0.1:1080",
+            "alpine",
+        ]);
+
+        assert_eq!(ignored_existing_inputs(&args), Some("creation flags"));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn protocol_specific_proxy_authentication_flags_parse() {
+        let socks4 = parse_run_args(&[
+            "--proxy",
+            "socks4://127.0.0.1:1080",
+            "--socks4-user-id",
+            "sandbox",
+            "alpine",
+        ]);
+        assert_eq!(socks4.sandbox.socks4_user_id.as_deref(), Some("sandbox"));
+
+        let socks5 = parse_run_args(&[
+            "--proxy",
+            "socks5://127.0.0.1:1080",
+            "--socks5-username",
+            "sandbox",
+            "--socks5-password-env",
+            "SOCKS5_PASSWORD",
+            "alpine",
+        ]);
+        assert_eq!(socks5.sandbox.socks5_username.as_deref(), Some("sandbox"));
+        assert_eq!(
+            socks5.sandbox.socks5_password_env.as_deref(),
+            Some("SOCKS5_PASSWORD")
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn socks5_cli_credentials_require_the_complete_pair() {
+        for auth in [
+            &["--socks5-username", "sandbox"][..],
+            &["--socks5-password-env", "SOCKS5_PASSWORD"][..],
+        ] {
+            let argv = ["msb", "--proxy", "socks5://127.0.0.1:1080"]
+                .into_iter()
+                .chain(auth.iter().copied())
+                .chain(["alpine"]);
+            let error = TestCli::try_parse_from(argv).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        }
     }
 
     #[test]
-    fn from_snap_is_an_alias_for_from_snapshot() {
-        let args = parse_run_args(&["--name", "box", "--from-snap", "clean"]);
+    fn snapshot_source_and_discarded_alias_are_rejected() {
+        for flag in ["--from-snapshot", "--from-snap"] {
+            assert!(TestCli::try_parse_from(["msb", "--name", "box", flag, "clean"]).is_err());
+        }
+    }
 
-        assert_eq!(args.from_snapshot.as_deref(), Some("clean"));
+    #[test]
+    fn restore_only_flags_are_rejected_by_run() {
+        for flag in ["--disk-only", "--cow-mem", "--forked"] {
+            assert!(TestCli::try_parse_from(["msb", "alpine", flag]).is_err());
+        }
+    }
+
+    #[test]
+    fn external_mount_policy_is_explicit_and_requires_full_restore() {
+        for args in [
+            vec!["msb", "alpine", "--external-mount-policy", "relaxed"],
+            vec![
+                "msb",
+                "--from-snapshot",
+                "saved",
+                "--external-mount-policy",
+                "unknown",
+            ],
+            vec![
+                "msb",
+                "--from-snapshot",
+                "saved",
+                "--external-mount-policy",
+                "relaxed",
+                "--disk-only",
+            ],
+        ] {
+            assert!(TestCli::try_parse_from(&args).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]
@@ -568,24 +796,14 @@ mod tests {
             .unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("--from-snapshot"));
+        assert!(!help.contains("--from-snapshot"));
         assert!(!help.contains("--from-snap "));
     }
 
     #[test]
-    fn existing_reuse_warns_for_snapshot_and_creation_flags() {
-        let args = parse_run_args(&[
-            "--name",
-            "box",
-            "--memory",
-            "1G",
-            "--from-snapshot",
-            "clean",
-        ]);
+    fn existing_reuse_warns_for_creation_flags() {
+        let args = parse_run_args(&["--name", "box", "--memory", "1G"]);
 
-        assert_eq!(
-            ignored_existing_inputs(&args),
-            Some("--from-snapshot and creation flags")
-        );
+        assert_eq!(ignored_existing_inputs(&args), Some("creation flags"));
     }
 }

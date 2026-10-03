@@ -28,10 +28,6 @@
       "wire": "core.relay.client.disconnected"
     },
     {
-      "introduced_in": 7,
-      "wire": "core.relay.client.released"
-    },
-    {
       "introduced_in": 1,
       "wire": "core.clock.sync"
     },
@@ -120,10 +116,6 @@
       "wire": "core.tcp.data"
     },
     {
-      "introduced_in": 7,
-      "wire": "core.tcp.credit"
-    },
-    {
       "introduced_in": 4,
       "wire": "core.tcp.eof"
     },
@@ -138,6 +130,10 @@
     {
       "introduced_in": 4,
       "wire": "core.tcp.failed"
+    },
+    {
+      "introduced_in": 7,
+      "wire": "core.bootstrap"
     }
   ],
   "protocol_version": 7

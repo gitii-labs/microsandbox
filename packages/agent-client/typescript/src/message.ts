@@ -1,7 +1,7 @@
 import { encode } from "cbor-x";
 
 /** Current microsandbox agent protocol generation. */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 5;
 /** Frame flag marking the final frame for a correlation ID. */
 export const FLAG_TERMINAL = 0b0000_0001;
 /** Frame flag marking the first frame of a new session. */
@@ -18,12 +18,7 @@ export type MessageType =
   | "core.init.ack"
   | "core.shutdown"
   | "core.relay.client.disconnected"
-  | "core.relay.client.released"
   | "core.clock.sync"
-  | "core.ping"
-  | "core.pong"
-  | "core.touch"
-  | "core.touched"
   | "core.error"
   | "core.exec.request"
   | "core.exec.started"
@@ -41,72 +36,18 @@ export type MessageType =
   | "core.tcp.connect"
   | "core.tcp.connected"
   | "core.tcp.data"
-  | "core.tcp.credit"
   | "core.tcp.eof"
   | "core.tcp.close"
   | "core.tcp.closed"
   | "core.tcp.failed";
 
-/**
- * Outbound message whose payload should be CBOR-encoded by this package.
- */
-export type TypedMessage<T = unknown> = {
-  /** Discriminant for `OutboundMessage`. */
-  kind: "typed";
-  /** Protocol message type. */
-  type: MessageType;
-  /** Native payload object to CBOR-encode into the message envelope. */
-  payload: T;
-};
+// These open-name message types are shared by agent, control, and external protocols.
+import type { OutboundMessage } from "@microsandbox/protocol-client";
+export { typedMessage, encodedMessage } from "@microsandbox/protocol-client";
+export type { TypedMessage, EncodedMessage, OutboundMessage } from "@microsandbox/protocol-client";
 
-/**
- * Outbound message whose payload is already CBOR-encoded.
- */
-export type EncodedMessage = {
-  /** Discriminant for `OutboundMessage`. */
-  kind: "encoded";
-  /** Protocol message type. */
-  type: MessageType;
-  /** CBOR-encoded payload bytes for this message type. */
-  payload: Uint8Array;
-};
-
-/** Message accepted by `AgentClient` send/request APIs. */
-export type OutboundMessage = TypedMessage | EncodedMessage;
-
-/** Decoded CBOR protocol envelope carried inside a transport frame. */
-export type EncodedEnvelope = {
-  /** Protocol generation. */
-  v: number;
-  /** Wire message type. */
-  t: MessageType;
-  /** CBOR-encoded message payload bytes. */
-  p: Uint8Array;
-};
-
-/**
- * Build a typed outbound message.
- *
- * Use this when the agent-client package should CBOR-encode the payload.
- */
-export function typedMessage<T>(
-  type: MessageType,
-  payload: T,
-): TypedMessage<T> {
-  return { kind: "typed", type, payload };
-}
-
-/**
- * Build an encoded outbound message.
- *
- * Use this when another layer already produced CBOR payload bytes.
- */
-export function encodedMessage(
-  type: MessageType,
-  payload: Uint8Array,
-): EncodedMessage {
-  return { kind: "encoded", type, payload };
-}
+/** Agent envelope; supplied encoded payloads keep their original byte representation. */
+export type EncodedEnvelope = { v: number; t: string; p: Uint8Array };
 
 /**
  * Return the CBOR payload bytes for a typed or encoded outbound message.
@@ -128,11 +69,11 @@ export function encodeEnvelope(
   message: OutboundMessage,
   protocolVersion = PROTOCOL_VERSION,
   negotiatedVersion = PROTOCOL_VERSION,
-): { type: MessageType; flags: number; body: Uint8Array } {
+): { type: string; flags: number; body: Uint8Array } {
   if (!supports(message.type, negotiatedVersion)) {
     throw new Error(
       `the sandbox runtime is too old for '${message.type}' ` +
-        `(needs protocol generation ${requiredProtocolVersion(message.type)}, ` +
+        `(needs protocol generation ${minProtocolVersion(message.type)}, ` +
         `the sandbox speaks ${negotiatedVersion})`,
     );
   }
@@ -153,10 +94,8 @@ export function encodeEnvelope(
 /**
  * Return the frame flags required for a message type.
  */
-export function messageFlags(type: MessageType): number {
+export function messageFlags(type: string): number {
   switch (type) {
-    case "core.pong":
-    case "core.touched":
     case "core.error":
     case "core.exec.exited":
     case "core.exec.failed":
@@ -178,7 +117,7 @@ export function messageFlags(type: MessageType): number {
 /**
  * Return the protocol generation that introduced a message type.
  */
-export function minProtocolVersion(type: MessageType): number {
+export function minProtocolVersion(type: string): number {
   switch (type) {
     case "core.fs.request":
     case "core.fs.response":
@@ -194,14 +133,6 @@ export function minProtocolVersion(type: MessageType): number {
       return 4;
     case "core.error":
       return 5;
-    case "core.ping":
-    case "core.pong":
-    case "core.touch":
-    case "core.touched":
-      return 6;
-    case "core.tcp.credit":
-    case "core.relay.client.released":
-      return 7;
     default:
       return 1;
   }
@@ -210,11 +141,6 @@ export function minProtocolVersion(type: MessageType): number {
 /**
  * Return whether a peer generation supports a message type.
  */
-export function supports(type: MessageType, peerGeneration: number): boolean {
-  return requiredProtocolVersion(type) <= peerGeneration;
-}
-
-function requiredProtocolVersion(type: MessageType): number {
-  // TCP has no uncredited compatibility path in this fork.
-  return type.startsWith("core.tcp.") ? minProtocolVersion("core.tcp.credit") : minProtocolVersion(type);
+export function supports(type: string, peerGeneration: number): boolean {
+  return minProtocolVersion(type) <= peerGeneration;
 }

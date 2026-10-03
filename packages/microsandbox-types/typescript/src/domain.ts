@@ -11,8 +11,6 @@ export type EnvVar = {
   value: string;
 };
 
-export type CpuPlacement = "inherit" | "auto" | "spread" | "compact";
-
 export type HandoffInit = {
   /**
    * Init binary: absolute path inside the guest rootfs, or the literal `auto`.
@@ -77,11 +75,39 @@ export type MountOptions = {
    * Whether device files on the mount are ignored.
    */
   nodev: boolean;
+  /**
+   * Guest uid presented for host files under this mount that carry no
+   * per-file stat override.
+   *
+   * Host-created files (written outside the guest) have no override, so
+   * without this they surface with the runtime's fallback owner. When set,
+   * such files are presented as this uid instead. Must be set together with
+   * [`override_gid`](Self::override_gid). `None` keeps the fallback.
+   */
+  override_uid?: number | null;
+  /**
+   * Guest gid presented for host files under this mount that carry no
+   * per-file stat override. See [`override_uid`](Self::override_uid); the two
+   * must be set together.
+   */
+  override_gid?: number | null;
+};
+
+export type OwnedVolumeStorage = {
+  "kind": "directory";
+  /**
+   * Guest-write budget in MiB; `None` uses the directory-mount default.
+   */
+  quota_mib: number | null;
+} | {
+  "kind": "disk";
+  /**
+   * Required, positive capacity in MiB.
+   */
+  capacity_mib: number;
 };
 
 export type StatVirtualization = "strict" | "relaxed" | "off";
-
-export type TransparentHugePagePolicy = "always" | "madvise" | "never";
 
 export type HostPermissions = "private" | "mirror";
 
@@ -236,19 +262,15 @@ export type OAuthSecret = {
   refresh_sentinel: string;
 };
 
-export type SecretInjection = {
+export type SecretSubstitution = {
   /**
    * Substitute in HTTP headers (default: true).
    */
   headers: boolean;
   /**
-   * Substitute in HTTP Basic Auth (default: true).
-   */
-  basic_auth: boolean;
-  /**
    * Substitute in URL query parameters (default: false).
    */
-  query_params: boolean;
+  query: boolean;
   /**
    * Substitute in request body (default: false).
    *

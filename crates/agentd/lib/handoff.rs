@@ -9,9 +9,9 @@
 //! - **Child** continues as a normal grandchild process and runs the
 //!   agent loop, serving host requests over virtio-serial.
 //!
-//! The handoff happens before any tokio runtime is built and before
-//! virtio-serial is opened, keeping the fork single-threaded and
-//! free of duplicated runtime state.
+//! The handoff happens before any tokio runtime is built. The already-open
+//! virtio-console descriptor is close-on-exec, so the new PID 1 does not
+//! inherit it while the agent child keeps serving the host connection.
 //!
 //! [`init::init`]: crate::init::init
 //!
@@ -329,10 +329,9 @@ pub fn do_handoff(spec: HandoffInit) -> AgentdResult<PathBuf> {
     let envp = build_envp(&spec.env);
     let cmd_c = path_to_cstring(&cmd)?;
 
-    // SAFETY: `fork()` in a single-threaded process with no opened
-    // serial fds and no async runtime. The agent loop has not started
-    // yet; tls/init writes are complete; only stdin/stdout/stderr are
-    // inherited from the kernel.
+    // SAFETY: `fork()` runs while agentd is still single-threaded and before
+    // any async runtime exists. The console fd is close-on-exec in the parent
+    // and intentionally retained by the child for the agent loop.
     match unsafe { fork() }? {
         ForkResult::Parent { .. } => {
             // We are now the new PID 1's pre-image. Restore default
@@ -484,18 +483,6 @@ fn build_envp(extras: &[(OsString, OsString)]) -> Vec<CString> {
 
     let mut env: HashMap<OsString, OsString> = std::env::vars_os().collect();
 
-    // Strip our own boot params from the inherited env so the new
-    // init doesn't see stale MSB_* values that referred to agentd's
-    // boot, not its own runtime.
-    for var in [
-        microsandbox_protocol::ENV_HANDOFF_INIT,
-        microsandbox_protocol::ENV_HANDOFF_INIT_ARGS,
-        microsandbox_protocol::ENV_HANDOFF_INIT_CWD,
-        microsandbox_protocol::ENV_HANDOFF_INIT_ENV,
-    ] {
-        env.remove(&OsString::from(var));
-    }
-
     for (k, v) in extras {
         env.insert(k.clone(), v.clone());
     }
@@ -614,7 +601,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// shutdown protocol independently of agentd's libc, so `systemctl` is the
 /// route taken whenever the manager can be reached. Every other init keeps the
 /// realtime-signal contract agentd defines in its own terms — which today is
-/// `crates/test-init`'s contract, not a universal one: busybox init, for
+/// `crates/testing/init`'s contract, not a universal one: busybox init, for
 /// instance, reads SIGUSR2 as poweroff and would need its own arm.
 pub async fn signal_init_shutdown(handoff_init: Option<&Path>) -> AgentdResult<()> {
     let pid_1 = InitPaths::pid_1();
@@ -902,7 +889,7 @@ async fn run_tracked_child(
 /// The realtime signal a non-systemd handoff init is asked to power off with.
 ///
 /// Computed with agentd's own libc on purpose: this contract is agentd's, and
-/// the init on the other side of it — `crates/test-init` — is built from this
+/// the init on the other side of it — `crates/testing/init` — is built from this
 /// workspace against the same musl. systemd is the init that does not share
 /// agentd's libc, and it is asked by number above instead.
 fn generic_init_poweroff_signal() -> i32 {

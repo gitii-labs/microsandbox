@@ -17,11 +17,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use microsandbox_protocol::codec::RawFrame;
-use microsandbox_protocol::queue::Receiver;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::Receiver;
 
-use super::{AgentClient, connect_sandbox, connect_sandbox_with_timeout};
+use super::AgentClient;
+#[cfg(feature = "local")]
+use super::{connect_sandbox, connect_sandbox_with_timeout};
 use microsandbox_agent_client::{AgentClientError, AgentClientResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -69,6 +71,7 @@ impl AgentBridge {
     /// Connect to a sandbox by name (resolves the socket path from SDK config).
     ///
     /// Sandbox names are limited to 128 UTF-8 bytes.
+    #[cfg(feature = "local")]
     pub async fn connect_sandbox(name: &str) -> AgentClientResult<Self> {
         let client = connect_sandbox(name).await?;
         Ok(Self::from_client(client))
@@ -77,6 +80,7 @@ impl AgentBridge {
     /// Connect to a sandbox by name with an explicit handshake timeout.
     ///
     /// Sandbox names are limited to 128 UTF-8 bytes.
+    #[cfg(feature = "local")]
     pub async fn connect_sandbox_with_timeout(
         name: &str,
         timeout: Duration,
@@ -312,14 +316,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::Duration;
 
-    use microsandbox_protocol::queue;
     use tokio::sync::Notify;
+    use tokio::sync::mpsc;
 
     use super::*;
 
     #[tokio::test]
     async fn close_wakes_in_flight_stream_next() {
-        let (tx, rx) = queue::channel(queue::TRANSPORT_QUEUE_BYTES);
+        let (tx, rx) = mpsc::channel(1);
         let bridge = Arc::new(AgentBridge {
             inner: StdMutex::new(None),
             streams: Mutex::new(HashMap::from([(

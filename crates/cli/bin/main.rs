@@ -1,17 +1,21 @@
 //! Entry point for the `msb` CLI binary.
 
+mod embedded_version;
+
 use std::io::{IsTerminal, Write};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use console::style;
 use microsandbox_cli::{
     commands::{
-        completion, context, copy, create, exec, image, inspect, install, list, logs, metrics,
-        modify, ping, ps, pull, registry, remove, restart, run, self_cmd, snapshot, start, stop,
-        touch, uninstall, volume,
+        completion, context, image, install, pull, registry,
+        sandbox::{self, SandboxCommands},
+        self_cmd,
+        snapshot::{self, SnapshotCommands},
+        storage, uninstall, volume,
     },
     log_args::{self, LogArgs},
-    sandbox_cmd::{self, SandboxArgs},
+    machine_cmd::{self, MachineArgs},
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -22,8 +26,9 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
     CommandGroup {
         heading: "Sandboxes",
         commands: &[
-            "run", "create", "modify", "start", "stop", "restart", "ping", "touch", "list",
-            "status", "metrics", "remove", "exec", "copy", "logs", "ssh", "inspect",
+            "run", "create", "restore", "modify", "start", "stop", "pause", "resume", "fork",
+            "restart", "wait", "ping", "touch", "list", "status", "metrics", "remove", "exec",
+            "copy", "logs", "ssh", "inspect", "sandbox",
         ],
     },
     CommandGroup {
@@ -32,7 +37,7 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
     },
     CommandGroup {
         heading: "Storage",
-        commands: &["volume", "snapshot"],
+        commands: &["df", "prune", "volume", "snapshot"],
     },
     CommandGroup {
         heading: "Installation",
@@ -56,7 +61,7 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
 #[derive(Parser)]
 #[command(
     name = "msb",
-    version,
+    version = embedded_version::version(),
     about = format!("Microsandbox CLI v{}", env!("CARGO_PKG_VERSION")),
     styles = microsandbox_cli::styles::styles()
 )]
@@ -75,9 +80,21 @@ struct Cli {
 /// Top-level commands.
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the sandbox process (internal).
+    /// Run the VM process (internal).
     #[command(hide = true)]
-    Sandbox(Box<SandboxArgs>),
+    Machine(Box<MachineArgs>),
+
+    /// Report launch wire capabilities without initializing a backend.
+    #[command(name = "__launch-protocol", hide = true)]
+    LaunchProtocol,
+
+    /// Manage sandboxes (also available as top-level commands).
+    #[command(visible_alias = "sbx")]
+    Sandbox(sandbox::SandboxArgs),
+
+    /// Convenient top-level forms of the sandbox commands.
+    #[command(flatten)]
+    SandboxShortcut(SandboxCommands),
 
     /// Print the schema baseline owned by this binary (internal).
     #[command(name = "__schema-baseline", hide = true)]
@@ -91,55 +108,6 @@ enum Commands {
     #[cfg(windows)]
     #[command(name = "__windows-self-swap", hide = true)]
     WindowsSelfSwap(self_cmd::WindowsSelfSwapArgs),
-
-    /// Create a sandbox from an image and run a command in it.
-    Run(run::RunArgs),
-
-    /// Create a sandbox and boot it in the background.
-    Create(create::CreateArgs),
-
-    /// Modify sandbox configuration.
-    Modify(modify::ModifyArgs),
-
-    /// Start a stopped sandbox.
-    Start(start::StartArgs),
-
-    /// Stop one or more running sandboxes.
-    Stop(stop::StopArgs),
-
-    /// Restart one or more sandboxes.
-    Restart(restart::RestartArgs),
-
-    /// Check whether one or more sandbox agents are reachable.
-    Ping(ping::PingArgs),
-
-    /// Refresh idle activity for one or more running sandboxes.
-    Touch(touch::TouchArgs),
-
-    /// List all sandboxes.
-    #[command(visible_alias = "ls")]
-    List(list::ListArgs),
-
-    /// Show sandbox status.
-    #[command(name = "status", visible_alias = "ps")]
-    Status(ps::PsArgs),
-
-    /// Show live metrics for a running sandbox.
-    Metrics(metrics::MetricsArgs),
-
-    /// Remove one or more sandboxes.
-    #[command(visible_alias = "rm")]
-    Remove(remove::RemoveArgs),
-
-    /// Run a command in a running sandbox.
-    Exec(exec::ExecArgs),
-
-    /// Copy files between the host and a sandbox.
-    #[command(visible_alias = "cp")]
-    Copy(copy::CopyArgs),
-
-    /// Show captured output from a sandbox.
-    Logs(logs::LogsArgs),
 
     /// Manage OCI images.
     Image(image::ImageArgs),
@@ -164,18 +132,33 @@ enum Commands {
     #[command(hide = true)]
     Images(image::ImageListArgs),
 
+    /// List named volumes (alias for `volume ls`).
+    #[command(alias = "vols", hide = true)]
+    Volumes(volume::VolumeListArgs),
+
+    /// List disk snapshots (alias for `snapshot ls`).
+    #[command(alias = "snaps", hide = true)]
+    Snapshots(snapshot::SnapshotListArgs),
+
+    /// List configured registries (alias for `registry ls`).
+    #[command(alias = "regs", hide = true)]
+    Registries(registry::RegistryListArgs),
+
     /// Remove a cached image (alias for `image rm`).
     #[command(hide = true)]
     Rmi(image::ImageRemoveArgs),
 
-    /// Show detailed sandbox configuration and status.
-    Inspect(inspect::InspectArgs),
+    /// Show aggregate local storage usage.
+    Df(storage::DfArgs),
+
+    /// Remove unused runtime memory cache files.
+    Prune(storage::PruneArgs),
 
     /// Manage named volumes.
     #[command(visible_alias = "vol")]
     Volume(volume::VolumeArgs),
 
-    /// Manage disk snapshots.
+    /// Capture, restore, and manage disk or full snapshots.
     #[command(visible_alias = "snap")]
     Snapshot(snapshot::SnapshotArgs),
 
@@ -222,6 +205,25 @@ struct HelpStyles {}
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
+
+impl Commands {
+    /// Normalize shortcuts before choosing the executor or resolving the backend.
+    fn into_canonical(self) -> Self {
+        match self {
+            Self::SandboxShortcut(command) => Self::Sandbox(sandbox::SandboxArgs { command }),
+            Self::Snapshot(snapshot::SnapshotArgs {
+                command: SnapshotCommands::Restore(args),
+            }) => Self::Sandbox(sandbox::SandboxArgs {
+                command: SandboxCommands::Restore(*args),
+            }),
+            command => command,
+        }
+    }
+
+    fn is_resident_control(&self) -> bool {
+        matches!(self, Self::Sandbox(args) if args.command.is_resident_control())
+    }
+}
 
 impl HelpStyles {
     /// Detect whether custom help should include ANSI styling.
@@ -277,7 +279,9 @@ fn main() {
 
     // Handle --tree before Cli::parse() so it works even when
     // required arguments (e.g. `msb run --tree`) are missing.
-    if let Some(tree) = microsandbox_cli::tree::try_show_tree(&Cli::command()) {
+    if std::env::args_os().any(|arg| arg == "--tree")
+        && let Some(tree) = microsandbox_cli::tree::try_show_tree(&Cli::command())
+    {
         println!("{tree}");
         return;
     }
@@ -285,23 +289,45 @@ fn main() {
         return;
     }
 
-    let cli = Cli::parse();
+    let mut argv: Vec<_> = std::env::args_os().collect();
+    let legacy_launch = microsandbox_cli::launch_compat::route_legacy_launch(&mut argv);
+    let cli = Cli::parse_from(argv);
     let log_level = cli.logs.selected_level();
 
-    let exit_code = match cli.command {
+    let exit_code = match cli.command.into_canonical() {
+        Commands::LaunchProtocol => {
+            println!(
+                "{}",
+                serde_json::to_string(&microsandbox_runtime::launch::LaunchCapabilities {
+                    protocols: vec![2, 1],
+                    required_restore_backing: true,
+                    tcp_accept_queue_size: true,
+                    http_deny_message: cfg!(feature = "net"),
+                    http_connect_proxy: cfg!(feature = "net"),
+                    guest_clock: true,
+                })
+                .expect("serialize capabilities")
+            );
+            return;
+        }
         // Sandbox process entry — never returns (VMM takes over).
         // Always install tracing for sandbox processes. With no explicit
         // diagnostic level, the subscriber keeps policy denials at WARN and
         // suppresses everything else.
-        Commands::Sandbox(args) => {
+        Commands::Machine(args) => {
             let mut args = *args;
+            args.legacy_launch = legacy_launch;
             let sandbox_level = args.log_level.or(log_level);
             args.log_level = sandbox_level;
             // The sandbox subprocess's stderr is redirected into
             // runtime.log via setup_log_capture(), so disable ANSI —
             // color escapes have nowhere useful to render.
             log_args::init_sandbox_tracing(sandbox_level);
-            sandbox_cmd::run(args); // returns `!`
+            if let Err(error) = microsandbox_filesystem::agentd::initialize_agentd_payload() {
+                eprintln!("msb: failed to select agentd payload: {error}");
+                std::process::exit(1);
+            }
+            machine_cmd::run(args); // returns `!`
         }
         command => {
             // CLI commands write tracing to the user's terminal.
@@ -617,17 +643,24 @@ fn run_async_command_anyhow(
     // Pull and create can overlap network I/O, decompression, and progress UI.
     // Use a small-but-not-tiny worker pool so foreground UI tasks still get
     // scheduled while multiple layers are downloading and materializing.
-    let worker_threads = std::thread::available_parallelism()
-        .map(|count| count.get().clamp(4, 8))
-        .unwrap_or(4);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()?;
+    // Resident control performs one IPC exchange. It needs I/O and timers, not the image
+    // pipeline's worker pool. Blocking filesystem/SQLite work keeps its normal executor.
+    let mut builder = if command.is_resident_control() {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        let worker_threads = std::thread::available_parallelism()
+            .map(|count| count.get().clamp(4, 8))
+            .unwrap_or(4);
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(worker_threads);
+        builder
+    };
+    let runtime = builder.enable_all().build()?;
 
     runtime.block_on(async move {
+        let mut cleanup_backend = None;
         // Stale-sandbox reaping and ephemeral cleanup are owned by host
-        // runtime processes (`msb sandbox`) now, not the CLI; see
+        // runtime processes (`msb machine`) now, not the CLI; see
         // `microsandbox_runtime::maintenance`. The CLI no longer spawns a
         // reaper here.
         if !is_backend_independent_maintenance_command(&command) {
@@ -635,36 +668,26 @@ fn run_async_command_anyhow(
             // the SDK's ambient convenience fallback, the CLI must not run a
             // sandbox operation locally after an invalid explicit cloud selection.
             let backend = microsandbox::resolve_default_backend()?;
-            let backend_info = backend.info();
-            microsandbox::set_default_backend(backend);
-
-            if shows_backend_notice(&command) {
-                microsandbox_cli::ui::notice("Backend", &context::notice_text(&backend_info));
+            if requires_current_catalog(&command)
+                && let Some(local) = backend.as_local()
+            {
+                local.prepare_cli_catalog().await?;
             }
+            cleanup_backend = Some(backend.clone());
+            microsandbox::set_default_backend(backend);
         }
 
-        match command {
-            Commands::Sandbox(_) => unreachable!("handled before Tokio starts"),
+        let result = match command {
+            Commands::Machine(_) | Commands::LaunchProtocol => {
+                unreachable!("handled before Tokio starts")
+            }
+            Commands::SandboxShortcut(_) => unreachable!("normalized before dispatch"),
             Commands::SchemaBaseline(_) => unreachable!("handled before backend resolution"),
             Commands::Context(args) => context::run(args),
             #[cfg(windows)]
             Commands::WindowsSelfSwap(args) => self_cmd::run_windows_self_swap(args).await,
 
-            Commands::Run(args) => run::run(args, log_level).await,
-            Commands::Create(args) => create::run(args, log_level).await,
-            Commands::Modify(args) => modify::run(args).await,
-            Commands::Start(args) => start::run(args).await,
-            Commands::Stop(args) => stop::run(args).await,
-            Commands::Restart(args) => restart::run(args).await,
-            Commands::Ping(args) => ping::run(args).await,
-            Commands::Touch(args) => touch::run(args).await,
-            Commands::List(args) => list::run(args).await,
-            Commands::Status(args) => ps::run(args).await,
-            Commands::Metrics(args) => metrics::run(args).await,
-            Commands::Remove(args) => remove::run(args).await,
-            Commands::Exec(args) => exec::run(args).await,
-            Commands::Copy(args) => copy::run(args).await,
-            Commands::Logs(args) => logs::run(args).await,
+            Commands::Sandbox(args) => sandbox::run(args.command, log_level).await,
             Commands::Image(args) => image::run(args).await,
             Commands::Pull(args) => image::run_pull(args).await,
             Commands::Load(args) => image::run_load(args).await,
@@ -673,8 +696,27 @@ fn run_async_command_anyhow(
             #[cfg(feature = "ssh")]
             Commands::Ssh(args) => microsandbox_cli::commands::ssh::run(args).await,
             Commands::Images(args) => image::run_list(args).await,
+            Commands::Volumes(args) => {
+                volume::run(volume::VolumeArgs {
+                    command: volume::VolumeCommands::List(args),
+                })
+                .await
+            }
+            Commands::Snapshots(args) => {
+                snapshot::run(snapshot::SnapshotArgs {
+                    command: SnapshotCommands::List(args),
+                })
+                .await
+            }
+            Commands::Registries(args) => {
+                registry::run(registry::RegistryArgs {
+                    command: registry::RegistryCommands::List(args),
+                })
+                .await
+            }
             Commands::Rmi(args) => image::run_remove(args).await,
-            Commands::Inspect(args) => inspect::run(args).await,
+            Commands::Df(args) => storage::run_df(args).await,
+            Commands::Prune(args) => storage::run_prune(args).await,
             Commands::Volume(args) => volume::run(args).await,
             Commands::Snapshot(args) => snapshot::run(args).await,
             Commands::Install(args) => install::run(args).await,
@@ -684,8 +726,36 @@ fn run_async_command_anyhow(
             Commands::Downgrade(args) => self_cmd::run_downgrade(args).await,
             Commands::Self_(args) => self_cmd::run(args).await,
             Commands::Completion(args) => completion::run(args, Cli::command()),
+        };
+        // A CLI runtime would cancel the deferred worker when this function returns.
+        // Drain after dispatch so graceful-stop deadlines still cover only VM teardown.
+        if let Some(local) = cleanup_backend
+            .as_ref()
+            .and_then(|backend| backend.as_local())
+        {
+            local.finish_stopped_memory_cleanup().await;
         }
+        result
     })
+}
+
+// Control and diagnostic operations must remain available so users can stop
+// older runtimes before a catalog upgrade. Internal `machine` dispatch never
+// enters this path: a newer SDK must not migrate an older CLI's catalog.
+fn requires_current_catalog(command: &Commands) -> bool {
+    match command {
+        Commands::Sandbox(args) => matches!(
+            args.command,
+            sandbox::SandboxCommands::Run(_)
+                | sandbox::SandboxCommands::Create(_)
+                | sandbox::SandboxCommands::Restore(_)
+                | sandbox::SandboxCommands::Start(_)
+                | sandbox::SandboxCommands::Restart(_)
+                | sandbox::SandboxCommands::Fork(_)
+        ),
+        Commands::Snapshot(_) | Commands::Snapshots(_) | Commands::Volume(_) => true,
+        _ => false,
+    }
 }
 
 /// Return whether a command manages the CLI installation rather than a backend.
@@ -706,33 +776,56 @@ fn is_backend_independent_maintenance_command(command: &Commands) -> bool {
     }
 }
 
-/// Return whether a command benefits from an explicit execution-context notice.
-fn shows_backend_notice(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Create(_) | Commands::Remove(_) | Commands::Exec(_)
-    ) || cfg!(feature = "ssh") && matches_ssh_command(command)
-}
-
-#[cfg(feature = "ssh")]
-fn matches_ssh_command(command: &Commands) -> bool {
-    match command {
-        Commands::Ssh(args) => !matches!(
-            args.subcommand.as_ref(),
-            Some(microsandbox_cli::commands::ssh::SshCommand::Authorize(_))
-        ),
-        _ => false,
-    }
-}
-
-#[cfg(not(feature = "ssh"))]
-fn matches_ssh_command(_command: &Commands) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod command_tests {
     use super::*;
+
+    #[test]
+    fn catalog_upgrade_leaves_stop_and_diagnostics_available() {
+        for (arguments, expected) in [
+            (vec!["msb", "sandbox", "create", "alpine"], true),
+            (vec!["msb", "sandbox", "start", "example"], true),
+            (vec!["msb", "snapshot", "ls"], true),
+            (vec!["msb", "sandbox", "stop", "example"], false),
+            (vec!["msb", "sandbox", "ls"], false),
+            (
+                vec!["msb", "sandbox", "exec", "example", "--", "true"],
+                false,
+            ),
+            (vec!["msb", "doctor"], false),
+            (vec!["msb", "context"], false),
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert_eq!(requires_current_catalog(&cli.command), expected);
+        }
+    }
+
+    #[test]
+    fn partial_capture_failure_keeps_artifact_locator_and_nonzero_exit() {
+        let error: anyhow::Error = microsandbox::MicrosandboxError::SnapshotSourceRecovery(
+            Box::new(microsandbox::SnapshotSourceRecoveryError {
+                source_sandbox: "source".into(),
+                checkpoint_id: "checkpoint_test".into(),
+                checkpoint_root: "root".into(),
+                checkpoint_path: "/runtime/checkpoint_test".into(),
+                artifact: Some(microsandbox::PublishedSnapshotArtifact {
+                    kind: microsandbox::SnapshotArtifactKind::Archive,
+                    path: "/saved/snapshot.tar".into(),
+                    snapshot_id: "snap_test".into(),
+                    digest: "digest".into(),
+                }),
+                detail: "thaw acknowledgement timed out".into(),
+                publication_error: None,
+            }),
+        )
+        .into();
+        // Quiet capture suppresses success output, never this top-level error renderer.
+        assert_eq!(render_anyhow_error(&error), 1);
+        let message = error.to_string();
+        assert!(message.contains("/saved/snapshot.tar"));
+        assert!(message.contains("requires recovery"));
+        assert!(message.contains("thaw acknowledgement timed out"));
+    }
 
     #[test]
     fn maintenance_commands_do_not_require_backend_resolution() {
@@ -763,35 +856,632 @@ mod command_tests {
     }
 
     #[test]
-    fn backend_notices_cover_requested_commands_only() {
-        let create = Cli::try_parse_from(["msb", "create", "alpine:3.19"]).unwrap();
-        let remove = Cli::try_parse_from(["msb", "remove", "demo"]).unwrap();
-        let exec = Cli::try_parse_from(["msb", "exec", "demo", "--", "true"]).unwrap();
-        let context = Cli::try_parse_from(["msb", "context"]).unwrap();
-        let context_alias = Cli::try_parse_from(["msb", "ctx"]).unwrap();
+    fn storage_commands_parse_and_use_backend_resolution() {
+        let df = Cli::try_parse_from(["msb", "df", "--verbose"]).unwrap();
+        assert!(matches!(df.command, Commands::Df(_)));
+        assert!(!is_backend_independent_maintenance_command(&df.command));
+        assert!(!requires_current_catalog(&df.command));
+        assert!(Cli::try_parse_from(["msb", "df", "-q"]).is_err());
+        let prune =
+            Cli::try_parse_from(["msb", "prune", "--dry-run", "--older-than", "2h"]).unwrap();
+        assert!(matches!(prune.command, Commands::Prune(_)));
+        assert!(!is_backend_independent_maintenance_command(&prune.command));
+        assert!(!requires_current_catalog(&prune.command));
+        let storage = TOP_LEVEL_COMMAND_GROUPS
+            .iter()
+            .find(|group| group.heading == "Storage")
+            .unwrap();
+        assert!(storage.commands.contains(&"df"));
+        assert!(storage.commands.contains(&"prune"));
+    }
 
-        assert!(shows_backend_notice(&create.command));
-        assert!(shows_backend_notice(&remove.command));
-        assert!(shows_backend_notice(&exec.command));
-        assert!(!shows_backend_notice(&context.command));
-        assert!(matches!(context_alias.command, Commands::Context(_)));
+    #[test]
+    fn command_aliases_route_to_their_canonical_commands() {
+        let context = Cli::try_parse_from(["msb", "ctx"]).unwrap();
+        let modify = Cli::try_parse_from(["msb", "mod", "demo", "--cpus", "2"]).unwrap();
+
+        assert!(matches!(context.command, Commands::Context(_)));
+        assert!(matches!(
+            modify.command.into_canonical(),
+            Commands::Sandbox(sandbox::SandboxArgs {
+                command: sandbox::SandboxCommands::Modify(_)
+            })
+        ));
+    }
+
+    #[test]
+    fn plural_resource_commands_route_to_list_actions() {
+        let cli = Cli::try_parse_from(["msb", "images"]).unwrap();
+        assert!(matches!(cli.command, Commands::Images(_)));
+
+        for command in ["volumes", "vols"] {
+            let cli = Cli::try_parse_from(["msb", command]).unwrap();
+            assert!(matches!(cli.command, Commands::Volumes(_)));
+        }
+
+        for command in ["snapshots", "snaps"] {
+            let cli = Cli::try_parse_from(["msb", command]).unwrap();
+            assert!(matches!(cli.command, Commands::Snapshots(_)));
+        }
+
+        for command in ["registries", "regs"] {
+            let cli = Cli::try_parse_from(["msb", command]).unwrap();
+            assert!(matches!(cli.command, Commands::Registries(_)));
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_aliases_share_sandbox_routing_and_controls() {
+        let flags = ["app:ready", "--name", "worker", "--cow-mem", "--disk-only"];
+        let mut expected = None;
+        for prefix in [
+            vec!["restore"],
+            vec!["sandbox", "restore"],
+            vec!["sbx", "restore"],
+            vec!["snapshot", "restore"],
+            vec!["snap", "restore"],
+        ] {
+            let cli = Cli::try_parse_from(
+                ["msb", "--debug"]
+                    .into_iter()
+                    .chain(prefix.iter().copied())
+                    .chain(flags[..4].iter().copied()),
+            )
+            .unwrap();
+            assert_eq!(
+                cli.logs.selected_level(),
+                Some(microsandbox::LogLevel::Debug)
+            );
+            let command = cli.command.into_canonical();
+            assert!(requires_current_catalog(&command));
+            assert!(!is_backend_independent_maintenance_command(&command));
+            let Commands::Sandbox(sandbox::SandboxArgs {
+                command: sandbox::SandboxCommands::Restore(args),
+            }) = command
+            else {
+                panic!("expected canonical sandbox restore");
+            };
+            let parsed = format!("{args:?}");
+            if let Some(expected) = &expected {
+                assert_eq!(&parsed, expected);
+            } else {
+                expected = Some(parsed);
+            }
+            assert!(
+                Cli::try_parse_from(
+                    ["msb"]
+                        .into_iter()
+                        .chain(prefix.iter().copied())
+                        .chain(flags)
+                )
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from(
+                    ["msb"]
+                        .into_iter()
+                        .chain(prefix.iter().copied())
+                        .chain(["app:ready"])
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_aliases_accept_explicit_capture_and_filtered_lists() {
+        for command in ["snapshot", "snap"] {
+            let cli = Cli::try_parse_from([
+                "msb",
+                command,
+                "create",
+                "ready",
+                "--sandbox",
+                "app",
+                "--full",
+            ])
+            .unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Snapshot(snapshot::SnapshotArgs {
+                    command: snapshot::SnapshotCommands::Create(_)
+                })
+            ));
+        }
+        for prefix in [
+            vec!["snapshot", "ls"],
+            vec!["snap", "ls"],
+            vec!["snapshots"],
+            vec!["snaps"],
+        ] {
+            let cli =
+                Cli::try_parse_from(["msb"].into_iter().chain(prefix).chain(["--group", "app"]))
+                    .unwrap();
+            let args = match cli.command {
+                Commands::Snapshots(args) => args,
+                Commands::Snapshot(snapshot::SnapshotArgs {
+                    command: snapshot::SnapshotCommands::List(args),
+                }) => args,
+                _ => panic!("expected snapshot list"),
+            };
+            assert_eq!(args.group.as_deref(), Some("app"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_command_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_long_flags_have_consistent_short_forms() {
+        fn collect(
+            command: &clap::Command,
+            path: &str,
+            flags: &mut std::collections::BTreeMap<String, Vec<(String, Option<char>)>>,
+        ) {
+            for arg in command.get_arguments() {
+                let Some(long) = arg.get_long() else {
+                    continue;
+                };
+                // Interactive commands reserve -t for TTY allocation; do not
+                // change existing invocations to make timeout look uniform.
+                if long == "timeout"
+                    && command.get_arguments().any(|other| {
+                        other.get_long() == Some("tty") && other.get_short() == Some('t')
+                    })
+                {
+                    assert_eq!(arg.get_short(), None);
+                    continue;
+                }
+                if long == "name" {
+                    assert_eq!(arg.get_short(), Some('n'), "{path} --name");
+                }
+                flags
+                    .entry(long.to_owned())
+                    .or_default()
+                    .push((path.to_owned(), arg.get_short()));
+            }
+            for child in command.get_subcommands() {
+                collect(child, &format!("{path} {}", child.get_name()), flags);
+            }
+        }
+
+        let mut command = Cli::command();
+        command.build();
+        command.clone().debug_assert();
+        let mut flags = std::collections::BTreeMap::new();
+        collect(&command, "msb", &mut flags);
+        for (long, occurrences) in flags {
+            let expected = occurrences[0].1;
+            assert!(
+                occurrences.iter().all(|(_, short)| *short == expected),
+                "inconsistent --{long} short forms: {occurrences:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_flag_additions_parse_like_their_long_forms() {
+        let cases: &[&[&str]] = &[
+            &["restore", "saved"],
+            &["fork", "source"],
+            &["volume", "create"],
+            #[cfg(feature = "ssh")]
+            &["ssh"],
+            #[cfg(feature = "ssh")]
+            &["ssh", "connect"],
+        ];
+        for prefix in cases {
+            for flag in ["--name", "-n"] {
+                let mut matches = Cli::command()
+                    .try_get_matches_from(
+                        ["msb"]
+                            .into_iter()
+                            .chain(prefix.iter().copied())
+                            .chain([flag, "child"]),
+                    )
+                    .unwrap();
+                while let Some((_, child)) = matches.remove_subcommand() {
+                    matches = child;
+                }
+                assert_eq!(matches.get_one::<String>("name").unwrap(), "child");
+            }
+        }
+        #[cfg(feature = "ssh")]
+        for flag in ["--port", "-p"] {
+            let cli = Cli::try_parse_from(["msb", "ssh", "serve", "demo", flag, "2222"]).unwrap();
+            let Commands::Ssh(args) = cli.command else {
+                panic!("expected SSH")
+            };
+            let Some(microsandbox_cli::commands::ssh::SshCommand::Serve(args)) = args.subcommand
+            else {
+                panic!("expected SSH serve")
+            };
+            assert_eq!(args.port, Some(2222));
+            assert!(
+                Cli::try_parse_from(["msb", "ssh", "serve", "demo", flag, "2222", "--stdio"])
+                    .is_err()
+            );
+        }
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            let short = parse_sandbox(
+                prefix,
+                &[
+                    "modify", "demo", "-c", "2", "-m", "1G", "-e", "A=B", "-w", "/work",
+                ],
+            );
+            let long = parse_sandbox(
+                prefix,
+                &[
+                    "modify",
+                    "demo",
+                    "--cpus",
+                    "2",
+                    "--memory",
+                    "1G",
+                    "--env",
+                    "A=B",
+                    "--workdir",
+                    "/work",
+                ],
+            );
+            assert_eq!(format!("{short:?}"), format!("{long:?}"));
+            for verb in ["restore", "fork"] {
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        parse_sandbox(prefix, &[verb, "source", "-n", "child"])
+                    ),
+                    format!(
+                        "{:?}",
+                        parse_sandbox(prefix, &[verb, "source", "--name", "child"])
+                    )
+                );
+            }
+        }
+    }
+
+    fn parse_sandbox(prefix: &[&str], args: &[&str]) -> sandbox::SandboxCommands {
+        let cli = Cli::try_parse_from(
+            ["msb"]
+                .into_iter()
+                .chain(prefix.iter().copied())
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
+        let Commands::Sandbox(args) = cli.command.into_canonical() else {
+            panic!("expected a public sandbox command");
+        };
+        args.command
+    }
+
+    #[test]
+    fn wait_accepts_both_timeout_spellings() {
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            for flag in ["-t", "--timeout"] {
+                let SandboxCommands::Wait(args) =
+                    parse_sandbox(prefix, &["wait", "worker", flag, "30s", "--format", "json"])
+                else {
+                    panic!("expected the wait command");
+                };
+                assert_eq!(args.name, "worker");
+                assert_eq!(args.timeout.as_deref(), Some("30s"));
+                assert_eq!(args.format.as_deref(), Some("json"));
+            }
+        }
+    }
+
+    #[test]
+    fn every_sandbox_operation_has_equivalent_public_spellings() {
+        let cases: &[&[&str]] = &[
+            &["run", "alpine", "--name", "demo", "--", "echo", "--help"],
+            &["create", "alpine", "--name", "demo"],
+            &["restore", "source:ready", "--name", "child"],
+            &[
+                "restore",
+                "./saved.msb",
+                "--name",
+                "child",
+                "--cow-mem",
+                "--snapshot-base",
+                "source:base",
+                "-v",
+                "/data",
+                "-u",
+                "1000",
+                "-q",
+            ],
+            &["restore", "source:ready", "--name", "child", "--disk-only"],
+            #[cfg(feature = "net")]
+            &[
+                "restore",
+                "source:ready",
+                "--name",
+                "child",
+                "-v",
+                "/srv/work:/workspace",
+                "-p",
+                "127.0.0.1:8081:80",
+                "--external-mount-policy",
+                "relaxed",
+                "--dangerously-inherit-resources",
+            ],
+            &["modify", "demo", "--cpus", "2"],
+            &["start", "demo"],
+            &["stop", "demo", "--timeout", "3"],
+            &["pause", "demo"],
+            &["resume", "demo"],
+            &["fork", "demo", "--name", "child"],
+            #[cfg(feature = "net")]
+            &[
+                "fork", "demo", "--name", "child", "-v", "/data", "-p", "8081:80",
+            ],
+            &["restart", "demo"],
+            &["wait", "demo", "--timeout", "30s", "--format", "json"],
+            &["ping", "demo"],
+            &["touch", "demo"],
+            &["list"],
+            &["status"],
+            &["metrics", "demo", "--format", "json"],
+            &["remove", "demo"],
+            &["exec", "demo", "--", "echo", "--help"],
+            &["copy", "./source", "demo:/target"],
+            &["logs", "demo"],
+            &["inspect", "demo"],
+        ];
+        for args in cases {
+            let short = format!("{:?}", parse_sandbox(&[], args));
+            for prefix in [["sandbox"], ["sbx"]] {
+                assert_eq!(
+                    format!("{:?}", parse_sandbox(&prefix, args)),
+                    short,
+                    "{prefix:?} {args:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "ssh")]
     #[test]
-    fn ssh_connect_has_notice_but_authorize_does_not() {
-        let connect = Cli::try_parse_from(["msb", "ssh", "demo"]).unwrap();
-        let authorize = Cli::try_parse_from([
-            "msb",
-            "ssh",
-            "authorize",
-            "--key",
-            "ssh-ed25519 AAAAexample",
-        ])
-        .unwrap();
+    fn ssh_remains_a_top_level_command_only() {
+        // SSH owns connection, serving, and authorization workflows outside the sandbox group.
+        for args in [
+            &["ssh", "demo", "--", "uname", "-a"][..],
+            &["ssh", "connect", "demo"][..],
+            &["ssh", "serve", "demo", "--port", "2222"][..],
+            &["ssh", "authorize", "--stdin"][..],
+        ] {
+            let cli = Cli::try_parse_from(["msb"].into_iter().chain(args.iter().copied())).unwrap();
+            assert!(matches!(cli.command.into_canonical(), Commands::Ssh(_)));
+            for group in ["sandbox", "sbx"] {
+                assert!(
+                    Cli::try_parse_from(["msb", group].into_iter().chain(args.iter().copied()))
+                        .is_err()
+                );
+            }
+        }
+        let command = Cli::command();
+        assert!(!command.find_subcommand("ssh").unwrap().is_hide_set());
+        assert!(
+            command
+                .find_subcommand("sandbox")
+                .unwrap()
+                .find_subcommand("ssh")
+                .is_none()
+        );
+    }
 
-        assert!(shows_backend_notice(&connect.command));
-        assert!(!shows_backend_notice(&authorize.command));
+    #[test]
+    fn existing_verb_aliases_work_inside_both_groups() {
+        for (canonical, alias, arguments) in [
+            ("list", "ls", &[][..]),
+            ("status", "ps", &[][..]),
+            ("remove", "rm", &["demo"][..]),
+            ("modify", "mod", &["demo", "--cpus", "2"][..]),
+            ("copy", "cp", &["./source", "demo:/target"][..]),
+        ] {
+            let original = [&[canonical][..], arguments].concat();
+            let abbreviated = [&[alias][..], arguments].concat();
+            for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+                assert_eq!(
+                    format!("{:?}", parse_sandbox(prefix, &original)),
+                    format!("{:?}", parse_sandbox(prefix, &abbreviated)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_commands_preserve_global_flags_and_resident_executor() {
+        for argv in [
+            vec!["msb", "--debug", "sandbox", "pause", "demo"],
+            vec!["msb", "sandbox", "--debug", "pause", "demo"],
+            vec!["msb", "sbx", "pause", "demo", "--debug"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.logs.debug);
+            let command = cli.command.into_canonical();
+            assert!(command.is_resident_control());
+            assert!(!is_backend_independent_maintenance_command(&command));
+        }
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            for verb in ["pause", "resume"] {
+                assert!(parse_sandbox(prefix, &[verb, "demo"]).is_resident_control());
+            }
+            assert!(!parse_sandbox(prefix, &["start", "demo"]).is_resident_control());
+        }
+    }
+
+    #[test]
+    fn machine_launcher_is_separate_from_public_sandbox_commands() {
+        let internal = [
+            "--name",
+            "demo",
+            "--sandbox-id",
+            "1",
+            "--config-file",
+            "launch.json",
+        ];
+        let cli = Cli::try_parse_from(["msb", "machine"].into_iter().chain(internal)).unwrap();
+        assert!(matches!(cli.command, Commands::Machine(_)));
+        let mut legacy: Vec<std::ffi::OsString> = ["msb", "sandbox"]
+            .into_iter()
+            .chain(internal)
+            .map(Into::into)
+            .collect();
+        assert!(microsandbox_cli::launch_compat::route_legacy_launch(
+            &mut legacy
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(legacy).unwrap().command,
+            Commands::Machine(_)
+        ));
+        for group in ["sandbox", "sbx"] {
+            assert!(Cli::try_parse_from(["msb", group].into_iter().chain(internal)).is_err());
+        }
+    }
+
+    #[test]
+    fn restore_preserves_geometry_controls_through_all_public_forms() {
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            for mode in [&[][..], &["--cow-mem"][..], &["--disk-only"][..]] {
+                for (controls, cpus, memory) in [
+                    (&[][..], None, None),
+                    (&["--cpus", "2"][..], Some(2), None),
+                    (&["--memory", "512M"][..], None, Some("512M")),
+                    (
+                        &["--cpus", "2", "--memory", "512M"][..],
+                        Some(2),
+                        Some("512M"),
+                    ),
+                    (&["-c", "2", "-m", "512M"][..], Some(2), Some("512M")),
+                ] {
+                    let args =
+                        [&["restore", "saved", "--name", "child"][..], mode, controls].concat();
+                    let restored = parse_sandbox(prefix, &args);
+                    assert!(!restored.is_resident_control());
+                    let sandbox::SandboxCommands::Restore(restored) = restored else {
+                        panic!("expected restore for {prefix:?} {args:?}");
+                    };
+                    // Parsing preserves explicit intent. Disk boot can resize; full restore
+                    // checks these values against captured geometry after resolving the snapshot.
+                    assert_eq!(restored.controls.cpus, cpus);
+                    assert_eq!(restored.controls.memory.as_deref(), memory);
+                    assert_eq!(restored.cow_mem, mode.contains(&"--cow-mem"));
+                    assert_eq!(restored.disk_only, mode.contains(&"--disk-only"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fork_and_restore_keep_deprecated_aliases() {
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            for verb in ["fork", "branch"] {
+                let command = parse_sandbox(prefix, &[verb, "source", "--name", "child"]);
+                assert!(matches!(command, SandboxCommands::Fork(_)));
+            }
+            let command =
+                parse_sandbox(prefix, &["restore", "saved", "--name", "child", "--forked"]);
+            let SandboxCommands::Restore(args) = command else {
+                panic!("expected restore")
+            };
+            assert!(args.forked);
+            assert!(!args.cow_mem);
+        }
+        for prefix in ["snap", "snapshot"] {
+            assert!(
+                Cli::try_parse_from([
+                    "msb", prefix, "restore", "saved", "--name", "child", "--forked",
+                ])
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn restore_rejects_boot_inputs_and_uses_the_creation_executor() {
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            let restored = parse_sandbox(prefix, &["restore", "saved", "--name", "child"]);
+            assert!(matches!(restored, sandbox::SandboxCommands::Restore(_)));
+            assert!(!restored.is_resident_control());
+            for extra in [
+                &["--cow-mem", "--disk-only"][..],
+                &["--forked", "--disk-only"][..],
+                &["--conf", "sandbox.yaml"][..],
+                &["--entrypoint", "sh"][..],
+                &["--", "sh"][..],
+                &["--replace"][..],
+            ] {
+                let argv = ["msb"]
+                    .into_iter()
+                    .chain(prefix.iter().copied())
+                    .chain(["restore", "saved", "--name", "child"])
+                    .chain(extra.iter().copied());
+                assert!(
+                    Cli::try_parse_from(argv).is_err(),
+                    "accepted {prefix:?} restore {extra:?}"
+                );
+            }
+            // The old create/run route must fail, not parse as an ordinary fresh boot.
+            for verb in ["create", "run"] {
+                let argv = ["msb"].into_iter().chain(prefix.iter().copied()).chain([
+                    verb,
+                    "--from-snapshot",
+                    "saved",
+                    "--name",
+                    "child",
+                ]);
+                assert!(Cli::try_parse_from(argv).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn restore_preserves_global_flags_through_all_public_forms() {
+        for argv in [
+            vec!["msb", "--debug", "restore", "saved", "--name", "child"],
+            vec![
+                "msb", "sandbox", "--debug", "restore", "saved", "--name", "child",
+            ],
+            vec![
+                "msb", "sbx", "restore", "saved", "--name", "child", "--debug",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.logs.debug);
+            let command = cli.command.into_canonical();
+            assert!(!command.is_resident_control());
+            assert!(!is_backend_independent_maintenance_command(&command));
+            assert!(matches!(
+                command,
+                Commands::Sandbox(sandbox::SandboxArgs {
+                    command: sandbox::SandboxCommands::Restore(_)
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn help_exposes_the_group_and_shortcuts_but_hides_machine() {
+        Cli::command().debug_assert();
+        let command = Cli::command();
+        let group = command.find_subcommand("sandbox").unwrap();
+        assert!(!group.is_hide_set());
+        assert!(group.get_visible_aliases().any(|alias| alias == "sbx"));
+        assert!(command.find_subcommand("machine").unwrap().is_hide_set());
+        for nested in group.get_subcommands() {
+            let top_level = command.find_subcommand(nested.get_name()).unwrap();
+            assert!(!top_level.is_hide_set());
+        }
+        let help = render_grouped_commands(&command, &HelpStyles::detect());
+        assert!(help.contains("sandbox"));
+        assert!(help.contains("sbx"));
+        assert!(help.contains("fork"));
+        assert!(help.contains("restore"));
+        assert!(group.find_subcommand("restore").is_some());
+        assert!(!help.contains("machine"));
     }
 }
 

@@ -25,8 +25,8 @@ For full API documentation, use the docs site and generated Rust docs:
 ## Requirements
 
 - Rust toolchain with Rust 2024 edition support
-- Linux with KVM, macOS with Apple Silicon, or Windows with Windows Hypervisor Platform
-- Windows support is currently preview; see the [Windows troubleshooting guide](https://docs.microsandbox.dev/getting-started/windows-troubleshooting) for WHP and runtime setup notes.
+- Linux with KVM, macOS with Apple Silicon, or Windows 11 (x64 or ARM64) with WHP enabled
+- Windows support is currently preview; see the [Windows troubleshooting guide](https://docs.microsandbox.dev/troubleshooting/windows) for WHP and runtime setup notes.
 
 ## Installation
 
@@ -38,16 +38,26 @@ cargo add microsandbox
 
 | Feature | Default | Description |
 | --- | --- | --- |
+| `local` | yes | Local runtime, setup, image cache, snapshots, metrics, and filesystem-backed volume APIs |
+| `cloud` | yes | Cloud API backend and remote sandbox/volume operations |
 | `keyring` | yes | Registry credential lookup through the platform keyring |
-| `net` | yes | Networking, port publishing, policies, TLS interception, and secrets |
-| `prebuilt` | yes | Use prebuilt runtime artifacts where available |
+| `net` | yes | Network configuration, port publishing, policies, TLS interception, and secrets; the SDK uses the type/builder surface without compiling the host network engine |
+| `download-binaries` | yes | Install a matching official `msb` + `libkrunfw` pair during Cargo builds; implies `local` |
+| `embed-binaries` | no | Embed a compressed `msb` + `libkrunfw` archive for offline runtime installation; implies `local` |
 | `ssh` | no | SSH, SFTP, and interactive SSH helpers |
 
-To build without the networking stack while keeping the default keyring and prebuilt-runtime behavior:
-
 ```bash
-cargo add microsandbox --no-default-features --features keyring,prebuilt
+# Cloud only
+cargo add microsandbox --no-default-features --features cloud,net
+
+# Local, with automatic runtime installation at build time
+cargo add microsandbox --no-default-features --features local,net,download-binaries,keyring
+
+# Local, without downloading or embedding runtime binaries
+cargo add microsandbox --no-default-features --features local,net
 ```
+
+For the last option, install the runtime with the [CLI installer](https://docs.microsandbox.dev/getting-started/quickstart) or call `setup::ensure_runtime()` at startup. See [Runtime setup](https://docs.microsandbox.dev/sdk/setup) for details.
 
 ## Quick Start
 
@@ -74,9 +84,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Reusable Lifecycle Convergence
+
+Use `connect_or_create` when a stable name should converge on one persisted sandbox. Existing configuration wins; the builder is used only if creation is necessary. Handles retain a stable `id`, so lifecycle calls on stale receivers refuse to act on a replacement that reused the name.
+
+```rust
+let sandbox = Sandbox::builder("worker")
+    .image("python")
+    .memory(1024)
+    .connect_or_create()
+    .await?;
+
+println!("{}: {}", sandbox.name(), sandbox.id());
+let running = Sandbox::get("worker").await?.connect_or_start().await?;
+running.request_stop().await?;
+let stopped = running
+    .wait_for_status(microsandbox::sandbox::SandboxStatus::Stopped)
+    .await?;
+let restarted = stopped.restart().await?;
+restarted.destroy().await?;
+```
+
 ## Common Examples
 
 These snippets assume you already have a live `sandbox: Sandbox`. See [examples/rust](../../examples/rust) for complete runnable crates.
+
+### Fork a Live Sandbox
+
+Forking copies a running or paused local sandbox's disk and execution state into an independent child. Memory uses copy-on-write automatically. The source keeps its previous running or paused state. Host resources require explicit bindings; see [forking and resource bindings](https://docs.microsandbox.dev/sandboxes/snapshots#forking).
+
+```rust
+let child = sandbox.fork("experiment").fork().await?;
+child.stop().await?;
+```
+
+Use `fork_many(["alice", "bob"]).fork().await?` to capture once for several children. Inspect every returned outcome: one child's startup failure does not remove successful siblings. See the [fork API reference](https://docs.microsandbox.dev/sdk/rust/sandbox#forking).
+
+Restoring starts from a saved snapshot instead. Use `.cow_memory()` to request copy-on-write memory for a full-snapshot restore. A generation describes snapshot-history progression; a branch describes a distinct path through that history. The former live branch APIs and old CoW restore names remain deprecated aliases. See [restore migration notes](https://docs.microsandbox.dev/sandboxes/snapshots#migrating-restore-options) for the old-to-new names and language-specific deprecation notices.
 
 ### Command Execution
 

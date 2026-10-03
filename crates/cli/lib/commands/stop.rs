@@ -28,8 +28,8 @@ pub struct StopArgs {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Graceful shutdown deadline in seconds (default: 150). Expiry fails;
-    /// use --force to kill instead. Zero is rejected.
+    /// Graceful completion budget in seconds; timeout fails without killing. Omit to wait indefinitely.
+    /// Zero is rejected; use --force to kill instead.
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
 
@@ -69,6 +69,9 @@ pub async fn run(args: StopArgs) -> anyhow::Result<()> {
         }
     }
 
+    // `process::exit` on a partial failure bypasses the binary's finalizer.
+    // Cleanup remains outside each sandbox's graceful-stop timeout.
+    super::finish_stopped_memory_cleanup().await;
     if failed {
         std::process::exit(1);
     }
@@ -136,5 +139,15 @@ mod tests {
         let args = parse_stop_args(&["msb-28b6f33e", "reborn", "renamed"]);
 
         assert_eq!(args.names, vec!["msb-28b6f33e", "reborn", "renamed"]);
+    }
+
+    #[test]
+    fn default_is_unbounded_and_zero_does_not_select_force() {
+        let ordinary = parse_stop_args(&["reborn"]);
+        assert_eq!(ordinary.timeout, None);
+        assert!(!ordinary.force);
+        let zero = parse_stop_args(&["-t", "0", "reborn"]);
+        assert_eq!(zero.timeout, Some(0));
+        assert!(!zero.force);
     }
 }

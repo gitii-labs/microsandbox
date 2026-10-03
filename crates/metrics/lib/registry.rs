@@ -30,8 +30,8 @@ use windows_sys::Win32::Foundation::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile, OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
@@ -125,6 +125,22 @@ pub struct MetricsRegistry {
     inner: Arc<RegistryInner>,
 }
 
+/// A coherent sample with allocation identity for reader-side cache validation.
+/// This exposes existing header/slot fields; it does not change the shared-memory ABI.
+#[derive(Clone, Debug)]
+pub struct IdentifiedMetric {
+    /// Latest coherent metric.
+    pub metric: LiveMetric,
+    /// Slot containing this sample.
+    pub slot: u32,
+    /// Allocation generation observed with the sample.
+    pub generation: u64,
+    /// Registry creation timestamp, read from its immutable header.
+    pub registry_created_at_ms: i64,
+    /// Runtime metrics activation timestamp, read under the slot seqlock.
+    pub started_at_ms: i64,
+}
+
 /// Reservation token returned by [`MetricsRegistry::reserve`].
 #[derive(Clone, Copy, Debug)]
 pub struct SlotReservation {
@@ -153,12 +169,24 @@ struct RegistryInner {
     capacity: u32,
 }
 
-struct MappedRegion {
+pub(crate) struct MappedRegion {
     ptr: NonNull<u8>,
     #[cfg(unix)]
     len: usize,
     #[cfg(target_os = "windows")]
     handle: HANDLE,
+}
+
+impl MappedRegion {
+    /// Return the base address of the mapped shared-memory region.
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr().cast_const()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -496,7 +524,7 @@ impl MetricsRegistry {
     /// generation-checked: if the slot was reused between the read and the
     /// release, the release fails and the (now unrelated) slot is skipped.
     fn read_slot_demoting(&self, idx: u32, include_stale: bool) -> Option<LiveMetric> {
-        let (mut metric, generation) = self.read_slot(idx, true)?;
+        let (mut metric, generation, _) = self.read_slot(idx, true)?;
         if metric.state == LiveMetricState::Active && metric.pid > 0 && !pid_is_alive(metric.pid) {
             if self
                 .release_inner(idx, generation, ReleaseMode::Stale, true)
@@ -510,6 +538,30 @@ impl MetricsRegistry {
             return None;
         }
         Some(metric)
+    }
+
+    /// Read one slot with its allocation identity, preserving existing dead-owner handling.
+    pub fn identified_at(&self, slot: u32, include_stale: bool) -> Option<IdentifiedMetric> {
+        if slot >= self.capacity() {
+            return None;
+        }
+        self.read_slot_demoting(slot, include_stale)?;
+        // Demotion can change generation. Read the final identity coherently again.
+        let (metric, generation, started_at_ms) = self.read_slot(slot, include_stale)?;
+        Some(IdentifiedMetric {
+            metric,
+            slot,
+            generation,
+            started_at_ms,
+            registry_created_at_ms: self.header().created_at_unix_ms,
+        })
+    }
+
+    /// Snapshot slots together with their allocation identities.
+    pub fn identified_snapshot(&self, include_stale: bool) -> Vec<IdentifiedMetric> {
+        (0..self.capacity())
+            .filter_map(|slot| self.identified_at(slot, include_stale))
+            .collect()
     }
 
     /// Lookup the active or stale slot for a sandbox id, if any.
@@ -647,7 +699,7 @@ impl MetricsRegistry {
     /// Read one coherent (metric, generation) pair from a slot. The
     /// generation is the value observed stable across the seqlock window,
     /// letting callers perform generation-checked follow-up transitions.
-    fn read_slot(&self, idx: u32, include_stale: bool) -> Option<(LiveMetric, u64)> {
+    fn read_slot(&self, idx: u32, include_stale: bool) -> Option<(LiveMetric, u64, i64)> {
         let slot = self.slot(idx);
         // Try many times to obtain a coherent snapshot. A tight-loop writer
         // can complete a full cycle in <100 ns, so we need a generous budget
@@ -755,7 +807,7 @@ impl MetricsRegistry {
                     upper_host_allocated,
                 ),
             };
-            return Some((metric, gen_after));
+            return Some((metric, gen_after, started_at_ms));
         }
         None
     }
@@ -986,7 +1038,30 @@ fn open_existing_region(
     name: &std::ffi::CStr,
     map_len: usize,
 ) -> MetricsResult<Option<MappedRegion>> {
-    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, 0) };
+    open_existing_unix_region(
+        name,
+        map_len,
+        libc::O_RDWR,
+        libc::PROT_READ | libc::PROT_WRITE,
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn open_existing_read_only_region(
+    name: &std::ffi::CStr,
+    map_len: usize,
+) -> MetricsResult<Option<MappedRegion>> {
+    open_existing_unix_region(name, map_len, libc::O_RDONLY, libc::PROT_READ)
+}
+
+#[cfg(unix)]
+fn open_existing_unix_region(
+    name: &std::ffi::CStr,
+    map_len: usize,
+    open_flags: libc::c_int,
+    protection: libc::c_int,
+) -> MetricsResult<Option<MappedRegion>> {
+    let fd = unsafe { libc::shm_open(name.as_ptr(), open_flags, 0) };
     if fd < 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ENOENT) {
@@ -1004,7 +1079,7 @@ fn open_existing_region(
         libc::mmap(
             std::ptr::null_mut(),
             map_len,
-            libc::PROT_READ | libc::PROT_WRITE,
+            protection,
             libc::MAP_SHARED,
             fd,
             0,
@@ -1026,8 +1101,25 @@ fn open_existing_region(
     name: &std::ffi::CStr,
     map_len: usize,
 ) -> MetricsResult<Option<MappedRegion>> {
+    open_existing_windows_region(name, map_len, FILE_MAP_ALL_ACCESS)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn open_existing_read_only_region(
+    name: &std::ffi::CStr,
+    map_len: usize,
+) -> MetricsResult<Option<MappedRegion>> {
+    open_existing_windows_region(name, map_len, FILE_MAP_READ)
+}
+
+#[cfg(target_os = "windows")]
+fn open_existing_windows_region(
+    name: &std::ffi::CStr,
+    map_len: usize,
+    desired_access: u32,
+) -> MetricsResult<Option<MappedRegion>> {
     let name = windows_mapping_name(name)?;
-    let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, name.as_ptr()) };
+    let handle = unsafe { OpenFileMappingW(desired_access, 0, name.as_ptr()) };
     if handle.is_null() {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
@@ -1036,11 +1128,11 @@ fn open_existing_region(
         return Err(err.into());
     }
 
-    map_windows_region(handle, map_len).map(Some)
+    map_windows_region(handle, map_len, desired_access).map(Some)
 }
 
 #[cfg(unix)]
-fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsResult<MappedRegion> {
+pub(crate) fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsResult<MappedRegion> {
     let fd = unsafe {
         libc::shm_open(
             name.as_ptr(),
@@ -1091,7 +1183,7 @@ fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsResult<MappedR
 }
 
 #[cfg(target_os = "windows")]
-fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsResult<MappedRegion> {
+pub(crate) fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsResult<MappedRegion> {
     let name = windows_mapping_name(name)?;
     let max_size = map_len as u64;
     let handle = unsafe {
@@ -1112,11 +1204,11 @@ fn create_region(name: &std::ffi::CStr, map_len: usize) -> MetricsResult<MappedR
         return Err(MetricsError::AlreadyExists);
     }
 
-    map_windows_region(handle, map_len)
+    map_windows_region(handle, map_len, FILE_MAP_ALL_ACCESS)
 }
 
 #[cfg(all(unix, test))]
-fn unlink_region(name: &std::ffi::CStr) {
+pub(crate) fn unlink_region(name: &std::ffi::CStr) {
     unsafe {
         libc::shm_unlink(name.as_ptr());
     }
@@ -1124,11 +1216,15 @@ fn unlink_region(name: &std::ffi::CStr) {
 
 #[cfg(target_os = "windows")]
 #[cfg(test)]
-fn unlink_region(_name: &std::ffi::CStr) {}
+pub(crate) fn unlink_region(_name: &std::ffi::CStr) {}
 
 #[cfg(target_os = "windows")]
-fn map_windows_region(handle: HANDLE, map_len: usize) -> MetricsResult<MappedRegion> {
-    let ptr = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, map_len) };
+fn map_windows_region(
+    handle: HANDLE,
+    map_len: usize,
+    desired_access: u32,
+) -> MetricsResult<MappedRegion> {
+    let ptr = unsafe { MapViewOfFile(handle, desired_access, 0, 0, map_len) };
     if ptr.Value.is_null() {
         let err = std::io::Error::last_os_error();
         unsafe { CloseHandle(handle) };
@@ -1165,14 +1261,14 @@ fn windows_mapping_name(name: &std::ffi::CStr) -> MetricsResult<Vec<u16>> {
 }
 
 /// Outcome of `wait_for_ready`.
-enum WaitForReadyError {
+pub(crate) enum WaitForReadyError {
     /// The header was still `UNINIT`/`INITIALIZING` when the wait expired.
     Stuck,
     /// The header carried an unrecognised state value.
     Invalid(u32),
 }
 
-fn wait_for_ready(header: &Header) -> Result<(), WaitForReadyError> {
+pub(crate) fn wait_for_ready(header: &Header) -> Result<(), WaitForReadyError> {
     let deadline = Instant::now() + INIT_WAIT_TIMEOUT;
     loop {
         let state = header.state.load(Ordering::Acquire);
@@ -1190,16 +1286,24 @@ fn wait_for_ready(header: &Header) -> Result<(), WaitForReadyError> {
 }
 
 fn validate_header(header: &Header, expected_capacity: Option<u32>) -> MetricsResult<()> {
+    validate_header_version(header, REGISTRY_VERSION, expected_capacity)
+}
+
+pub(crate) fn validate_header_version(
+    header: &Header,
+    expected_version: u32,
+    expected_capacity: Option<u32>,
+) -> MetricsResult<()> {
     if header.magic != REGISTRY_MAGIC {
         return Err(MetricsError::Custom(format!(
             "invalid registry magic: 0x{:x}",
             header.magic
         )));
     }
-    if header.version != REGISTRY_VERSION {
+    if header.version != expected_version {
         return Err(MetricsError::Custom(format!(
-            "incompatible registry version: {}",
-            header.version
+            "incompatible registry version: {} (expected {expected_version})",
+            header.version,
         )));
     }
     if header.header_len as usize != HEADER_SIZE {
@@ -1278,7 +1382,7 @@ fn read_name(slot: &Slot) -> String {
     String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
-fn flag_value(flags: u32, flag: u32, value: u64) -> Option<u64> {
+pub(crate) fn flag_value(flags: u32, flag: u32, value: u64) -> Option<u64> {
     if flag_set(flags, flag) {
         Some(value)
     } else {
@@ -1387,7 +1491,7 @@ fn pid_is_alive(pid: i32) -> bool {
     ok != 0 && exit_code == STILL_ACTIVE as u32
 }
 
-fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+pub(crate) fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     if ms <= 0 {
         return DateTime::<Utc>::UNIX_EPOCH;
     }

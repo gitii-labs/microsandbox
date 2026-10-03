@@ -1,48 +1,12 @@
 ---
 title: Execution
 description: Rust SDK - Command execution API reference
+keywords: ["Rust SDK", "Rust execution", "microsandbox execution"]
 ---
 
-Run commands inside a running sandbox: buffer the output in one call, stream it event by event, drive a shell, or bridge your terminal to an interactive PTY session. See [Commands](/sandboxes/commands) for usage examples.
+Run commands inside a running sandbox. See [Commands](/sandboxes/commands) for usage examples.
 
-<p className="msb-label" id="typical-flow">Typical flow</p>
-
-```rust
-use microsandbox::Sandbox;
-
-let sb = Sandbox::builder("api").image("python").create().await?;
-
-// Buffered: run and collect everything
-let out = sb.exec("python", ["-c", "print('hi')"]).await?;
-println!("{}", out.stdout()?);
-
-// Streaming: process output as it arrives
-let mut handle = sb.exec_stream("tail", ["-f", "/var/log/app.log"]).await?;
-while let Some(event) = handle.recv().await {
-    if let microsandbox::ExecEvent::Stdout(chunk) = event {
-        print!("{}", String::from_utf8_lossy(&chunk));
-    }
-}
-
-sb.stop().await?;
-```
-
-## Default workload
-
-`create()` boots the sandbox without executing its image workload. `exec_default()` resolves the effective OCI ENTRYPOINT and CMD, then runs it through the guest agent. Use `exec_default_with(...)` for per-call options, `exec_default_stream()` / `exec_default_stream_with(...)` for streaming, and `attach_default()` / `attach_default_with(...)` for a PTY. These methods return `MicrosandboxError::NoDefaultCommand` when no executable default exists; they never fall back to a shell.
-
-```rust
-let sb = Sandbox::builder("worker")
-    .image("example/worker:latest")
-    .entrypoint(["python", "-u"])
-    .cmd(["worker.py", "--once"])
-    .create()
-    .await?;
-
-let out = sb.exec_default_with(|e| e.env("LOG_LEVEL", "debug")).await?;
-```
-
-## Run methods
+## Sandbox
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">exec()</span>
 
@@ -151,7 +115,7 @@ println!("{}", out.stdout()?);
 
 </Accordion>
 
-Run a command through the sandbox's configured shell (default: `/bin/sh`, set via [`SandboxBuilder::shell()`](/sdk/rust/sandbox#shell)). The script is run as `<shell> -c "<script>"`, so shell syntax like pipes, redirects, and `&&` chains works.
+Run a command through the sandbox's configured shell (default: `/bin/sh`, set via [`SandboxBuilder::shell()`](/sdk/rust/sandbox#sandbox-shell)). The script is run as `<shell> -c "<script>"`, so shell syntax like pipes, redirects, and `&&` chains works.
 
 <p className="msb-label">Parameters</p>
 
@@ -286,7 +250,7 @@ if let Some(stdin) = handle.take_stdin() {
 
 </Accordion>
 
-Streaming execution with per-execution overrides. Enable [`stdin_pipe()`](#stdin_pipe) to write to the process's stdin via [`ExecHandle::take_stdin()`](#exechandle), and [`tty(true)`](#tty) to allocate a pseudo-terminal for interactive programs like shells, REPLs, or editors.
+Streaming execution with per-execution overrides. Enable [`stdin_pipe()`](#exec_options-stdin_pipe) to write to the process's stdin via [`ExecHandle::take_stdin()`](#exechandle), and [`tty(true)`](#exec_options-tty) to allocate a pseudo-terminal for interactive programs like shells, REPLs, or editors.
 
 <p className="msb-label">Parameters</p>
 
@@ -387,7 +351,7 @@ Run a shell command with per-execution overrides and streaming I/O. As with [`sh
   </div>
 </div>
 
-## Attach methods
+<p className="msb-member-group">Attach methods</p>
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">attach()</span>
 
@@ -490,7 +454,7 @@ let exit_code = sb.attach_shell().await?;
 
 </Accordion>
 
-Attach to the sandbox's default shell (configured via [`SandboxBuilder::shell()`](/sdk/rust/sandbox#shell), default `/bin/sh`) with an interactive PTY session.
+Attach to the sandbox's default shell (configured via [`SandboxBuilder::shell()`](/sdk/rust/sandbox#sandbox-shell), default `/bin/sh`) with an interactive PTY session.
 
 <p className="msb-label">Returns</p>
 
@@ -505,7 +469,7 @@ Attach to the sandbox's default shell (configured via [`SandboxBuilder::shell()`
 
 Builder for per-execution overrides passed to [`exec_with()`](#sb-exec_with), [`exec_stream_with()`](#sb-exec_stream_with), [`shell_with()`](#sb-shell_with), and [`shell_stream_with()`](#sb-shell_stream_with). Does not change the sandbox's defaults. Every setter returns `Self`, so calls chain.
 
-#### <span className="msb-recv">.</span><span className="msb-hn">arg()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">arg()</span>
 
 ```rust
 fn arg(self, arg: impl Into<String>) -> Self
@@ -522,7 +486,7 @@ Append a single command-line argument, e.g. `"-la"` or `"/tmp"`.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">args()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">args()</span>
 
 ```rust
 fn args(self, args: impl IntoIterator<Item = impl Into<String>>) -> Self
@@ -539,7 +503,7 @@ Append multiple command-line arguments.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">cwd()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">cwd()</span>
 
 ```rust
 fn cwd(self, cwd: impl Into<String>) -> Self
@@ -556,7 +520,7 @@ Override the working directory for this command. Overrides the sandbox default s
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">user()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">user()</span>
 
 ```rust
 fn user(self, user: impl Into<String>) -> Self
@@ -573,7 +537,7 @@ Override the guest user for this command.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">env()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">env()</span>
 
 ```rust
 fn env(self, key: impl Into<String>, value: impl Into<String>) -> Self
@@ -594,7 +558,7 @@ Set an environment variable for this command. Merged on top of the sandbox-level
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">envs()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">envs()</span>
 
 ```rust
 fn envs(
@@ -614,7 +578,7 @@ Set multiple environment variables for this command at once.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">timeout()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">timeout()</span>
 
 ```rust
 fn timeout(self, timeout: Duration) -> Self
@@ -631,7 +595,7 @@ Kill the process with SIGKILL if it hasn't exited within this duration.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">tty()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">tty()</span>
 
 ```rust
 fn tty(self, enabled: bool) -> Self
@@ -648,7 +612,7 @@ Allocate a pseudo-terminal. Enable for interactive programs (shells, editors, `t
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">stdin_null()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">stdin_null()</span>
 
 ```rust
 fn stdin_null(self) -> Self
@@ -656,7 +620,7 @@ fn stdin_null(self) -> Self
 
 Stdin reads from `/dev/null`. This is the default.
 
-#### <span className="msb-recv">.</span><span className="msb-hn">stdin_pipe()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">stdin_pipe()</span>
 
 ```rust
 fn stdin_pipe(self) -> Self
@@ -664,7 +628,7 @@ fn stdin_pipe(self) -> Self
 
 Enable a stdin writer via [`ExecSink`](#execsink). Use with [`ExecHandle::take_stdin()`](#exechandle) on the returned streaming handle to send data to the process.
 
-#### <span className="msb-recv">.</span><span className="msb-hn">stdin_bytes()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">stdin_bytes()</span>
 
 ```rust
 fn stdin_bytes(self, data: impl Into<Vec<u8>>) -> Self
@@ -681,7 +645,7 @@ Provide fixed bytes as stdin. The process reads them and then sees EOF.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">rlimit()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">rlimit()</span>
 
 ```rust
 fn rlimit(self, resource: RlimitResource, limit: u64) -> Self
@@ -712,13 +676,13 @@ Set a POSIX resource limit with soft equal to hard. Applied via `setrlimit()` be
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">rlimit_range()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">rlimit_range()</span>
 
 ```rust
 fn rlimit_range(self, resource: RlimitResource, soft: u64, hard: u64) -> Self
 ```
 
-Set a resource limit with different soft and hard values. [`build()`](#build) errors if `soft > hard`.
+Set a resource limit with different soft and hard values. [`build()`](#exec_options-build) errors if `soft > hard`.
 
 <p className="msb-label">Parameters</p>
 
@@ -737,7 +701,7 @@ Set a resource limit with different soft and hard values. [`build()`](#build) er
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">build()</span>
+#### <span className="msb-recv">exec_options.</span><span className="msb-hn">build()</span>
 
 ```rust
 fn build(self) -> MicrosandboxResult<ExecOptions>
@@ -758,7 +722,7 @@ Finalize the options. Called automatically by the `*_with` methods when you use 
 
 Builder for interactive attach options passed to [`attach_with()`](#sb-attach_with). Every setter returns `Self`, so calls chain.
 
-#### <span className="msb-recv">.</span><span className="msb-hn">arg()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">arg()</span>
 
 ```rust
 fn arg(self, arg: impl Into<String>) -> Self
@@ -775,7 +739,7 @@ Append a single command-line argument to the attached command.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">args()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">args()</span>
 
 ```rust
 fn args(self, args: impl IntoIterator<Item = impl Into<String>>) -> Self
@@ -792,7 +756,7 @@ Append multiple command-line arguments.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">cwd()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">cwd()</span>
 
 ```rust
 fn cwd(self, cwd: impl Into<String>) -> Self
@@ -809,7 +773,7 @@ Override the working directory for the attached session.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">user()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">user()</span>
 
 ```rust
 fn user(self, user: impl Into<String>) -> Self
@@ -826,7 +790,7 @@ Override the guest user for the attached session.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">env()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">env()</span>
 
 ```rust
 fn env(self, key: impl Into<String>, value: impl Into<String>) -> Self
@@ -847,7 +811,7 @@ Set an environment variable for the attached session. Merged on top of the sandb
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">envs()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">envs()</span>
 
 ```rust
 fn envs(
@@ -867,7 +831,7 @@ Set multiple environment variables for the attached session at once.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">detach_keys()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">detach_keys()</span>
 
 ```rust
 fn detach_keys(self, keys: impl Into<String>) -> Self
@@ -884,7 +848,7 @@ Set the key sequence that detaches from the session without stopping the process
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">rlimit()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">rlimit()</span>
 
 ```rust
 fn rlimit(self, resource: RlimitResource, limit: u64) -> Self
@@ -905,13 +869,13 @@ Set a POSIX resource limit with soft equal to hard for the attached process.
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">rlimit_range()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">rlimit_range()</span>
 
 ```rust
 fn rlimit_range(self, resource: RlimitResource, soft: u64, hard: u64) -> Self
 ```
 
-Set a resource limit with different soft and hard values for the attached process. [`build()`](#build-2) errors if `soft > hard`.
+Set a resource limit with different soft and hard values for the attached process. [`build()`](#attach_options-build) errors if `soft > hard`.
 
 <p className="msb-label">Parameters</p>
 
@@ -930,7 +894,7 @@ Set a resource limit with different soft and hard values for the attached proces
   </div>
 </div>
 
-#### <span className="msb-recv">.</span><span className="msb-hn">build()</span>
+#### <span className="msb-recv">attach_options.</span><span className="msb-hn">build()</span>
 
 ```rust
 fn build(self) -> MicrosandboxResult<AttachOptions>
@@ -947,49 +911,271 @@ Finalize the options. Called automatically by [`attach_with()`](#sb-attach_with)
   </div>
 </div>
 
-## Types
+## ExecHandle
 
-### ExecHandle
 
 <p className="msb-backref">Returned by <a href="#sb-exec_stream">exec_stream()</a> · <a href="#sb-exec_stream_with">exec_stream_with()</a> · <a href="#sb-shell_stream">shell_stream()</a> · <a href="#sb-shell_stream_with">shell_stream_with()</a></p>
 
 A handle to a running streaming execution. Receives [`ExecEvent`](#execevent)s as the process produces output, and provides control over stdin, signals, and the PTY size.
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| recv() | `Option<`[`ExecEvent`](#execevent)`>` | Receive the next event. `None` when the session has ended and all output has been delivered. |
-| wait() | `Result<`[`ExitStatus`](#exitstatus)`>` | Wait for the process to exit, discarding any remaining output. |
-| collect() | `Result<`[`ExecOutput`](#execoutput)`>` | Wait for exit and collect all remaining stdout/stderr. |
-| id() | `String` | Session ID for this execution. Can be used to reattach later. |
-| control() | [`ExecControl`](#execcontrol) | A cloneable control handle for sending signals and resizes from another task. |
-| take_stdin() | `Option<`[`ExecSink`](#execsink)`>` | Take the stdin writer. Only available if `stdin_pipe()` was set; returns `None` after the first call. |
-| signal(signal) | `Result<()>` | Send a POSIX signal to the process (e.g. `libc::SIGTERM`). |
-| kill() | `Result<()>` | Send SIGKILL to the process. |
-| resize(rows, cols) | `Result<()>` | Resize the PTY for this session. |
 
-### ExecControl
+#### <span className="msb-recv">h.</span><span className="msb-hn">recv()</span>
+
+```rust
+recv()
+```
+
+Receive the next event. `None` when the session has ended and all output has been delivered.
+
+<p className="msb-label">Returns</p>
+
+`Option<`[`ExecEvent`](#execevent)`>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">wait()</span>
+
+```rust
+wait()
+```
+
+Wait for the process to exit, discarding any remaining output.
+
+<p className="msb-label">Returns</p>
+
+`Result<`[`ExitStatus`](#exitstatus)`>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">collect()</span>
+
+```rust
+collect()
+```
+
+Wait for exit and collect all remaining stdout/stderr.
+
+<p className="msb-label">Returns</p>
+
+`Result<`[`ExecOutput`](#execoutput)`>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">id()</span>
+
+```rust
+id()
+```
+
+Session ID for this execution. Can be used to reattach later.
+
+<p className="msb-label">Returns</p>
+
+`String`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">control()</span>
+
+```rust
+control()
+```
+
+A cloneable control handle for sending signals and resizes from another task.
+
+<p className="msb-label">Returns</p>
+
+[`ExecControl`](#execcontrol)
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">take_stdin()</span>
+
+```rust
+take_stdin()
+```
+
+Take the stdin writer. Only available if `stdin_pipe()` was set; returns `None` after the first call.
+
+<p className="msb-label">Returns</p>
+
+`Option<`[`ExecSink`](#execsink)`>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">signal()</span>
+
+```rust
+signal(signal)
+```
+
+Send a POSIX signal to the process (e.g. `libc::SIGTERM`).
+
+<p className="msb-label">Returns</p>
+
+`Result<()>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">kill()</span>
+
+```rust
+kill()
+```
+
+Send SIGKILL to the process.
+
+<p className="msb-label">Returns</p>
+
+`Result<()>`
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">resize()</span>
+
+```rust
+resize(rows, cols)
+```
+
+Resize the PTY for this session.
+
+<p className="msb-label">Returns</p>
+
+`Result<()>`
+
+## ExecControl
+
 
 <p className="msb-backref">Returned by <a href="#exechandle">ExecHandle.control()</a></p>
 
 A cloneable, lightweight control handle for a streaming exec session. Lets a task other than the one owning the [`ExecHandle`](#exechandle) send signals and PTY resizes. Carries no event stream.
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| id() | `String` | Session ID for this execution. |
-| signal(signal) | `Result<()>` | Send a POSIX signal to the process (e.g. `libc::SIGTERM`). |
-| kill() | `Result<()>` | Send SIGKILL to the process. |
-| resize(rows, cols) | `Result<()>` | Resize the PTY for this session. |
 
-### ExecSink
+#### <span className="msb-recv">control.</span><span className="msb-hn">id()</span>
+
+```rust
+id()
+```
+
+Session ID for this execution.
+
+<p className="msb-label">Returns</p>
+
+`String`
+
+#### <span className="msb-recv">control.</span><span className="msb-hn">signal()</span>
+
+```rust
+signal(signal)
+```
+
+Send a POSIX signal to the process (e.g. `libc::SIGTERM`).
+
+<p className="msb-label">Returns</p>
+
+`Result<()>`
+
+#### <span className="msb-recv">control.</span><span className="msb-hn">kill()</span>
+
+```rust
+kill()
+```
+
+Send SIGKILL to the process.
+
+<p className="msb-label">Returns</p>
+
+`Result<()>`
+
+#### <span className="msb-recv">control.</span><span className="msb-hn">resize()</span>
+
+```rust
+resize(rows, cols)
+```
+
+Resize the PTY for this session.
+
+<p className="msb-label">Returns</p>
+
+`Result<()>`
+
+## ExecSink
+
 
 <p className="msb-backref">Returned by <a href="#exechandle">ExecHandle.take_stdin()</a></p>
 
-A writer for sending data to a running process's stdin. Obtained via [`ExecHandle::take_stdin()`](#exechandle) after enabling [`stdin_pipe()`](#stdin_pipe).
+A writer for sending data to a running process's stdin. Obtained via [`ExecHandle::take_stdin()`](#exechandle) after enabling [`stdin_pipe()`](#exec_options-stdin_pipe).
 
-| Method | Parameters | Description |
-|--------|-----------|-------------|
-| write(data) | `data: impl AsRef<[u8]>` | Write bytes to the process's stdin. |
-| close() | - | Close stdin. The process sees EOF on its stdin. |
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">write()</span>
+
+```rust
+write(data)
+```
+
+Write bytes to the process's stdin.
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">close()</span>
+
+```rust
+close()
+```
+
+Close stdin. The process sees EOF on its stdin.
+
+## ExecOutput
+
+
+<p className="msb-backref">Returned by <a href="#sb-exec">exec()</a> · <a href="#sb-exec_with">exec_with()</a> · <a href="#sb-shell">shell()</a> · <a href="#sb-shell_with">shell_with()</a> · <a href="#exechandle">ExecHandle.collect()</a></p>
+
+The result of a completed command execution. Holds the exit status and all captured output.
+
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">status()</span>
+
+```rust
+status()
+```
+
+Exit code and success flag.
+
+<p className="msb-label">Returns</p>
+
+[`ExitStatus`](#exitstatus)
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">stdout()</span>
+
+```rust
+stdout()
+```
+
+Collected stdout decoded as UTF-8. Errors if the output is not valid UTF-8.
+
+<p className="msb-label">Returns</p>
+
+`Result<String, FromUtf8Error>`
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">stderr()</span>
+
+```rust
+stderr()
+```
+
+Collected stderr decoded as UTF-8.
+
+<p className="msb-label">Returns</p>
+
+`Result<String, FromUtf8Error>`
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">stdout_bytes()</span>
+
+```rust
+stdout_bytes()
+```
+
+Raw stdout bytes without decoding.
+
+<p className="msb-label">Returns</p>
+
+`&Bytes`
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">stderr_bytes()</span>
+
+```rust
+stderr_bytes()
+```
+
+Raw stderr bytes without decoding.
+
+<p className="msb-label">Returns</p>
+
+`&Bytes`
+
+## Types
 
 ### ExecEvent
 
@@ -1006,20 +1192,6 @@ An event emitted by a streaming execution.
 | `Failed` | `ExecFailed` | The process failed to spawn (binary not found, permission denied, etc.). The user code never ran. Terminal: no further events follow. |
 | `StdinError` | `ExecStdinError` | A stdin write to the child failed (e.g. broken pipe). Non-terminal: the session keeps running and may still emit output and an `Exited` event. |
 
-### ExecOutput
-
-<p className="msb-backref">Returned by <a href="#sb-exec">exec()</a> · <a href="#sb-exec_with">exec_with()</a> · <a href="#sb-shell">shell()</a> · <a href="#sb-shell_with">shell_with()</a> · <a href="#exechandle">ExecHandle.collect()</a></p>
-
-The result of a completed command execution. Holds the exit status and all captured output.
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| status() | [`ExitStatus`](#exitstatus) | Exit code and success flag. |
-| stdout() | `Result<String, FromUtf8Error>` | Collected stdout decoded as UTF-8. Errors if the output is not valid UTF-8. |
-| stderr() | `Result<String, FromUtf8Error>` | Collected stderr decoded as UTF-8. |
-| stdout_bytes() | `&Bytes` | Raw stdout bytes without decoding. |
-| stderr_bytes() | `&Bytes` | Raw stderr bytes without decoding. |
-
 ### ExitStatus
 
 <p className="msb-backref">Returned by <a href="#exechandle">ExecHandle.wait()</a> · <a href="#execoutput">ExecOutput.status()</a> · <a href="/sdk/rust/sandbox#sb-wait">sb.wait()</a> · <a href="/sdk/rust/sandbox#sb-stop_and_wait">sb.stop_and_wait()</a></p>
@@ -1033,9 +1205,9 @@ The exit status of a completed process.
 
 ### Rlimit
 
-<p className="msb-backref">Configured via <a href="#rlimit">rlimit()</a> · <a href="#rlimit_range">rlimit_range()</a></p>
+<p className="msb-backref">Configured via <a href="#rlimit">rlimit()</a> · <a href="#exec_options-rlimit_range">rlimit_range()</a></p>
 
-A POSIX resource limit. Built indirectly by [`rlimit()`](#rlimit) and [`rlimit_range()`](#rlimit_range) on the option builders; you rarely construct it by hand.
+A POSIX resource limit. Built indirectly by [`rlimit()`](#rlimit) and [`rlimit_range()`](#exec_options-rlimit_range) on the option builders; you rarely construct it by hand.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1045,7 +1217,7 @@ A POSIX resource limit. Built indirectly by [`rlimit()`](#rlimit) and [`rlimit_r
 
 ### RlimitResource
 
-<p className="msb-backref">Used by <a href="#rlimit">rlimit()</a> · <a href="#rlimit_range">rlimit_range()</a> · <a href="#rlimit-3">AttachOptionsBuilder.rlimit()</a></p>
+<p className="msb-backref">Used by <a href="#rlimit">rlimit()</a> · <a href="#exec_options-rlimit_range">rlimit_range()</a> · <a href="#attach_options-rlimit">AttachOptionsBuilder.rlimit()</a></p>
 
 POSIX resource limit identifiers. Each maps to an `RLIMIT_*` constant.
 

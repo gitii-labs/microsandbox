@@ -1,16 +1,34 @@
 ---
-title: config.json
-description: Global config.json reference
+title: Global config reference
+description: Reference for the global config.json shared by the CLI and SDKs
 icon: "gear"
 ---
 
-microsandbox reads its global configuration from `~/.microsandbox/config.json`. All fields are optional. A missing file or empty JSON object is equivalent to using the defaults.
+For guidance on choosing between global configuration, sandbox YAML, CLI
+arguments, and SDK inputs, start with [Configuration](/operations/configuration).
+
+microsandbox reads user configuration from `~/.microsandbox/config.json`, or `MSB_CONFIG_PATH` when set. All fields are optional. A missing file or empty JSON object adds no user overrides; defaults and managed settings still apply.
+
+Newly saved user files include `"version": 1`. An omitted version defaults to `1`; invalid or unsupported versions are rejected.
+
+In Rust, `GlobalConfigPatch::load()` reads saved user settings and `.save()` writes them without filling in defaults. Omitted fields remain omitted, and explicit clears are preserved. Unknown user fields are ignored on load and discarded on save. `GlobalConfig` holds resolved settings after layering; use `LocalBackend::config()` to read the effective backend configuration.
+
+## Managed configuration
+
+Administrators can enforce these same fields using a protected `managed.json` file with the shape `{ "version": 1, "overrides": { ... } }`. Supplied managed values take precedence over ordinary user settings and CLI/SDK options. The user and managed files have independent schema versions, each defaulting to `1` when omitted. Managed values are not automatically saved into the user file.
+
+See [Managed deployment](/enterprise/managed-configuration) for deployment, precedence, clearing, and updates. This page remains the reference for individual fields and accepted values.
+
+## Reference example
+
+Relative host paths stored in this file resolve from the file's directory, including `home`, `paths.*`, and `registries.ca_certs`. For example, `/etc/microsandbox/config.json` containing `"ca_certs": "./company.pem"` selects `/etc/microsandbox/company.pem`, regardless of the caller's working directory. This intentionally replaces the previous working-directory-relative interpretation. Use an absolute path to keep a location elsewhere. Programmatic SDK paths and environment defaults are captured relative to the caller's working directory when the backend is constructed. Guest paths, such as `sandbox_defaults.workdir`, are unaffected.
 
 <Accordion title="Full example">
 ```json
 {
   "home": "/custom/path/.microsandbox",
   "log_level": "info",
+  "deployment_profile": "multi-tenant",
   "database": {
     "url": "sqlite:///tmp/msb.db",
     "max_connections": 10,
@@ -20,6 +38,7 @@ microsandbox reads its global configuration from `~/.microsandbox/config.json`. 
   "paths": {
     "msb": "/usr/local/bin/msb",
     "libkrunfw": "/usr/local/lib/libkrunfw.so",
+    "agentd": "/usr/local/libexec/microsandbox/agentd",
     "cache": "/mnt/fast/msb-cache",
     "sandboxes": null,
     "volumes": null,
@@ -31,6 +50,7 @@ microsandbox reads its global configuration from `~/.microsandbox/config.json`. 
     "cpus": 2,
     "memory_mib": 1024,
     "cpu_placement": "auto",
+    "placement_profile": "latency",
     "thp": "madvise",
     "oci": {
       "root_disk": {
@@ -43,6 +63,12 @@ microsandbox reads its global configuration from `~/.microsandbox/config.json`. 
     "workdir": "/app"
   },
   "runtime": {
+    "placement_profiles": {
+      "latency": {
+        "numa": { "mode": "prefer_single" },
+        "memory": { "mode": "follow_cpu" }
+      }
+    },
     "block_writeback": {
       "mode": "auto"
     }
@@ -71,6 +97,9 @@ microsandbox reads its global configuration from `~/.microsandbox/config.json`. 
       }
     }
   },
+  "ssh": {
+    "inactivity_timeout_secs": 600
+  },
   "metrics": {
     "capacity": 4096
   },
@@ -94,16 +123,36 @@ microsandbox reads its global configuration from `~/.microsandbox/config.json`. 
 |-------|---------|-------------|
 | `home` | `~/.microsandbox` | Root directory for all microsandbox data |
 | `log_level` | `null` (silent) | Log level for sandbox processes: `error`, `warn`, `info`, `debug`, `trace` |
+| `deployment_profile` | `null` | Authoritative local host-runtime isolation profile: `single-tenant` or `multi-tenant` |
 | `database` | [reference](#database) | Database connection settings |
 | `paths` | [reference](#paths) | Path overrides for binaries and directories |
-| `sandbox_defaults` | [reference](#sandbox_defaults) | Defaults applied to local sandboxes |
+| `sandbox_defaults` | [reference](#sandbox_defaults) | Defaults applied to new sandboxes, subject to backend support |
 | `runtime` | [reference](#runtime) | Host runtime performance policy |
 | `registries` | [reference](#registries) | Container registry authentication |
+| `ssh` | [reference](#ssh) | Host-side SSH session defaults |
 | `metrics` | [reference](#metrics) | Live metrics shared-memory registry settings |
-| `active_profile` | `null` | Default backend profile name |
-| `profiles` | `{}` | Named backend profiles |
+| `active_profile` | `null` | Default [backend profile](#profiles) name |
+| `profiles` | [reference](#profiles) | Named [backend profiles](/operations/backends#profiles) |
+
+## `deployment_profile`
+
+<Tooltip tip="Local runtime placement only; microsandbox cloud applies its platform deployment profile."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Set `deployment_profile` when the local host must enforce one deployment policy for every sandbox:
+
+```json
+{
+  "deployment_profile": "multi-tenant"
+}
+```
+
+`single-tenant` preserves the network configuration requested by each sandbox. `multi-tenant` applies the host-runtime isolation floor for shared infrastructure. The configured value is authoritative on create and restart, so a per-sandbox CLI or SDK option cannot weaken or replace it. A programmatic `LocalBackendBuilder::deployment_profile()` override takes precedence over the file. When the field is absent or `null`, each sandbox selects its own profile and defaults to `single-tenant`.
+
+The parser also accepts the internal wire spellings `single_tenant` and `multi_tenant` for compatibility, but the kebab-case values above are canonical in this human-edited file.
 
 ## `database`
+
+<Tooltip tip="Configures the local runtime database; microsandbox cloud stores state in the control plane."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -114,14 +163,17 @@ microsandbox reads its global configuration from `~/.microsandbox/config.json`. 
 
 ## `paths`
 
-All path fields are optional. When `null`, they resolve relative to `home`.
+<Tooltip tip="Configures files used by the local runtime; these paths do not apply to microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+All path fields are optional. Runtime pairs resolve from environment overrides, SDK-provided paths, explicit configuration, then the install under `home`. Other unset paths resolve relative to `home`; runtime resolution does not search `PATH` or debug build directories.
 
 On Windows, the default `home` is `%USERPROFILE%\.microsandbox`. JSON strings can use escaped backslashes such as `"C:\\Users\\you\\.microsandbox\\lib\\libkrunfw.dll"` or forward slashes such as `"C:/Users/you/.microsandbox/lib/libkrunfw.dll"`.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `msb` | `{home}/bin/msb` | `msb` binary. Resolved via: `MSB_PATH` env, SDK-provided runtime path, this field, debug workspace build paths, default install path, then `PATH` |
-| `libkrunfw` | `{home}/lib/libkrunfw` | Path to a custom VM kernel (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows). Resolved via: `MSB_LIBKRUNFW_PATH` env, SDK-provided runtime path, this field, paths next to the resolved `msb` binary, then default install path |
+| `msb` | `{home}/bin/msb` | `msb` binary. Configure a matching `libkrunfw` path; when omitted, resolution can use a library adjacent to this executable. An incomplete pair fails closed. |
+| `libkrunfw` | `{home}/lib/libkrunfw` | Matching libkrunfw shared library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows). Set this together with `msb`. |
+| `agentd` | embedded when enabled | Linux guest Agentd executable. Normal release builds embed it in `msb`; custom builds without `embed-binaries` must provide this field or `MSB_AGENTD_PATH`. The environment variable takes precedence, and an explicitly configured missing or invalid file fails closed. |
 | `cache` | `{home}/cache` | Image layer cache |
 | `sandboxes` | `{home}/sandboxes` | Per-sandbox state |
 | `volumes` | `{home}/volumes` | Named volumes |
@@ -129,14 +181,17 @@ On Windows, the default `home` is `%USERPROFILE%\.microsandbox`. JSON strings ca
 | `logs` | `{home}/logs` | Sandbox logs |
 | `secrets` | `{home}/secrets` | Secrets. Registry secrets live under `secrets/registries/` |
 
+Runtime path settings are captured during local backend construction, with managed paths taking precedence. Existing backend handles keep their settings until replaced.
+
 ### Rust SDK path helpers
 
-Rust callers can inspect the active local config and resolve runtime paths with the same precedence used by sandbox startup. `microsandbox::config::config()` uses the active default backend and returns `Unsupported` when that backend is cloud.
+Rust callers can inspect the active config and resolve runtime paths with the same precedence used by sandbox startup:
 
 ```rust
 let cfg = microsandbox::config::config()?;
-let msb = cfg.resolve_msb_path()?;
-let libkrunfw = cfg.resolve_libkrunfw_path()?;
+let runtime = microsandbox::setup::resolve_runtime(&cfg)?;
+let msb = &runtime.msb_path;
+let libkrunfw = &runtime.libkrunfw_path;
 ```
 
 When your code owns an explicit local backend, prefer the backend-owned config:
@@ -150,32 +205,60 @@ let backend = LocalBackend::builder()
     .await?;
 
 let cfg = backend.config();
-let msb = cfg.resolve_msb_path()?;
+let runtime = microsandbox::setup::resolve_runtime(&cfg)?;
 ```
+
+`LocalBackend` has two plain constructors alongside the builder. `LocalBackend::lazy()?` is synchronous and defers opening (and migrating) the local sandbox database until the first operation; it is what backend resolution uses when no backend is set explicitly. `LocalBackend::new().await?` opens the database up front, so startup fails fast if the database is unusable. All constructors read, layer, and validate global configuration before returning a backend; only database setup is lazy. Proxy settings are validated after sandbox options and managed overrides are composed, before network use.
+
+`LocalBackendBuilder::build_lazy()` now returns `Result<LocalBackend>`. It replaces `try_build_lazy()`, and `LocalBackend` no longer implements `Default`; use `LocalBackend::lazy()?` instead.
+
+For a long-lived process, construct a new backend to pick up configuration changes. Installing it with `set_default_backend` affects future operations; existing sandbox and volume handles retain their original backend. Construct the replacement successfully before installing it.
+
+## `ssh`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `inactivity_timeout_secs` | `600` | Disconnect an SSH session after this many seconds without SSH traffic. Set to `0` to disable. |
+
+The timeout applies to host-side SSH sessions created by `msb ssh`, `msb ssh serve`, and the SDK, for both local and cloud sandboxes. SSH traffic resets the timer. This setting is separate from a sandbox lifecycle idle timeout: disconnecting SSH does not stop the sandbox, and sandbox activity policy does not change the SSH timeout.
+
+Explicit CLI or SDK options override the user-configured value; a managed timeout takes precedence over both. The setting is resolved when a client or server endpoint is prepared using the backend's retained configuration, so file changes do not alter existing connections. Programmatic local backends can override the persisted value with `LocalBackendBuilder::ssh_inactivity_timeout_secs()`.
 
 ## `sandbox_defaults`
 
-Defaults applied to local sandboxes unless overridden per-sandbox. Cloud backends retain their service-side default policy.
+<Tooltip tip="Sandbox settings are applied to local and cloud create requests. Cloud rejects unsupported options such as outbound proxies and custom metrics sampling."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
-Explicit CLI or SDK options win over `config.json`, and `config.json` wins over built-in defaults. Microsandbox resolves the effective values once when it creates a local sandbox and persists that resolved sandbox configuration; changing the global file affects future creations, not existing sandboxes.
+Defaults applied to sandboxes unless overridden per-sandbox.
 
-For workload effects, host requirements, filesystem expectations, and verification steps for these settings, see [Performance optimization](/optimization/overview).
+Explicit CLI or SDK options win over `config.json`, and managed overrides take precedence over both. microsandbox resolves the effective values before creating a local sandbox or sending a cloud create request. Cloud creation rejects sandbox options it cannot represent. File changes apply after constructing a new backend or starting a new CLI invocation; they do not rewrite existing sandboxes.
+
+Rust applications can use [`SandboxBuilder::overlay`](/sdk/rust/sandbox#sandbox-overlay) to add sparse per-sandbox values. Local creation resolves built-in defaults < image defaults < `config.json` < CLI/SDK patches < managed overrides after image metadata is available. Cloud creation applies user settings, request options, and managed overrides on the client; the cloud worker resolves image metadata.
+
+For local `workdir`, omission inherits the lower layer and explicit `null` clears it, including an image working directory. A concrete Rust `SandboxConfig` with `workdir: None` is treated as omitted. Local CPU and memory maxima remain explicit when supplied; otherwise they follow the final size. Cloud supports no separate hotplug maximum: a supplied maximum equal to the requested size follows the final size. A maximum that differs from the final size is rejected.
+
+For workload effects, host requirements, filesystem expectations, and verification steps for these settings, see [Performance](/sandboxes/optimization).
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `cpus` | `1` | Number of vCPUs |
 | `memory_mib` | `512` | Guest memory in MiB |
 | `cpu_placement` | `"inherit"` | Host vCPU placement: `inherit`, `auto`, `spread`, or `compact` |
+| `placement_profile` | `null` | Name of a host-defined entry in `runtime.placement_profiles` |
 | `thp` | `"madvise"` | Guest transparent huge-page policy: `always`, `madvise`, or `never` |
-| `oci` | [reference](#sandbox_defaultsoci) | Defaults for OCI-rooted sandboxes |
+| `oci` | [reference](#sandbox_defaults-oci) | Defaults for OCI-rooted sandboxes |
 | `shell` | `"/bin/sh"` | Shell for interactive sessions and scripts |
 | `workdir` | `null` | Working directory inside the sandbox |
+| `outbound_proxy` | `null` | Default outbound SOCKS4/SOCKS5 proxy for local sandboxes. Uses the existing proxy object with `protocol`, `address` (`IP:port`), and optional authentication. See [managed proxy configuration](/enterprise/corporate-networking#route-sandbox-traffic). |
 | `metrics_sample_interval_ms` | `1000` | Runtime metrics sampling interval in milliseconds. Set to `0` to disable sampling. |
 | `disable_metrics_sample` | `false` | Force-disable metrics sampling regardless of `metrics_sample_interval_ms`. |
+
+An ordinary `outbound_proxy` default can be overridden per sandbox. A managed value takes precedence over CLI/SDK proxy options; managed `null` clears them. The whole proxy object is replaced, including credentials. SOCKS4 accepts an optional `user_id`; SOCKS5 accepts `credentials` containing `username` and `password: { "kind": "env", "var": "PROXY_PASSWORD" }`. Passwords are resolved at sandbox startup. Proxy defaults do not enable disabled networking or route host downloads. Cloud creation fails if the final configuration contains a proxy, including one supplied by managed policy.
 
 ### `sandbox_defaults.oci`
 
 Defaults applied only when the sandbox rootfs is an OCI image.
+
+User OCI defaults apply to local creation. Managed root-disk settings also apply to cloud create requests, which accept only `kind: "managed"`.
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -188,17 +271,28 @@ When the root-disk default is flat, plain `msb pull IMAGE` also prepares the reu
 
 ## `runtime`
 
+<Tooltip tip="Host runtime placement and block-device writeback settings do not apply to microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
 | Field | Default | Description |
 |-------|---------|-------------|
-| `block_writeback` | `{ "mode": "off" }` | Buffered host writeback containment and admission. The compatibility default cannot reject sandbox creation because of host-global dirty-credit capacity. Operators can opt into `auto` or `fixed` after sizing the policy for their workload and node. |
+| `block_writeback` | `{ "mode": "auto" }` | Buffered host writeback containment and live pressure sharing on Linux. Pool pressure never rejects sandbox creation; unconfigured `auto` is a no-op on other hosts. |
+| `placement_profiles` | `{}` | Host-owned named CPU and NUMA placement profiles selectable by sandboxes |
+
+### `runtime.placement_profiles`
+
+Placement profiles let an operator define safe host topology policy once while callers select it by name. `numa.mode` is `prefer_single`, `strict_single`, or `inherit`; `memory.mode` is `follow_cpu` or `inherit`.
+
+This release does not enable multi-node guest placement. `prefer_single` falls back to inherited host NUMA behavior when one node cannot fit. `strict_single` fails clearly because it is an explicit guarantee.
+
+`follow_cpu` requires managed CPU placement (`auto`, `spread`, or `compact`). Linux prefers the selected node for ordinary profiles and allows memory to spill elsewhere under pressure; `strict_single` uses a required binding instead. If CPUs span nodes, capacity is already insufficient, or the kernel rejects a best-effort affinity or memory-policy syscall, an ordinary profile starts with inherited memory placement. Windows keeps ordinary memory inherited because its preferred-node allocation cannot be undone if a later vCPU affinity attempt falls back; `strict_single` can still request required preferred-node allocation. Windows checks current boot-time availability, but does not expose equivalent per-node total capacity for a hard future-growth promise. macOS inherits ordinary CPU and memory scheduling for non-strict profiles because it has no equivalent hard-affinity API.
 
 ### `runtime.block_writeback`
 
 | Field | Modes | Default | Description |
 |-------|-------|---------|-------------|
-| `mode` | all | `"off"` | `auto` uses the smaller of the measured 1536 MiB per-disk ceiling and the available aggregate pool, `fixed` requires an exact `per_disk_mib`, and `off` disables both the VMM hard bound and host-global admission. |
-| `per_disk_mib` | `fixed` | required | Explicit hard budget for each eligible writable raw disk. The minimum is 128 MiB. This field is rejected in `auto` and `off` modes. |
-| `pool_mib` | `auto`, `fixed` | `null` | Optional aggregate dirty-credit admission-pool override. `null` derives the pool as the lower of 10% of physical RAM and a conservative estimate of Linux's dirty-background threshold, using the exact byte threshold when configured or the ratio applied to current `MemAvailable`. In `auto`, the pool reduces the per-disk window when necessary but must fit libkrun's 128 MiB minimum. In `fixed`, it must fit at least one complete configured per-disk budget. This field is rejected in `off` mode. |
+| `mode` | all | `"auto"` | `auto` gives each eligible disk a measured 1536 MiB maximum and shares the aggregate pool when the host is busy, `fixed` requires an explicit maximum, and `off` disables both the VMM bound and host-global pressure coordination. |
+| `per_disk_mib` | `fixed` | required | Explicit maximum for each eligible writable raw disk. The boot-time maximum is at least 128 MiB; the live fair share may fall below it under aggregate pressure. This field is rejected in `auto` and `off` modes. |
+| `pool_mib` | `auto`, `fixed` | `null` | Optional aggregate dirty-credit pressure-pool override. `null` derives the pool as the lower of 10% of physical RAM and a conservative estimate of Linux's dirty-background threshold, using the exact byte threshold when configured or the ratio applied to current `MemAvailable`. This field is rejected in `off` mode. |
 
 Use a fixed policy only when representative measurements justify a different per-disk window:
 
@@ -214,11 +308,15 @@ Use a fixed policy only when representative measurements justify a different per
 }
 ```
 
-`pool_mib` is admission capacity, not eagerly allocated RAM. Each sandbox reserves `per-disk window × eligible disks` from it before boot, while actual host page-cache use follows guest writes. Linux rejects creation if the pool cannot admit the complete requested reservation. `fixed` and an explicitly pooled `auto` policy are unsupported on other hosts.
+`pool_mib` is a live pressure budget, not eagerly allocated RAM. Every eligible writable disk in the same `MSB_HOME` receives a weighted max-min fair share. Disks with a smaller configured maximum keep that smaller value, and the remaining pool is divided equally across the rest. Creating another sandbox never fails merely because this pool is full.
 
-Hardware CRC32C, the guest kernel preemption model, x2APIC, APICv/AVIC capability, vCPU affinity mechanics, and the pure-Rust ext4 writer are implementation or capability details rather than user policy, so they intentionally have no global config keys. The [performance guide](/optimization/overview#optimizations-that-are-not-knobs) explains how those automatic layers interact with the configurable policy.
+Existing VMMs observe membership changes within 250 ms. If a disk already owns more dirty data than its new share, libkrun retires accounted ranges and pauses later writes until it converges below the target. A guest write already reserved before the target changed completes safely. `fixed` and an explicitly pooled `auto` policy are unsupported on other hosts.
+
+See the [performance guide](/sandboxes/optimization) for choosing and measuring runtime settings.
 
 ## `registries`
+
+<Tooltip tip="These user and managed registry settings govern local image pulls. Cloud uses explicitly supplied credentials or credentials stored in the cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -273,7 +371,9 @@ A map of registry hostnames to settings. Each host entry can mark the registry a
 
 ### Auth resolution order
 
-When pulling from a registry, microsandbox resolves credentials in this order:
+Managed registry hosts merge by field. Setting `insecure: false` enforces TLS while preserving employee credentials. Omitted `auth` keeps the normal credential lookup and CLI/SDK credentials; explicit `auth: null` forces anonymous access. A managed `auth` object replaces credentials, including explicit CLI/SDK credentials. A managed `registries.ca_certs` path replaces user and per-call certificates; `null` clears them. Without a managed certificate setting, per-call certificates append to user certificates.
+
+For local pulls without managed `auth`, microsandbox resolves credentials in this order, including when a managed host entry only sets TLS options:
 
 1. **Explicit SDK auth** via `.registry(|r| r.auth(...))` on the sandbox builder
 2. **OS keyring** entries created by `msb registry login`
@@ -283,101 +383,25 @@ When pulling from a registry, microsandbox resolves credentials in this order:
 
 ## `metrics`
 
+<Tooltip tip="Host-side SDK and CLI resource metrics are not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
 | Field | Default | Description |
 |-------|---------|-------------|
 | `capacity` | `0` | Number of slots reserved in the live metrics shared-memory registry. `0` uses the built-in default. Stop all sandboxes for the same home before changing this value. |
 
-## Backend profiles
+## `profiles`
 
-Backend profiles let CLI and SDK calls choose between the local runtime and a cloud backend from the same `config.json` file.
+Named backend profiles keyed by profile name; `active_profile` selects the default. How profiles participate in local or cloud selection, including the full precedence order, is documented in [Local or cloud](/operations/backends).
 
-```json
-{
-  "active_profile": "prod",
-  "profiles": {
-    "prod": {
-      "backend": "cloud",
-      "api_key_ref": "env:MSB_API_KEY"
-    },
-    "local": {
-      "backend": "local"
-    }
-  }
-}
-```
+| Field | Default | Description |
+|-------|---------|-------------|
+| `backend` | required | `local` or `cloud` |
+| `api_key_ref` | none | Credential reference; required for `cloud` profiles |
+| `url` | `https://api.microsandbox.dev` | Cloud endpoint override for development, self-hosted, or on-prem control planes |
 
-Use `active_profile` for the default profile. Use `MSB_PROFILE=<name>` to override it for a single command:
-
-```bash
-MSB_PROFILE=prod msb run python -- python -V
-```
-
-Cloud profiles require `api_key_ref`. The `url` field is optional and defaults to `https://api.microsandbox.dev`; set it only for a development, self-hosted, or on-prem control plane. Supported credential references are:
+Supported credential references for `api_key_ref`:
 
 | Prefix | Description |
 |--------|-------------|
 | `env:<VAR_NAME>` | Read the API key from an environment variable |
 | `inline:<API_KEY>` | Store the API key directly in `config.json`; use only for development or CI |
-
-Backend resolution uses this order:
-
-1. Programmatic backend set by the SDK
-2. `MSB_BACKEND=local|cloud`
-3. `MSB_PROFILE=<name>`
-4. `active_profile`
-5. Local runtime
-
-Cloud is opt-in. For hosted cloud usage, select it explicitly and provide the credential separately:
-
-```bash
-export MSB_BACKEND=cloud
-export MSB_API_KEY=msb_...
-```
-
-`MSB_API_URL` is optional and defaults to `https://api.microsandbox.dev`. It only overrides the endpoint. Neither `MSB_API_KEY` nor `MSB_API_URL` selects Cloud on its own, so leaving cloud credentials in a shell does not unexpectedly reroute local workloads.
-
-Selecting a cloud profile with `MSB_PROFILE` or `active_profile` is also explicit Cloud intent when that profile has `"backend": "cloud"`. `MSB_BACKEND=cloud` without a usable API key or cloud profile returns a configuration error; it never falls back to Local.
-
-### Inspect the active backend
-
-Use `msb context` before running CLI commands when you want to confirm where sandboxes will execute. The human-readable output uses the regular CLI table style; JSON is available for scripts:
-
-```bash
-msb context
-msb context --format json
-```
-
-`msb ctx` is a shorter alias for `msb context`.
-
-The SDKs expose the same secret-safe information. It includes the backend kind, cloud API URL, selection source, and profile when applicable, but never the API key:
-
-<CodeGroup>
-```typescript TypeScript
-import { defaultBackendInfo } from "microsandbox";
-
-console.log(defaultBackendInfo());
-console.log(sandbox.backendKind);
-```
-
-```python Python
-from microsandbox import default_backend_info
-
-print(default_backend_info())
-print(sandbox.backend_kind)
-```
-
-```rust Rust
-let info = microsandbox::default_backend_info();
-println!("{}", info.kind.as_str());
-println!("{}", sandbox.backend_kind().as_str());
-```
-
-```go Go
-info, err := microsandbox.DefaultBackendInfo()
-if err != nil {
-    return err
-}
-fmt.Println(info.Kind)
-fmt.Println(sandbox.BackendKind())
-```
-</CodeGroup>
