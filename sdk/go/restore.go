@@ -171,20 +171,7 @@ func buildFFIRestoreOptions[T SnapshotSeed](snapshot T, config RestoreConfig) ff
 	// Reuse mount/route serialization only. Never pass a creation config to the
 	// native restore operation or copy global creation defaults into it.
 	resources := buildFFICreateOptions(SandboxConfig{Volumes: config.Volumes})
-	// Preserve a cloud ID versus a host-volume path instead of guessing from its spelling.
-	var reference, referenceKind string
-	switch value := any(snapshot).(type) {
-	case string:
-		reference = value
-	case *SnapshotArtifact:
-		if value != nil {
-			reference, referenceKind = value.Reference(), value.ReferenceKind()
-		}
-	case *SnapshotHandle:
-		if value != nil {
-			reference, referenceKind = value.Reference(), value.ReferenceKind()
-		}
-	}
+	reference, referenceKind := snapshotReference(snapshot)
 	var policy *ffi.CustomNetworkPolicy
 	if config.NetworkPolicy != nil {
 		policy = buildFFINetwork(config.NetworkPolicy).CustomPolicy
@@ -216,4 +203,22 @@ func buildFFIRestoreOptions[T SnapshotSeed](snapshot T, config RestoreConfig) ff
 		Ports: buildFFIPortBindings(config.Ports), TCPAcceptQueueSize: config.TCPAcceptQueueSize,
 		Vsock: buildFFIVsockRoutes(config.Vsock),
 	}
+}
+
+// snapshotReference preserves a cloud ID versus a host-volume path instead of
+// guessing from its spelling.
+func snapshotReference[T SnapshotSeed](snapshot T) (reference, kind string) {
+	switch value := any(snapshot).(type) {
+	case string:
+		reference = value
+	case *SnapshotArtifact:
+		if value != nil {
+			reference, kind = value.Reference(), value.ReferenceKind()
+		}
+	case *SnapshotHandle:
+		if value != nil {
+			reference, kind = value.Reference(), value.ReferenceKind()
+		}
+	}
+	return reference, kind
 }

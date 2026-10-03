@@ -871,6 +871,86 @@ async fn managed_v066_migration_rewrites_parent_to_stable_snapshot_id() {
 }
 
 #[tokio::test]
+async fn create_from_disk_snapshot_keeps_creation_config_over_the_pinned_image() {
+    let tmp = TempDir::new().unwrap();
+    let (dir, _) = make_artifact(tmp.path(), "disk-source", b"disk state");
+    let manifest =
+        Manifest::from_bytes(&std::fs::read(dir.join(DESCRIPTOR_FILENAME)).unwrap()).unwrap();
+    let backend = isolated_backend(&tmp.path().join("home")).await;
+    let config = microsandbox::backend::with_backend(
+        backend,
+        microsandbox::Sandbox::builder("disk-child")
+            .from_disk_snapshot(SnapshotReference::path(dir.to_string_lossy()))
+            .env("MODE", "resumed")
+            .label("topic", "t1")
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let microsandbox_types::RootfsSource::Oci(image) = &config.spec.image else {
+        panic!("a disk snapshot must pin its OCI source");
+    };
+    assert_eq!(image.reference, manifest.image.reference);
+    assert!(
+        config
+            .spec
+            .env
+            .iter()
+            .any(|var| var.key == "MODE" && var.value == "resumed")
+    );
+    assert_eq!(
+        config.spec.labels.get("topic").map(String::as_str),
+        Some("t1")
+    );
+}
+
+#[tokio::test]
+async fn create_from_disk_snapshot_rejects_a_full_snapshot_before_publication() {
+    let tmp = TempDir::new().unwrap();
+    let (dir, _) = make_artifact_with_scope(tmp.path(), "full-snap", b"upper", SnapshotScope::Full);
+    let home = tmp.path().join("home");
+    let backend = isolated_backend(&home).await;
+
+    let err = microsandbox::backend::with_backend(
+        backend,
+        microsandbox::Sandbox::builder("full-child")
+            .from_disk_snapshot(SnapshotReference::path(dir.to_string_lossy()))
+            .env("MODE", "resumed")
+            .create(),
+    )
+    .await
+    .err()
+    .expect("creation must not resume a full snapshot");
+    assert!(
+        err.to_string().contains("would resume captured execution"),
+        "unexpected error: {err}"
+    );
+    assert!(!home.join("sandboxes").join("full-child").exists());
+}
+
+#[tokio::test]
+async fn create_from_disk_snapshot_rejects_an_explicit_image() {
+    let tmp = TempDir::new().unwrap();
+    let (dir, _) = make_artifact(tmp.path(), "disk-source", b"disk state");
+    let backend = isolated_backend(&tmp.path().join("home")).await;
+
+    let err = microsandbox::backend::with_backend(
+        backend,
+        microsandbox::Sandbox::builder("image-child")
+            .image("alpine:latest")
+            .from_disk_snapshot(SnapshotReference::path(dir.to_string_lossy()))
+            .build(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn open_accepts_full_scope_artifact() {
     let tmp = TempDir::new().unwrap();
     let (dir, _) = make_artifact_with_scope(tmp.path(), "full-snap", b"upper", SnapshotScope::Full);

@@ -1276,6 +1276,34 @@ impl SandboxBuilder {
         self
     }
 
+    /// Cold-boot from a disk snapshot with this builder's full creation configuration.
+    ///
+    /// The snapshot pins the image and root-disk layout, so an explicit image, root disk or
+    /// patches are rejected. Everything else — environment, secrets, init, scripts, mounts,
+    /// network, labels, resources — applies as on an image boot. A full snapshot is rejected
+    /// before anything is published: resuming its captured execution would ignore that
+    /// configuration. Restore it with [`Sandbox::restore`](super::Sandbox::restore) instead.
+    ///
+    /// ```no_run
+    /// # async fn example() -> microsandbox::MicrosandboxResult<()> {
+    /// use microsandbox::{Sandbox, SnapshotReference};
+    ///
+    /// let sandbox = Sandbox::builder("worker")
+    ///     .from_disk_snapshot(SnapshotReference::auto("baseline:after-install"))
+    ///     .env("MODE", "resumed")
+    ///     .create()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_disk_snapshot(mut self, reference: impl Into<SnapshotReference>) -> Self {
+        self.config
+            .restore_boot_overrides
+            .get_or_insert_with(Default::default)
+            .cold_boot = true;
+        self.with_snapshot_reference(reference)
+    }
+
     /// Record an already-resolved local snapshot artifact.
     ///
     /// This compatibility helper derives the artifact directory from

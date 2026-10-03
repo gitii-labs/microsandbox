@@ -863,7 +863,7 @@ child, err := m.RestoreSandbox(ctx, "api:baseline", "api-restored", m.WithCowMem
 | `RestoreSandbox` | Return the restored sandbox. |
 | `RestoreSandboxWithProgress` | Return event and result channels. |
 
-Image, replacement, and startup-command options are not accepted. Full restore requires matching CPU and memory settings, keeps captured network devices, and cannot apply a new guest security profile. Use disk-only restore to change these.
+Image, replacement, and startup-command options are not accepted. To boot a disk snapshot with a full creation config instead — environment, secrets, init, labels, volumes, network — use [`CreateSandbox` with `WithFromSnapshot`](/sdk/go/sandbox#withfromsnapshot). Full restore requires matching CPU and memory settings, keeps captured network devices, and cannot apply a new guest security profile. Use disk-only restore to change these.
 
 Full restore rejects missing external filesystems and additional disks by default. Use `WithAllowMissingResources()` to resume with unavailable devices and warnings. This is separate from strict/relaxed validation of supplied mappings; inheritance does not waive missing backing. Root and owned storage remain required.
 
