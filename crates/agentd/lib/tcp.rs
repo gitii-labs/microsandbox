@@ -53,10 +53,13 @@ const TCP_COMMAND_CAPACITY: usize = DEFAULT_BULK_WINDOW as usize / MIN_BULK_RECO
 /// the agent's serial loop.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a torn-down stream whose host-to-guest side already ended in order keeps reading
-/// its destination, so the guest kernel can still deliver the queued tail and FIN. A destination
-/// that has not closed by then is closed regardless.
-const TCP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a stream drained after a host cancel may go without progress (bytes read from the
+/// destination, or the guest kernel delivering its queued tail) before it is closed regardless.
+const TCP_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest a stream drained after a host cancel may take in total, however steadily it
+/// progresses.
+const TCP_DRAIN_MAX: Duration = Duration::from_secs(120);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -73,8 +76,6 @@ pub struct TcpSession {
     teardown: Arc<Mutex<Teardown>>,
     /// Asks a relay whose host-to-guest side ended in order to drain its destination and exit.
     drain: watch::Sender<bool>,
-    /// Set when a teardown left the relay draining on its own, so nothing waits for it.
-    detached: std::sync::atomic::AtomicBool,
 }
 
 /// How [`TcpSession::close`] ends the relay.
@@ -93,6 +94,13 @@ enum Teardown {
 struct TeardownHandle {
     state: Arc<Mutex<Teardown>>,
     drain: watch::Receiver<bool>,
+}
+
+/// The relay's way to the host. Once a host cancel has detached the relay, nothing more is sent,
+/// including a send that was already waiting for capacity.
+struct HostOutput {
+    tx: SessionOutputSender,
+    detached: watch::Receiver<bool>,
 }
 
 enum TcpCommand {
@@ -230,45 +238,56 @@ impl TcpSession {
 
     /// Tear down the TCP session.
     ///
-    /// Never waits behind a full command queue. The host has already closed its side before
-    /// asking for this, so no terminal frame is owed back to it.
+    /// Aborts the relay task directly rather than queuing a command, so teardown never waits
+    /// behind a full command queue, and the guest socket is gone once [`Self::finish`] returns.
+    /// No terminal frame is owed to the host.
     ///
     /// A stream whose host-to-guest side is still open is cut off, not ended: its destination
-    /// socket is reset and the relay aborted, so the destination cannot mistake a truncated
-    /// stream for a complete one. Once that side ended in order, the relay instead stops sending
-    /// to the host and reads the destination until it closes, for at most
-    /// [`TCP_DRAIN_TIMEOUT`], so the queued tail and FIN still arrive.
+    /// socket is reset, so the destination cannot mistake a truncated stream for a complete one.
     pub fn close(&self) {
-        let teardown = self
+        if let Teardown::Reset(socket) = &*self
             .teardown
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match &*teardown {
-            Teardown::Drain => {
-                self.drain.send_replace(true);
-                self.detached
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-            Teardown::Reset(socket) => {
-                if let Err(error) = set_zero_linger(socket) {
-                    eprintln!(
-                        "agentd: failed to reset TCP stream {}: {error}",
-                        self.owner_id
-                    );
-                }
-            }
-            Teardown::Abort => {}
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            && let Err(error) = set_zero_linger(socket)
+        {
+            eprintln!(
+                "agentd: failed to reset TCP stream {}: {error}",
+                self.owner_id
+            );
         }
         self.task.abort();
     }
 
-    /// Waits until a closed session's task, and with it the guest socket, is gone. A relay left
-    /// draining its destination owes the host nothing and is not waited for.
-    pub async fn finish(self) -> Result<(), String> {
-        if self.detached.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(());
+    /// End the session for a host that cancelled the stream.
+    ///
+    /// Like [`Self::close`], unless the host-to-guest side already ended in order: then the relay
+    /// stops sending to the host and reads the destination until it closes, within
+    /// [`TCP_DRAIN_IDLE_TIMEOUT`] and [`TCP_DRAIN_MAX`], so the guest kernel still delivers the
+    /// queued tail and FIN. That session is returned for the caller to keep tracking until it
+    /// ends; [`Self::close`] still ends it at once.
+    pub fn cancel(self) -> Option<Self> {
+        if self.finished_in_order() {
+            self.drain.send_replace(true);
+            return Some(self);
         }
+        self.close();
+        None
+    }
+
+    /// Whether the host-to-guest side ended in order while the relay still runs.
+    pub(crate) fn finished_in_order(&self) -> bool {
+        matches!(
+            *self
+                .teardown
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Teardown::Drain
+        )
+    }
+
+    /// Waits until a closed session's task, and with it the guest socket, is gone.
+    pub async fn finish(self) -> Result<(), String> {
         match self.task.await {
             Ok(()) => Ok(()),
             Err(error) if error.is_cancelled() => Ok(()),
@@ -327,7 +346,6 @@ impl TcpSession {
             bulk,
             teardown,
             drain,
-            detached: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -350,6 +368,10 @@ async fn connect_and_relay(
     tx: SessionOutputSender,
     teardown: TeardownHandle,
 ) {
+    let tx = HostOutput {
+        tx,
+        detached: teardown.drain.clone(),
+    };
     let TcpConnect { host, port, bulk } = req;
     let connect = TcpStream::connect((host.as_str(), port));
     let stream = match tokio::time::timeout(TCP_CONNECT_TIMEOUT, connect).await {
@@ -548,7 +570,7 @@ async fn relay_tcp_session(
     stream: TcpStream,
     mut commands: mpsc::Receiver<TcpCommand>,
     bulk_control: Option<TcpBulkControlReceivers>,
-    tx: SessionOutputSender,
+    tx: HostOutput,
     mut bulk: Option<TcpBulkState>,
     mut teardown: TeardownHandle,
 ) {
@@ -573,14 +595,15 @@ async fn relay_tcp_session(
     // The destination half-closed its write side. We stop reading but keep the
     // loop alive so host->destination data still flows until the host closes.
     let mut read_eof = false;
-    // A teardown after the host-to-guest side ended in order.
-    let mut draining = false;
 
     loop {
         // An in-order shutdown has queued every host byte and the FIN; a later teardown must
         // let them drain rather than reset them away.
         if write_shutdown {
             teardown.set(Teardown::Drain);
+        }
+        if *teardown.drain.borrow() {
+            break;
         }
         // One EOF leaves the opposite half usable. Once both halves finish, all ordered
         // writes have completed and the peer's final output/EOF is already queued. Exit so
@@ -594,11 +617,11 @@ async fn relay_tcp_session(
                 .available_credit()
                 .min(state.send.max_record_payload() as u64) as usize
         });
+        // Not `biased`: that would let a destination that is always readable starve the
+        // host-to-guest writes. A cancel that loses this race still sends nothing, because every
+        // send to the host gives way to it.
         tokio::select! {
-            Ok(()) = teardown.drain.changed() => {
-                draining = true;
-                break;
-            }
+            Ok(()) = teardown.drain.changed() => break,
             Some(finish) = recv_optional_mpsc(&mut finish_rx) => {
                 if pending_finish.replace(finish).is_some() {
                     terminal_sent = send_tcp_failure(
@@ -977,8 +1000,12 @@ async fn relay_tcp_session(
         }
     }
 
-    if draining {
-        // The host already closed its side; it is owed no further output or terminal.
+    // A host cancel, whether it ended the loop or made a send to the host give up.
+    if *teardown.drain.borrow() {
+        // Queued input will never be written; release its admission charges and permits now.
+        commands.close();
+        while commands.try_recv().is_ok() {}
+        drop(pending_write);
         if !read_eof {
             drain_destination(&mut reader, &mut read_buf).await;
         }
@@ -1013,23 +1040,87 @@ impl Drop for TeardownHandle {
     }
 }
 
-/// Read and discard what a torn-down destination still sends until it closes, so the guest
+impl HostOutput {
+    /// Run one step of a send, unless the host cancels first.
+    async fn unless_detached<T>(
+        &self,
+        step: impl std::future::Future<Output = Option<T>>,
+    ) -> Option<T> {
+        let mut detached = self.detached.clone();
+        tokio::select! {
+            biased;
+            Ok(_) = detached.wait_for(|detached| *detached) => None,
+            result = step => result,
+        }
+    }
+
+    async fn send(&self, id: u32, output: SessionOutput) -> bool {
+        self.unless_detached(async { Some(self.tx.send(id, output).await) })
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn reserve(&self, max_bytes: usize) -> Option<SessionOutputPermit> {
+        self.unless_detached(self.tx.reserve(max_bytes)).await
+    }
+
+    async fn reserve_bulk(&self, max_bytes: usize) -> Option<SessionOutputPermit> {
+        self.unless_detached(self.tx.reserve_bulk(max_bytes)).await
+    }
+
+    async fn send_reserved(
+        &self,
+        id: u32,
+        output: SessionOutput,
+        permit: SessionOutputPermit,
+    ) -> bool {
+        self.unless_detached(async { Some(self.tx.send_reserved(id, output, permit).await) })
+            .await
+            .unwrap_or(false)
+    }
+}
+
+/// Read and discard what a cancelled destination still sends until it closes, so the guest
 /// kernel neither resets the stream for unread data nor drops its queued tail and FIN.
-async fn drain_destination<R>(reader: &mut R, buffer: &mut [u8])
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let drained = tokio::time::timeout(TCP_DRAIN_TIMEOUT, async {
-        loop {
-            match reader.read(buffer).await {
+async fn drain_destination(reader: &mut tokio::net::tcp::ReadHalf<'_>, buffer: &mut [u8]) {
+    let fd = reader.as_ref().as_raw_fd();
+    let started = tokio::time::Instant::now();
+    let mut idle_until = started + TCP_DRAIN_IDLE_TIMEOUT;
+    let mut queued = unsent_bytes(fd);
+    loop {
+        tokio::select! {
+            read = reader.read(buffer) => match read {
                 Ok(0) | Err(_) => return,
-                Ok(_) => {}
+                Ok(_) => idle_until = tokio::time::Instant::now() + TCP_DRAIN_IDLE_TIMEOUT,
+            },
+            () = tokio::time::sleep_until(idle_until.min(started + TCP_DRAIN_MAX)) => {
+                let now = tokio::time::Instant::now();
+                let still_queued = unsent_bytes(fd);
+                if now >= started + TCP_DRAIN_MAX || still_queued >= queued {
+                    eprintln!("agentd: TCP destination did not finish draining; closing it");
+                    return;
+                }
+                // The kernel delivered more of the tail: that is progress too.
+                queued = still_queued;
+                idle_until = now + TCP_DRAIN_IDLE_TIMEOUT;
             }
         }
-    })
-    .await;
-    if drained.is_err() {
-        eprintln!("agentd: TCP destination did not close within the drain bound; closing it");
+    }
+}
+
+/// Bytes still queued in a socket's send buffer, not yet taken by the peer. An unreadable
+/// count reads as nothing queued, which ends a drain at its next idle check.
+fn unsent_bytes(fd: std::os::fd::RawFd) -> usize {
+    let mut bytes: libc::c_int = 0;
+    // SAFETY: `fd` is the relay's open socket and `bytes` is the int TIOCOUTQ writes.
+    if unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut bytes) } == 0 {
+        usize::try_from(bytes).unwrap_or(0)
+    } else {
+        eprintln!(
+            "agentd: failed to read TCP send queue: {}",
+            std::io::Error::last_os_error()
+        );
+        0
     }
 }
 
@@ -1057,7 +1148,7 @@ fn set_zero_linger(socket: &OwnedFd) -> std::io::Result<()> {
     }
 }
 
-async fn send_tcp_failure(id: u32, error: String, tx: &SessionOutputSender) -> bool {
+async fn send_tcp_failure(id: u32, error: String, tx: &HostOutput) -> bool {
     send_raw_tcp_message(
         id,
         MessageType::TcpFailed,
@@ -1086,7 +1177,7 @@ async fn send_raw_tcp_message<T: serde::Serialize>(
     payload: &T,
     activity: RawActivity,
     completion: Option<RawSessionCompletion>,
-    tx: &SessionOutputSender,
+    tx: &HostOutput,
 ) -> bool {
     let mut buf = Vec::new();
     match encode_tcp_message(id, t, payload, &mut buf) {
@@ -1110,7 +1201,7 @@ async fn send_raw_tcp_data(
     data: Vec<u8>,
     byte_count: usize,
     permit: SessionOutputPermit,
-    tx: &SessionOutputSender,
+    tx: &HostOutput,
 ) -> bool {
     let mut buf = Vec::new();
     match encode_tcp_message(id, MessageType::TcpData, &TcpData { data }, &mut buf) {
@@ -1493,7 +1584,10 @@ mod tests {
                     credit: credit_rx,
                     finish: finish_rx,
                 }),
-                tx,
+                HostOutput {
+                    tx,
+                    detached: watch::channel(false).1,
+                },
                 Some(TcpBulkState {
                     send: BulkSendState::new(
                         BulkKind::Tcp,
@@ -1524,7 +1618,6 @@ mod tests {
                 bulk: true,
                 teardown: Arc::new(Mutex::new(Teardown::Abort)),
                 drain: watch::channel(false).0,
-                detached: std::sync::atomic::AtomicBool::new(false),
             };
             peer.shutdown().await.unwrap();
             assert_tcp_output_through_eof(&mut rx, true, b"").await;
@@ -1709,8 +1802,8 @@ mod tests {
                 .unwrap();
             let mut received = vec![0; payload.len()];
             peer.read_exact(&mut received).await.unwrap();
-            session.close();
-            drop(session);
+            // A host cancel before the finish cuts the stream off.
+            assert!(session.cancel().is_none());
             let error = peer.read(&mut [0]).await.unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
 
@@ -1886,12 +1979,14 @@ mod tests {
                 payload,
                 _rx,
             } = finish_with_unsent_tail(44).await;
-            session.close();
-            drop(session);
+            let draining = session
+                .cancel()
+                .expect("a stream finished in order drains after a host cancel");
             let mut received = Vec::new();
             peer.read_to_end(&mut received).await.unwrap();
             assert_eq!(received.len(), payload.len());
             assert!(received == payload);
+            drop((peer, draining));
         })
         .await
         .unwrap();
@@ -1906,14 +2001,73 @@ mod tests {
                 payload,
                 _rx,
             } = finish_with_unsent_tail(45).await;
-            session.close();
-            drop(session);
+            let draining = session
+                .cancel()
+                .expect("a stream finished in order drains after a host cancel");
             // Data reaching a guest socket nobody reads would make the kernel reset it.
             peer.write_all(&[7; 4096]).await.unwrap();
             let mut received = Vec::new();
             peer.read_to_end(&mut received).await.unwrap();
             assert_eq!(received.len(), payload.len());
             assert!(received == payload);
+            drop(peer);
+            draining.finish().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Bytes waiting to be read on a socket.
+    fn readable(fd: std::os::fd::RawFd) -> usize {
+        let mut bytes: libc::c_int = 0;
+        assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut bytes) }, 0);
+        bytes as usize
+    }
+
+    #[tokio::test]
+    async fn a_send_waiting_at_cancel_never_reaches_the_host() {
+        /// The whole session output budget of [`SessionOutputSender::channel`].
+        const OUTPUT_BUDGET: usize = 32 * 1024 * 1024;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let (session, mut peer) = open_bulk_session(60, &tx, &mut rx).await;
+            let probe = match &*session.teardown.lock().unwrap() {
+                Teardown::Reset(socket) => socket.try_clone().unwrap(),
+                _ => panic!("a connected relay keeps a reset handle"),
+            };
+            session
+                .finish_bulk(BulkFinish {
+                    kind: BulkKind::Tcp,
+                    flow: BulkFlow::HostToGuest,
+                    final_offset: 0,
+                })
+                .await
+                .unwrap();
+            assert_eq!(recv_message(&mut rx).await.t, MessageType::BulkCredit);
+            while !session.finished_in_order() {
+                tokio::task::yield_now().await;
+            }
+            // With no output budget left, the relay reads the destination's output and then
+            // waits for room to send it.
+            let budget = tx.reserve_bulk(OUTPUT_BUDGET).await.unwrap();
+            peer.write_all(b"output read before the cancel")
+                .await
+                .unwrap();
+            while readable(probe.as_raw_fd()) != 0 {
+                tokio::task::yield_now().await;
+            }
+            drop(probe);
+            let draining = session
+                .cancel()
+                .expect("a stream finished in order drains after a host cancel");
+            drop(budget);
+            drop(peer);
+            draining.finish().await.unwrap();
+            drop(tx);
+            assert!(
+                rx.recv().await.is_none(),
+                "output reached the host after its cancel"
+            );
         })
         .await
         .unwrap();
@@ -2074,7 +2228,6 @@ mod tests {
             bulk: true,
             teardown: Arc::new(Mutex::new(Teardown::Abort)),
             drain: watch::channel(false).0,
-            detached: std::sync::atomic::AtomicBool::new(false),
         };
         let payload = Bytes::from(vec![0u8; MIN_BULK_RECORD_PAYLOAD as usize]);
 

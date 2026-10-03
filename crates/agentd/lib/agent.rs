@@ -161,6 +161,9 @@ struct AgentState {
     bulk_write_workers: HashMap<u32, FsBulkWriteWorker>,
     read_sessions: HashMap<u32, FsReadSession>,
     tcp_sessions: HashMap<u32, TcpSession>,
+    /// Streams the host cancelled after their host-to-guest side ended in order, still draining
+    /// their destination. Owner release, restore and shutdown end them like live streams.
+    draining_tcp: Vec<TcpSession>,
     bulk_received_offsets: HashMap<u32, u64>,
     pending_bulk_finishes: HashMap<u32, BulkFinish>,
     fs: FsState,
@@ -290,6 +293,7 @@ impl Default for AgentState {
             bulk_write_workers: HashMap::new(),
             read_sessions: HashMap::new(),
             tcp_sessions: HashMap::new(),
+            draining_tcp: Vec::new(),
             bulk_received_offsets: HashMap::new(),
             pending_bulk_finishes: HashMap::new(),
             fs: FsState::default(),
@@ -2131,7 +2135,7 @@ fn cancel_bulk_correlation(
         }
         BulkKind::Tcp => {
             if let Some(session) = state.tcp_sessions.remove(&id) {
-                session.close();
+                cancel_tcp_session(state, session);
             }
         }
     }
@@ -2376,8 +2380,12 @@ fn cleanup_relay_client_range(
         }
         keep
     });
-    let closed_tcp =
-        close_tcp_sessions_in_owner_range(&mut state.tcp_sessions, id_start, id_end_exclusive);
+    let closed_tcp = close_tcp_sessions_in_owner_range(
+        &mut state.tcp_sessions,
+        &mut state.draining_tcp,
+        id_start,
+        id_end_exclusive,
+    );
     clear_bulk_receive_range(state, id_start, id_end_exclusive);
     closed_tcp
 }
@@ -2408,6 +2416,9 @@ async fn restore_client_state(
     }
     state.write_sessions.clear();
     for (_, session) in state.tcp_sessions.drain() {
+        session.close();
+    }
+    for session in state.draining_tcp.drain(..) {
         session.close();
     }
     state.fs.clear();
@@ -3069,7 +3080,7 @@ async fn handle_message_with_charge(
                 return Ok(());
             };
             if let Some(session) = state.tcp_sessions.remove(&msg.id) {
-                session.close();
+                cancel_tcp_session(state, session);
             }
             clear_bulk_receive_state(state, msg.id);
         }
@@ -3151,6 +3162,9 @@ async fn handle_message_with_charge(
                 worker.task.abort();
             }
             for (_, session) in state.tcp_sessions.drain() {
+                session.close();
+            }
+            for session in state.draining_tcp.drain(..) {
                 session.close();
             }
             state.fs.clear();
@@ -3516,14 +3530,18 @@ fn abort_read_sessions_in_owner_range(
 
 fn close_tcp_sessions_in_owner_range(
     tcp_sessions: &mut HashMap<u32, TcpSession>,
+    draining_tcp: &mut Vec<TcpSession>,
     id_start: u32,
     id_end_exclusive: u32,
 ) -> Vec<TcpSession> {
+    let owned = |session: &TcpSession| {
+        let owner_id = session.owner_id();
+        owner_id >= id_start && owner_id < id_end_exclusive
+    };
     let mut retained = HashMap::new();
     let mut closed = Vec::new();
     for (id, session) in tcp_sessions.drain() {
-        let owner_id = session.owner_id();
-        if owner_id >= id_start && owner_id < id_end_exclusive {
+        if owned(&session) {
             session.close();
             closed.push(session);
         } else {
@@ -3531,7 +3549,22 @@ fn close_tcp_sessions_in_owner_range(
         }
     }
     *tcp_sessions = retained;
+    // A released owner's draining streams go too: its sockets must be gone by the ack.
+    let (released, kept) = std::mem::take(draining_tcp).into_iter().partition(owned);
+    *draining_tcp = kept;
+    for session in released {
+        session.close();
+        closed.push(session);
+    }
     closed
+}
+
+/// End a stream the host cancelled, tracking it while it still drains its destination.
+fn cancel_tcp_session(state: &mut AgentState, session: TcpSession) {
+    if let Some(draining) = session.cancel() {
+        state.draining_tcp.retain(|session| !session.is_finished());
+        state.draining_tcp.push(draining);
+    }
 }
 
 /// Waits until closed TCP sessions have dropped their guest sockets.
@@ -5365,6 +5398,15 @@ mod tests {
         let (mut sender, _output) = SessionOutputSender::channel();
         let owned = open_loopback_tcp(&mut state, &sender, 2).await;
         let other = open_loopback_tcp(&mut state, &sender, id_end_exclusive + 1).await;
+        // A stream the host cancelled after it finished in order, still draining.
+        let _draining_peer = open_loopback_tcp(&mut state, &sender, 3).await;
+        let draining = state.tcp_sessions.remove(&3).unwrap();
+        draining.close_write().await.unwrap();
+        while !draining.finished_in_order() {
+            tokio::task::yield_now().await;
+        }
+        cancel_tcp_session(&mut state, draining);
+        assert_eq!(state.draining_tcp.len(), 1);
 
         let config = AgentdConfig {
             user: None,
@@ -5415,6 +5457,8 @@ mod tests {
             guest_closed_before_return(owned),
             "acknowledged before the socket closed"
         );
+        // The draining stream was ended and awaited before the acknowledgement too.
+        assert!(state.draining_tcp.is_empty());
         drop(other);
     }
 

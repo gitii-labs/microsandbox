@@ -2452,16 +2452,13 @@ async fn run_tcp_forward(
             if finished == Some(false) {
                 break false;
             }
-            // Register for the next grant before reading the state it changes: `notify_waiters`
-            // wakes only registered waiters, so a grant in between would otherwise be missed.
+            // Create the waiter before reading the state a grant changes: a `Notified` receives
+            // `notify_waiters` from its creation on, so a grant in between still wakes it.
             let mut credit_ready = std::pin::pin!(
                 bulk_sender
                     .as_deref()
                     .map(|bulk| bulk.credit_ready.notified())
             );
-            if let Some(notified) = credit_ready.as_mut().as_pin_mut() {
-                notified.enable();
-            }
             let awaiting_credit = match bulk_sender.as_deref() {
                 Some(bulk) => finished.is_none() || !bulk.consumed().await.1,
                 None => false,
