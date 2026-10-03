@@ -35,7 +35,7 @@ jobs:
             . -> target
             vendor/russh -> target
       - run: cargo test --locked -p microsandbox-agent-client --features uds --lib
-      - run: cargo test --locked -p microsandbox-runtime --lib relay::tests
+      - run: cargo test --locked -p microsandbox-runtime --lib runner::relay::tests
       - run: cargo test --locked -p microsandbox-network --lib
       - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::ssh
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib queued_reservations_survive
@@ -48,12 +48,13 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: packages/agent-client/typescript
+        working-directory: packages
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 22
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - run: npm run build -w @microsandbox/types && npm run build -w @microsandbox/protocol-client
+      - run: npm run typecheck -w @microsandbox/agent-client
+      - run: npm test -w @microsandbox/agent-client

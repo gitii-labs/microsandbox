@@ -24,10 +24,20 @@ pub mod disk;
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(any(unix, windows))]
+pub use backends::passthroughfs::ExternalCheckpointOptions;
 #[cfg(windows)]
 pub use backends::passthroughfs::{
     HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,
 };
+#[cfg(any(unix, windows))]
+pub use backends::passthroughfs::{
+    OwnedDirectoryCheckpoint, OwnedDirectoryPayload, OwnedDirectorySnapshot,
+};
+#[cfg(windows)]
+pub use backends::singlefilefs::SingleFileFs;
+#[cfg(any(unix, windows))]
+pub use backends::unavailable::UnavailableFs;
 #[cfg(unix)]
 pub use backends::{
     dualfs::{
@@ -39,6 +49,7 @@ pub use backends::{
         BindIdentityMap, BindIdentityMapHandle, CachePolicy, HostPermissions, PassthroughConfig,
         PassthroughFs, PassthroughFsBuilder, StatVirtualization,
     },
+    singlefilefs::SingleFileFs,
 };
 pub use microsandbox_utils::size::{ByteSize, Bytes, Mebibytes, SizeExt};
 #[cfg(any(unix, windows))]

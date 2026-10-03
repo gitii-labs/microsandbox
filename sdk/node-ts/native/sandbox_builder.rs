@@ -7,8 +7,9 @@ use napi_derive::napi;
 use microsandbox::sandbox::LogLevel as RustLogLevel;
 use microsandbox::sandbox::{
     CpuPlacement as RustCpuPlacement, DeploymentProfile as RustDeploymentProfile,
-    PullPolicy as RustPullPolicy, Sandbox as RustSandbox, SandboxBuilder as RustSandboxBuilder,
-    SecurityProfile as RustSecurityProfile, TransparentHugePagePolicy as RustThpPolicy,
+    OutboundProxy as RustOutboundProxy, PullPolicy as RustPullPolicy, Sandbox as RustSandbox,
+    SandboxBuilder as RustSandboxBuilder, SecurityProfile as RustSecurityProfile,
+    TransparentHugePagePolicy as RustThpPolicy,
 };
 use microsandbox::size::Mebibytes;
 
@@ -19,11 +20,14 @@ use crate::image_builder::JsImageBuilder;
 use crate::init_options_builder::JsInitOptionsBuilder;
 use crate::mount_builder::JsMountBuilder;
 use crate::network_builder::JsNetworkBuilder;
+use crate::outbound_proxy_builder::{
+    JsOutboundProxyBuilder, JsSocks4ProxyBuilder, JsSocks5ProxyBuilder, take_selected_proxy,
+};
 use crate::patch_builder::JsPatchBuilder;
 use crate::pull_progress::JsPullProgressStream;
 use crate::registry_builder::JsRegistryConfigBuilder;
 use crate::root_disk_builder::JsRootDiskBuilder;
-use crate::sandbox::Sandbox as JsSandbox;
+use crate::sandbox::Sandbox;
 use crate::secret_builder::JsSecretBuilder;
 use crate::tls_builder::JsTlsBuilder;
 
@@ -31,7 +35,14 @@ use crate::tls_builder::JsTlsBuilder;
 // re-emit references to these classes (otherwise they'd appear as
 // the Rust struct names in `index.d.ts`).
 #[allow(dead_code)]
-type _NapiHints = (JsDnsBuilder, JsTlsBuilder, JsSecretBuilder);
+type _NapiHints = (
+    JsDnsBuilder,
+    JsTlsBuilder,
+    JsSecretBuilder,
+    JsOutboundProxyBuilder,
+    JsSocks4ProxyBuilder,
+    JsSocks5ProxyBuilder,
+);
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -46,6 +57,7 @@ type _NapiHints = (JsDnsBuilder, JsTlsBuilder, JsSecretBuilder);
 #[napi(js_name = "SandboxBuilder")]
 pub struct JsSandboxBuilder {
     inner: Option<RustSandboxBuilder>,
+    outbound_proxy: Option<RustOutboundProxy>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -59,6 +71,7 @@ impl JsSandboxBuilder {
     pub fn new(name: String) -> Self {
         Self {
             inner: Some(microsandbox::Sandbox::builder(name)),
+            outbound_proxy: None,
         }
     }
 
@@ -108,10 +121,14 @@ impl JsSandboxBuilder {
         &mut self,
         env: &Env,
         size_mib_or_configure: Either<
-            u32,
+            f64,
             Function<ClassInstance<JsRootDiskBuilder>, ClassInstance<JsRootDiskBuilder>>,
         >,
     ) -> Result<&Self> {
+        let size_mib_or_configure = match size_mib_or_configure {
+            Either::A(size) => Either::A(crate::numeric::uint32(size, "sizeMib")?),
+            Either::B(configure) => Either::B(configure),
+        };
         let prev = self.take_inner();
         match size_mib_or_configure {
             Either::A(size_mib) => {
@@ -127,24 +144,10 @@ impl JsSandboxBuilder {
         Ok(self)
     }
 
-    /// Boot a fresh sandbox from a snapshot artifact (path or name).
-    /// Mutually exclusive with `image()` / `imageWith()` — the
-    /// snapshot already pins the image reference and digest.
-    #[napi(js_name = "fromSnapshot")]
-    // Naming mirrors the Rust SDK (`SandboxBuilder::from_snapshot`),
-    // not Rust's `from_*` constructor convention. Clippy's
-    // wrong_self_convention lint trips on the `from_` prefix here;
-    // the alternative name would diverge from the rest of the SDK.
-    #[allow(clippy::wrong_self_convention)]
-    pub fn from_snapshot(&mut self, path_or_name: String) -> &Self {
-        let prev = self.take_inner();
-        self.inner = Some(prev.from_snapshot(path_or_name));
-        self
-    }
-
     /// Number of virtual CPUs.
     #[napi]
-    pub fn cpus(&mut self, count: u32) -> Result<&Self> {
+    pub fn cpus(&mut self, count: f64) -> Result<&Self> {
+        let count = crate::numeric::uint32(count, "count")?;
         let n =
             u8::try_from(count).map_err(|_| napi::Error::from_reason("cpus out of u8 range"))?;
         let prev = self.take_inner();
@@ -154,7 +157,8 @@ impl JsSandboxBuilder {
 
     /// Boot-time maximum possible virtual CPUs.
     #[napi(js_name = "maxCpus")]
-    pub fn max_cpus(&mut self, count: u32) -> Result<&Self> {
+    pub fn max_cpus(&mut self, count: f64) -> Result<&Self> {
+        let count = crate::numeric::uint32(count, "count")?;
         let n =
             u8::try_from(count).map_err(|_| napi::Error::from_reason("maxCpus out of u8 range"))?;
         let prev = self.take_inner();
@@ -173,20 +177,30 @@ impl JsSandboxBuilder {
         Ok(self)
     }
 
+    /// Host-defined placement profile name.
+    #[napi(js_name = "placementProfile")]
+    pub fn placement_profile(&mut self, profile: String) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.placement_profile(profile));
+        self
+    }
+
     /// Guest memory in MiB.
     #[napi]
-    pub fn memory(&mut self, mib: u32) -> &Self {
+    pub fn memory(&mut self, mib: f64) -> Result<&Self> {
+        let mib = crate::numeric::uint32(mib, "mib")?;
         let prev = self.take_inner();
         self.inner = Some(prev.memory(Mebibytes::from(mib)));
-        self
+        Ok(self)
     }
 
     /// Boot-time maximum hotpluggable guest memory in MiB.
     #[napi(js_name = "maxMemory")]
-    pub fn max_memory(&mut self, mib: u32) -> &Self {
+    pub fn max_memory(&mut self, mib: f64) -> Result<&Self> {
+        let mib = crate::numeric::uint32(mib, "mib")?;
         let prev = self.take_inner();
         self.inner = Some(prev.max_memory(Mebibytes::from(mib)));
-        self
+        Ok(self)
     }
 
     /// Guest transparent huge-page policy selected at boot.
@@ -257,10 +271,11 @@ impl JsSandboxBuilder {
 
     /// Override the metrics sampling interval in milliseconds; pass `0` to disable.
     #[napi(js_name = "metricsSampleIntervalMs")]
-    pub fn metrics_sample_interval_ms(&mut self, ms: u32) -> &Self {
+    pub fn metrics_sample_interval_ms(&mut self, ms: f64) -> Result<&Self> {
+        let ms = crate::numeric::safe_integer(ms, "ms")?;
         let prev = self.take_inner();
-        self.inner = Some(prev.metrics_sample_interval(Duration::from_millis(u64::from(ms))));
-        self
+        self.inner = Some(prev.metrics_sample_interval(Duration::from_millis(ms)));
+        Ok(self)
     }
 
     /// Force-disable metrics sampling regardless of `metricsSampleIntervalMs`.
@@ -362,11 +377,11 @@ impl JsSandboxBuilder {
     /// The default timeout used by `replace` is 10_000 ms. An expired
     /// timeout force-kills the prior sandbox; `create()` still proceeds.
     #[napi]
-    pub fn replace_with_timeout(&mut self, timeout_ms: u32) -> &Self {
+    pub fn replace_with_timeout(&mut self, timeout_ms: f64) -> Result<&Self> {
+        let timeout_ms = crate::numeric::safe_integer(timeout_ms, "timeout_ms")?;
         let prev = self.take_inner();
-        self.inner =
-            Some(prev.replace_with_timeout(std::time::Duration::from_millis(timeout_ms.into())));
-        self
+        self.inner = Some(prev.replace_with_timeout(std::time::Duration::from_millis(timeout_ms)));
+        Ok(self)
     }
 
     /// Override the image entrypoint.
@@ -487,17 +502,58 @@ impl JsSandboxBuilder {
         env: &Env,
         configure: Function<ClassInstance<JsNetworkBuilder>, ClassInstance<JsNetworkBuilder>>,
     ) -> Result<&Self> {
-        let initial = JsNetworkBuilder::new().into_instance(env)?;
-        let mut returned = configure.call(initial)?;
-        let net_builder = returned.take_inner_builder()?;
         let prev = self.take_inner();
-        self.inner = Some(prev.network(|_default| net_builder));
+        let mut callback_error = None;
+        let mut next = prev.network(|current| {
+            // Seed the callback with the accumulated configuration, and retain it
+            // if JavaScript throws so a failed callback cannot discard restrictions.
+            let result = (|| {
+                let initial = JsNetworkBuilder::from_inner(current.clone()).into_instance(env)?;
+                configure.call(initial)?.take_inner_builder()
+            })();
+            match result {
+                Ok(updated) => updated,
+                Err(error) => {
+                    callback_error = Some(error);
+                    current
+                }
+            }
+        });
+        if let Some(proxy) = self.outbound_proxy.clone() {
+            next = next.proxy(|_| proxy);
+        }
+        self.inner = Some(next);
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
+        Ok(self)
+    }
+
+    /// Configure the single proxy used for outbound sandbox connections.
+    #[napi(
+        ts_args_type = "configure: (arg: OutboundProxyBuilder) => HttpConnectProxyBuilder | Socks4ProxyBuilder | Socks5ProxyBuilder"
+    )]
+    pub fn proxy(
+        &mut self,
+        env: &Env,
+        configure: Function<ClassInstance<JsOutboundProxyBuilder>, Unknown<'_>>,
+    ) -> Result<&Self> {
+        let selector = JsOutboundProxyBuilder::new();
+        let selection = selector.selection();
+        let initial = selector.into_instance(env)?;
+        configure.call(initial)?;
+        let proxy = take_selected_proxy(&selection)?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.proxy(|_| proxy.clone()));
+        self.outbound_proxy = Some(proxy);
         Ok(self)
     }
 
     /// Publish a TCP port from host -> guest.
     #[napi]
-    pub fn port(&mut self, host_port: u32, guest_port: u32) -> Result<&Self> {
+    pub fn port(&mut self, host_port: f64, guest_port: f64) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
         let h = u16::try_from(host_port)
             .map_err(|_| napi::Error::from_reason("host port out of range"))?;
         let g = u16::try_from(guest_port)
@@ -509,7 +565,9 @@ impl JsSandboxBuilder {
 
     /// Publish a TCP port from host -> guest on a specific host bind address.
     #[napi(js_name = "portBind")]
-    pub fn port_bind(&mut self, bind: String, host_port: u32, guest_port: u32) -> Result<&Self> {
+    pub fn port_bind(&mut self, bind: String, host_port: f64, guest_port: f64) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
         let bind = parse_bind_addr(&bind)?;
         let h = u16::try_from(host_port)
             .map_err(|_| napi::Error::from_reason("host port out of range"))?;
@@ -522,7 +580,9 @@ impl JsSandboxBuilder {
 
     /// Publish a UDP port from host -> guest.
     #[napi(js_name = "portUdp")]
-    pub fn port_udp(&mut self, host_port: u32, guest_port: u32) -> Result<&Self> {
+    pub fn port_udp(&mut self, host_port: f64, guest_port: f64) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
         let h = u16::try_from(host_port)
             .map_err(|_| napi::Error::from_reason("host port out of range"))?;
         let g = u16::try_from(guest_port)
@@ -537,9 +597,11 @@ impl JsSandboxBuilder {
     pub fn port_udp_bind(
         &mut self,
         bind: String,
-        host_port: u32,
-        guest_port: u32,
+        host_port: f64,
+        guest_port: f64,
     ) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
         let bind = parse_bind_addr(&bind)?;
         let h = u16::try_from(host_port)
             .map_err(|_| napi::Error::from_reason("host port out of range"))?;
@@ -547,6 +609,24 @@ impl JsSandboxBuilder {
             .map_err(|_| napi::Error::from_reason("guest port out of range"))?;
         let prev = self.take_inner();
         self.inner = Some(prev.port_udp_bind(bind, h, g));
+        Ok(self)
+    }
+
+    /// Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port.
+    #[napi]
+    pub fn vsock(&mut self, host_path: String, port: f64) -> Result<&Self> {
+        let port = crate::numeric::uint32(port, "port")?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.vsock(host_path, port));
+        Ok(self)
+    }
+
+    /// Expose a host Unix datagram socket on a guest-to-host vsock port.
+    #[napi(js_name = "vsockDgram")]
+    pub fn vsock_dgram(&mut self, host_path: String, port: f64) -> Result<&Self> {
+        let port = crate::numeric::uint32(port, "port")?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.vsock_dgram(host_path, port));
         Ok(self)
     }
 
@@ -608,19 +688,22 @@ impl JsSandboxBuilder {
 
     /// Set a hard rlimit (soft = hard).
     #[napi]
-    pub fn rlimit(&mut self, resource: String, limit: u32) -> Result<&Self> {
+    pub fn rlimit(&mut self, resource: String, limit: f64) -> Result<&Self> {
+        let limit = crate::numeric::safe_integer(limit, "limit")?;
         let res = parse_rlimit_resource(&resource)?;
         let prev = self.take_inner();
-        self.inner = Some(prev.rlimit(res, limit as u64));
+        self.inner = Some(prev.rlimit(res, limit));
         Ok(self)
     }
 
     /// Set a separate soft and hard rlimit.
     #[napi(js_name = "rlimitRange")]
-    pub fn rlimit_range(&mut self, resource: String, soft: u32, hard: u32) -> Result<&Self> {
+    pub fn rlimit_range(&mut self, resource: String, soft: f64, hard: f64) -> Result<&Self> {
+        let soft = crate::numeric::safe_integer(soft, "soft")?;
+        let hard = crate::numeric::safe_integer(hard, "hard")?;
         let res = parse_rlimit_resource(&resource)?;
         let prev = self.take_inner();
-        self.inner = Some(prev.rlimit_range(res, soft as u64, hard as u64));
+        self.inner = Some(prev.rlimit_range(res, soft, hard));
         Ok(self)
     }
 
@@ -642,18 +725,20 @@ impl JsSandboxBuilder {
 
     /// Auto-stop after `secs` seconds.
     #[napi(js_name = "maxDuration")]
-    pub fn max_duration(&mut self, secs: u32) -> &Self {
+    pub fn max_duration(&mut self, secs: f64) -> Result<&Self> {
+        let secs = crate::numeric::safe_integer(secs, "secs")?;
         let prev = self.take_inner();
-        self.inner = Some(prev.max_duration(secs as u64));
-        self
+        self.inner = Some(prev.max_duration(secs));
+        Ok(self)
     }
 
     /// Auto-stop after `secs` seconds of inactivity.
     #[napi(js_name = "idleTimeout")]
-    pub fn idle_timeout(&mut self, secs: u32) -> &Self {
+    pub fn idle_timeout(&mut self, secs: f64) -> Result<&Self> {
+        let secs = crate::numeric::safe_integer(secs, "secs")?;
         let prev = self.take_inner();
-        self.inner = Some(prev.idle_timeout(secs as u64));
-        self
+        self.inner = Some(prev.idle_timeout(secs));
+        Ok(self)
     }
 
     /// Configure a volume mount via a callback. The callback receives a
@@ -728,13 +813,27 @@ impl JsSandboxBuilder {
     /// synchronously before awaiting; napi-rs requires the `unsafe` tag
     /// regardless. JS callers see `create(): Promise<Sandbox>`.
     #[napi]
-    pub async unsafe fn create(&mut self) -> Result<JsSandbox> {
+    pub async unsafe fn create(&mut self) -> Result<Sandbox> {
         let b = self
             .inner
             .take()
             .ok_or_else(|| napi::Error::from_reason("SandboxBuilder already consumed"))?;
         let inner: RustSandbox = b.create().await.map_err(to_napi_error)?;
-        Ok(JsSandbox::from_rust(inner))
+        Ok(Sandbox::from_rust(inner))
+    }
+
+    /// Connect to the persisted sandbox with this name, or create it.
+    ///
+    /// # Safety
+    /// Same justification as `create`.
+    #[napi(js_name = "connectOrCreate")]
+    pub async unsafe fn connect_or_create(&mut self) -> Result<Sandbox> {
+        let builder = self
+            .inner
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("SandboxBuilder already consumed"))?;
+        let inner = builder.connect_or_create().await.map_err(to_napi_error)?;
+        Ok(Sandbox::from_rust(inner))
     }
 
     /// Create the sandbox with image-pull progress reporting. Returns
@@ -754,12 +853,31 @@ impl JsSandboxBuilder {
         let (handle, task) = b.create_with_pull_progress().map_err(to_napi_error)?;
         Ok(JsPullProgressCreate {
             stream: JsPullProgressStream::from_handle(handle),
+            abort: task.abort_handle(),
+            task: std::sync::Arc::new(tokio::sync::Mutex::new(Some(task))),
+        })
+    }
+
+    /// Create with image, snapshot preparation and activation progress.
+    ///
+    /// # Safety
+    /// Same consumed-builder ownership requirement as `create`.
+    #[napi(js_name = "createWithProgress")]
+    pub async unsafe fn create_with_progress(&mut self) -> Result<JsPullProgressCreate> {
+        let builder = self
+            .inner
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("SandboxBuilder already consumed"))?;
+        let (handle, task) = builder.create_with_progress().map_err(to_napi_error)?;
+        Ok(JsPullProgressCreate {
+            stream: JsPullProgressStream::from_creation(handle),
+            abort: task.abort_handle(),
             task: std::sync::Arc::new(tokio::sync::Mutex::new(Some(task))),
         })
     }
 }
 
-fn parse_bind_addr(bind: &str) -> Result<IpAddr> {
+pub(crate) fn parse_bind_addr(bind: &str) -> Result<IpAddr> {
     bind.parse::<IpAddr>()
         .map_err(|_| napi::Error::from_reason(format!("invalid bind address: {bind}")))
 }
@@ -768,8 +886,9 @@ fn parse_bind_addr(bind: &str) -> Result<IpAddr> {
 /// plus a method to await the final `Sandbox`.
 #[napi(js_name = "PullProgressCreate")]
 pub struct JsPullProgressCreate {
-    stream: JsPullProgressStream,
-    task: std::sync::Arc<
+    pub(crate) abort: tokio::task::AbortHandle,
+    pub(crate) stream: JsPullProgressStream,
+    pub(crate) task: std::sync::Arc<
         tokio::sync::Mutex<
             Option<tokio::task::JoinHandle<microsandbox::MicrosandboxResult<RustSandbox>>>,
         >,
@@ -778,6 +897,12 @@ pub struct JsPullProgressCreate {
 
 #[napi]
 impl JsPullProgressCreate {
+    /// Cancel creation, independently of whether awaitSandbox is already waiting.
+    #[napi]
+    pub fn cancel(&self) {
+        self.abort.abort();
+    }
+
     /// The progress event stream. Iterate with `for await...of` or
     /// poll with `.recv()`. The stream closes once the pull completes.
     #[napi(getter)]
@@ -788,7 +913,7 @@ impl JsPullProgressCreate {
     /// Await the sandbox. Resolves once the pull + boot finishes.
     /// Calling more than once errors.
     #[napi(js_name = "awaitSandbox")]
-    pub async fn await_sandbox(&self) -> Result<JsSandbox> {
+    pub async fn await_sandbox(&self) -> Result<Sandbox> {
         let mut guard = self.task.lock().await;
         let task = guard
             .take()
@@ -797,7 +922,7 @@ impl JsPullProgressCreate {
             .await
             .map_err(|e| napi::Error::from_reason(format!("create task panicked: {e}")))?
             .map_err(to_napi_error)?;
-        Ok(JsSandbox::from_rust(inner))
+        Ok(Sandbox::from_rust(inner))
     }
 }
 

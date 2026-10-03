@@ -8,15 +8,15 @@
 #![warn(missing_docs)]
 
 mod error;
-pub mod queue;
 
 //--------------------------------------------------------------------------------------------------
 // Constants: Host↔Guest Shutdown Timings
 //--------------------------------------------------------------------------------------------------
 
 const NORMAL_SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 2;
+const HANDOFF_SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 120;
 
-/// Host fallback window for normal sandboxes where agentd remains PID 1.
+/// Explicit lifetime-policy fallback window when agentd remains PID 1.
 ///
 /// agentd can synchronously `sync()`, remount the root read-only, and request
 /// kernel poweroff directly in this mode, so normal development sandboxes
@@ -24,12 +24,17 @@ const NORMAL_SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 2;
 pub const NORMAL_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(NORMAL_SHUTDOWN_FLUSH_TIMEOUT_SECS);
 
-/// Host fallback window for sandboxes that hand PID 1 to another init.
+/// Explicit lifetime-policy fallback window for a foreign guest PID 1.
+///
+/// Idle, startup-command completion and parent-death policies may bound guest
+/// shutdown before host teardown. Public Stop and its timeout variant do not
+/// install this timer, and agentd never sends a fallback SIGTERM.
 ///
 /// Allows image-managed services to finish their stop jobs (systemd's
 /// default service stop deadline is 90 seconds). Expiry is recorded as a
 /// failed shutdown, never as successful application-consistent poweroff.
-pub const HANDOFF_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const HANDOFF_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(HANDOFF_SHUTDOWN_FLUSH_TIMEOUT_SECS);
 
 /// Legacy name for the handoff-init shutdown fallback window.
 ///
@@ -44,6 +49,14 @@ pub const SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration = HANDOFF_SHUTDOWN_FLUSH_T
 
 /// Virtio-console port name for the agent channel.
 pub const AGENT_PORT_NAME: &str = "agent";
+
+/// Virtio-console port name for the optional generation-8 bulk lane.
+#[doc(hidden)]
+pub const AGENT_BULK_PORT_NAME: &str = "agent-bulk";
+
+/// Internal kernel command-line selector for the first dual-port transport profile.
+#[doc(hidden)]
+pub const AGENT_TRANSPORT_DUAL_PORT_CMDLINE: &str = "microsandbox.agent_transport=dual-port-v1";
 
 /// Virtiofs tag for the runtime filesystem (scripts, heartbeat).
 pub const RUNTIME_FS_TAG: &str = "msb_runtime";
@@ -184,10 +197,9 @@ pub const ENV_DIR_MOUNTS: &str = "MSB_DIR_MOUNTS";
 /// Environment variable carrying virtiofs **file** volume mount specs for guest init.
 ///
 /// Used when the host path is a single file rather than a directory. The SDK
-/// wraps each file in an isolated staging directory (hard-linked to preserve
-/// the same inode) and shares that directory via virtiofs. Agentd mounts the
-/// share at [`FILE_MOUNTS_DIR`]`/<tag>/` and bind-mounts the file to the
-/// guest path.
+/// asks the runtime to expose the source through a synthetic one-entry
+/// filesystem. Agentd mounts that share at [`FILE_MOUNTS_DIR`]`/<tag>/` and
+/// bind-mounts the file to the guest path.
 ///
 /// Format: `tag:filename:guest_path[:opts][;tag:filename:guest_path[:opts];...]`
 ///
@@ -265,11 +277,9 @@ pub const ENV_HOSTNAME: &str = "MSB_HOSTNAME";
 /// Environment variable carrying the DNS name the guest uses to reach
 /// the sandbox host (Docker's `host.docker.internal` equivalent).
 ///
-/// The host-side network stack emits this value via its
-/// `guest_env_vars()` method; agentd reads it into
-/// [`crate::exec`]-adjacent boot params and writes the mapping into
-/// `/etc/hosts`. The value the network stack emits is a fixed
-/// protocol constant — today always `host.microsandbox.internal`.
+/// Legacy environment spelling for the host alias now carried in the typed
+/// guest bootstrap. Agentd writes the mapping into `/etc/hosts`. The value the
+/// network stack emits is fixed at `host.microsandbox.internal`.
 pub const ENV_HOST_ALIAS: &str = "MSB_HOST_ALIAS";
 
 /// Environment variable carrying sandbox-wide resource limits.
@@ -400,12 +410,19 @@ pub const GUEST_TLS_HOST_CAS_PATH: &str = "/.msb/tls/host-cas.pem";
 // Exports
 //--------------------------------------------------------------------------------------------------
 
+pub mod bootstrap;
+pub mod bulk;
 pub mod codec;
+pub mod control;
 pub mod core;
 pub mod exec;
 pub mod fs;
 pub mod heartbeat;
 pub mod message;
+pub mod queue;
 pub mod tcp;
+#[doc(hidden)]
+pub mod transport;
+pub mod wire;
 
 pub use error::*;

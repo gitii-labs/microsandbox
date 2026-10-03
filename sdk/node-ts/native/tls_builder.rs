@@ -20,7 +20,10 @@ pub struct JsTlsConfig {
     pub intercepted_ports: Vec<u32>,
     pub block_quic: bool,
     pub upstream_ca_cert_paths: Vec<String>,
+    // Keep public names stable when napi-rs renders these renamed nested objects.
+    #[napi(ts_type = "Array<ScopedUpstreamCaCert>")]
     pub scoped_upstream_ca_certs: Vec<JsScopedUpstreamCaCert>,
+    #[napi(ts_type = "Array<ScopedVerifyUpstream>")]
     pub scoped_verify_upstream: Vec<JsScopedVerifyUpstream>,
     pub intercept_ca_cert_path: Option<String>,
     pub intercept_ca_key_path: Option<String>,
@@ -87,7 +90,11 @@ impl JsTlsBuilder {
 
     /// Set the ports to intercept (default: 443).
     #[napi(js_name = "interceptedPorts")]
-    pub fn intercepted_ports(&mut self, ports: Vec<u32>) -> Result<&Self> {
+    pub fn intercepted_ports(&mut self, ports: Vec<f64>) -> Result<&Self> {
+        let ports: Vec<u32> = ports
+            .into_iter()
+            .map(|value| crate::numeric::uint32(value, "ports"))
+            .collect::<Result<_>>()?;
         let ports16: std::result::Result<Vec<u16>, _> =
             ports.iter().map(|p| u16::try_from(*p)).collect();
         let ports16 =

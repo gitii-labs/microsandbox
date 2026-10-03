@@ -1,12 +1,20 @@
 //! PID 1 init: mount filesystems, apply tmpfs mounts, prepare runtime directories.
 
-use crate::config::{BootParams, DirMountSpec, DiskMountSpec, FileMountSpec, SecurityProfile};
+use crate::config::{BootParams, SecurityProfile};
 use crate::error::AgentdResult;
 use crate::{network, rlimit, tls};
 
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Mount only the filesystems needed to discover and open the agent console.
+///
+/// The console descriptor remains valid when a block-backed root later pivots
+/// and remounts the essential filesystems inside the final guest root.
+pub fn prepare_bootstrap_console() -> AgentdResult<()> {
+    linux::mount_bootstrap_filesystems()
+}
 
 /// Performs synchronous PID 1 initialization.
 ///
@@ -32,14 +40,18 @@ pub fn init(
     if params.security_profile == SecurityProfile::Restricted {
         force_restricted_mount_flags(&mut params);
     }
-    linux::apply_user_mounts(&params.dir_mounts, &params.file_mounts, &params.disk_mounts)?;
+    linux::apply_user_mounts(
+        &params.dir_mounts,
+        &params.file_mounts,
+        &params.disk_mounts,
+        &params.tmpfs,
+    )?;
     network::apply_hostname(
         params.hostname.as_deref(),
         params.host_alias.as_deref(),
         params.net_ipv4.as_ref().map(|v4| v4.gateway),
         params.net_ipv6.as_ref().map(|v6| v6.gateway),
     )?;
-    linux::apply_tmpfs_mounts(&params.tmpfs)?;
     linux::ensure_standard_tmp_permissions()?;
     network::apply_network_config(params.network())?;
     tls::install_ca_cert()?;
@@ -66,106 +78,6 @@ fn force_restricted_mount_flags(params: &mut BootParams) {
         spec.nosuid = true;
         spec.nodev = true;
     }
-}
-
-/// Splits a guest path into its meaningful components, dropping empty and
-/// `.` segments so `/a//b` and `/a/./b` compare equal to `/a/b`.
-fn mount_path_components(path: &str) -> Vec<&str> {
-    path.split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect()
-}
-
-/// Reports whether `parent` is a strict ancestor of `child`.
-fn is_mount_ancestor(parent: &[&str], child: &[&str]) -> bool {
-    parent.len() < child.len() && child.starts_with(parent)
-}
-
-/// Orders mount targets so a parent path is mounted before any path nested
-/// under it, returning indices into `paths`.
-///
-/// Guards the guest against the host's ordering: the spec list keeps
-/// whatever order the caller sent it in, the Go SDK builds that list from a
-/// map, and nothing before the guest orders it by nesting. Mounting a nested
-/// path first leaves it hidden the moment the parent is mounted over it, and
-/// the guest then sees the nested path as a plain directory on the parent
-/// filesystem.
-///
-/// Each round emits the first remaining target that has no remaining
-/// ancestor. Two targets swap only when a later one is an ancestor of an
-/// earlier one, so targets with no nesting between any of them come out in
-/// their original order; once a swap happens, targets that follow the moved
-/// ancestor can be carried along with it.
-fn parent_first_order(paths: &[&str]) -> Vec<usize> {
-    let components: Vec<Vec<&str>> = paths.iter().map(|p| mount_path_components(p)).collect();
-    let mut pending: Vec<usize> = (0..paths.len()).collect();
-    let mut order = Vec::with_capacity(paths.len());
-    while !pending.is_empty() {
-        let pick = pending
-            .iter()
-            .position(|&i| {
-                !pending
-                    .iter()
-                    .any(|&j| j != i && is_mount_ancestor(&components[j], &components[i]))
-            })
-            .expect(
-                "ancestry is a strict partial order: some pending target has no pending ancestor",
-            );
-        order.push(pending.remove(pick));
-    }
-    order
-}
-
-/// One user-requested mount, of whichever kind, borrowed from the boot
-/// params so the kind's own mount function still does the work.
-pub(crate) enum UserMount<'a> {
-    Dir(&'a DirMountSpec),
-    File(&'a FileMountSpec),
-    Disk(&'a DiskMountSpec),
-}
-
-impl UserMount<'_> {
-    /// The guest path this mount lands on, whatever its kind.
-    pub(crate) fn guest_path(&self) -> &str {
-        match self {
-            UserMount::Dir(spec) => spec.guest_path.as_str(),
-            UserMount::File(spec) => spec.guest_path.as_str(),
-            UserMount::Disk(spec) => spec.guest_path.as_str(),
-        }
-    }
-}
-
-/// Builds the order the three kinds of user mount are applied in.
-///
-/// Nesting crosses kinds — a disk volume can be the parent of a directory
-/// share and the other way round — so the three lists are ordered as one
-/// sequence rather than one batch after another. Within the sequence the
-/// original directory, file, disk grouping is the starting order, so mounts
-/// with no nesting between them are applied as before.
-pub(crate) fn user_mount_sequence<'a>(
-    dirs: &'a [DirMountSpec],
-    files: &'a [FileMountSpec],
-    disks: &'a [DiskMountSpec],
-) -> Vec<UserMount<'a>> {
-    let mounts: Vec<UserMount<'a>> = dirs
-        .iter()
-        .map(UserMount::Dir)
-        .chain(files.iter().map(UserMount::File))
-        .chain(disks.iter().map(UserMount::Disk))
-        .collect();
-    let order = {
-        let paths: Vec<&str> = mounts.iter().map(|mount| mount.guest_path()).collect();
-        parent_first_order(&paths)
-    };
-    let mut slots: Vec<Option<UserMount<'a>>> = mounts.into_iter().map(Some).collect();
-    order
-        .into_iter()
-        .map(|index| {
-            slots[index]
-                .take()
-                .expect("parent_first_order returns every index exactly once")
-        })
-        .collect()
 }
 
 fn ensure_scripts_profile_block(profile: &str) -> String {
@@ -197,29 +109,67 @@ mod linux {
     use nix::mount::{self, MntFlags, MsFlags};
     use nix::sys::stat::Mode;
     use nix::unistd;
+    use typed_path::{Utf8Component, Utf8UnixComponent, Utf8UnixPath};
 
     use crate::config::{
         BlockRootSpec, BlockRootUpper, DirMountSpec, DiskMountSpec, FileMountSpec, TmpfsSpec,
     };
     use crate::error::{AgentdError, AgentdResult};
 
-    use super::UserMount;
-
     const UPPER_METRICS_PATH: &str = "/sys/kernel/msb_metrics/upper_path";
     const UPPER_METRICS_REGISTER_ATTEMPTS: usize = 100;
     const UPPER_METRICS_REGISTER_RETRY: Duration = Duration::from_millis(10);
 
+    //--------------------------------------------------------------------------------------------------
+    // Types
+    //--------------------------------------------------------------------------------------------------
+
+    /// A mount from any user-facing volume transport.
+    ///
+    /// Keeping the variants together is essential: mounting by transport
+    /// group can let a later parent hide a child from an earlier group.
+    enum UserMount<'a> {
+        Dir(&'a DirMountSpec),
+        File(&'a FileMountSpec),
+        Disk(&'a DiskMountSpec),
+        Tmpfs(&'a TmpfsSpec),
+    }
+
+    struct PlannedUserMount<'a> {
+        depth: usize,
+        canonical_path: String,
+        mount: UserMount<'a>,
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Methods
+    //--------------------------------------------------------------------------------------------------
+
+    impl UserMount<'_> {
+        fn guest_path(&self) -> &str {
+            match self {
+                Self::Dir(spec) => &spec.guest_path,
+                Self::File(spec) => &spec.guest_path,
+                Self::Disk(spec) => &spec.guest_path,
+                Self::Tmpfs(spec) => &spec.path,
+            }
+        }
+
+        fn is_file(&self) -> bool {
+            matches!(self, Self::File(_))
+        }
+    }
+
+    /// Mount the minimum filesystems needed for virtio-console discovery.
+    pub fn mount_bootstrap_filesystems() -> AgentdResult<()> {
+        mount_dev()?;
+        mount_sys()?;
+        Ok(())
+    }
+
     /// Mounts essential Linux filesystems.
     pub fn mount_filesystems() -> AgentdResult<()> {
-        // /dev — devtmpfs
-        mkdir_ignore_exists("/dev")?;
-        mount_ignore_busy(
-            Some("devtmpfs"),
-            "/dev",
-            Some("devtmpfs"),
-            MsFlags::MS_RELATIME,
-            None::<&str>,
-        )?;
+        mount_dev()?;
 
         // /proc — proc
         let nodev_noexec_nosuid =
@@ -234,15 +184,7 @@ mod linux {
             None::<&str>,
         )?;
 
-        // /sys — sysfs
-        mkdir_ignore_exists("/sys")?;
-        mount_ignore_busy(
-            Some("sysfs"),
-            "/sys",
-            Some("sysfs"),
-            nodev_noexec_nosuid,
-            None::<&str>,
-        )?;
+        mount_sys()?;
 
         // /sys/fs/cgroup — cgroup2
         mkdir_ignore_exists("/sys/fs/cgroup")?;
@@ -276,13 +218,42 @@ mod linux {
             None::<&str>,
         )?;
 
-        // /dev/fd → /proc/self/fd
-        if !Path::new("/dev/fd").exists() {
-            unix_fs::symlink("/proc/self/fd", "/dev/fd")
-                .map_err(|e| AgentdError::Init(format!("failed to symlink /dev/fd: {e}")))?;
+        // devtmpfs hides any links from the image and does not create these aliases.
+        for (target, link) in [
+            ("/proc/self/fd", "/dev/fd"),
+            ("/proc/self/fd/0", "/dev/stdin"),
+            ("/proc/self/fd/1", "/dev/stdout"),
+            ("/proc/self/fd/2", "/dev/stderr"),
+        ] {
+            match unix_fs::symlink(target, link) {
+                Ok(()) => {}
+                // A link may already exist even when its descriptor is closed.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(AgentdError::Init(format!("failed to symlink {link}: {e}")));
+                }
+            }
         }
 
         Ok(())
+    }
+
+    fn mount_dev() -> AgentdResult<()> {
+        mkdir_ignore_exists("/dev")?;
+        mount_ignore_busy(
+            Some("devtmpfs"),
+            "/dev",
+            Some("devtmpfs"),
+            MsFlags::MS_RELATIME,
+            None::<&str>,
+        )
+    }
+
+    fn mount_sys() -> AgentdResult<()> {
+        let flags =
+            MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_RELATIME;
+        mkdir_ignore_exists("/sys")?;
+        mount_ignore_busy(Some("sysfs"), "/sys", Some("sysfs"), flags, None::<&str>)
     }
 
     /// Mount boot-ephemeral state after the root pivot and before any agent or
@@ -378,6 +349,7 @@ mod linux {
         match spec {
             BlockRootSpec::DiskImage { device, fstype } => {
                 mount_disk_image(device, fstype.as_deref())?;
+                crate::root_disk::register("/newroot", device);
             }
             BlockRootSpec::OciErofs { lower, upper } => {
                 mount_oci_erofs(lower, upper)?;
@@ -440,6 +412,7 @@ mod linux {
                     None::<&str>,
                 )
                 .map_err(|e| AgentdError::Init(format!("mount {device} at {upperfs_dir}: {e}")))?;
+                crate::root_disk::register(upperfs_dir, device);
             }
             BlockRootUpper::Tmpfs { size_mib } => {
                 let data = size_mib
@@ -613,6 +586,162 @@ mod linux {
         )))
     }
 
+    /// Applies every user mount in one parent-before-child plan.
+    pub fn apply_user_mounts(
+        dir_specs: &[DirMountSpec],
+        file_specs: &[FileMountSpec],
+        disk_specs: &[DiskMountSpec],
+        tmpfs_specs: &[TmpfsSpec],
+    ) -> AgentdResult<()> {
+        let plan = plan_user_mounts(dir_specs, file_specs, disk_specs, tmpfs_specs)?;
+
+        // Read the autodetection candidates once even when disk mounts are
+        // interleaved with other kinds in the final plan.
+        let fstypes = if disk_specs.iter().any(|spec| spec.fstype.is_none()) {
+            Some(read_proc_filesystems()?)
+        } else {
+            None
+        };
+
+        if !file_specs.is_empty() {
+            fs::create_dir_all(microsandbox_protocol::FILE_MOUNTS_DIR).map_err(|e| {
+                AgentdError::Init(format!(
+                    "failed to create file mounts dir {}: {e}",
+                    microsandbox_protocol::FILE_MOUNTS_DIR
+                ))
+            })?;
+        }
+
+        let result = (|| {
+            for planned in plan {
+                match planned.mount {
+                    UserMount::Dir(spec) => mount_dir(spec)?,
+                    UserMount::File(spec) => mount_file(spec)?,
+                    UserMount::Disk(spec) => mount_disk(spec, fstypes.as_deref())?,
+                    UserMount::Tmpfs(spec) => mount_tmpfs(spec)?,
+                }
+            }
+            Ok(())
+        })();
+
+        // Each file share is detached by mount_file; remove the common
+        // staging root after the complete cross-kind plan finishes.
+        if !file_specs.is_empty() {
+            let _ = fs::remove_dir(microsandbox_protocol::FILE_MOUNTS_DIR);
+        }
+
+        result
+    }
+
+    fn plan_user_mounts<'a>(
+        dir_specs: &'a [DirMountSpec],
+        file_specs: &'a [FileMountSpec],
+        disk_specs: &'a [DiskMountSpec],
+        tmpfs_specs: &'a [TmpfsSpec],
+    ) -> AgentdResult<Vec<PlannedUserMount<'a>>> {
+        let mounts = dir_specs
+            .iter()
+            .map(UserMount::Dir)
+            .chain(file_specs.iter().map(UserMount::File))
+            .chain(disk_specs.iter().map(UserMount::Disk))
+            .chain(tmpfs_specs.iter().map(UserMount::Tmpfs));
+        let mut plan = Vec::with_capacity(
+            dir_specs.len() + file_specs.len() + disk_specs.len() + tmpfs_specs.len(),
+        );
+
+        for mount in mounts {
+            let (depth, canonical_path) = mount_order_key(mount.guest_path())?;
+            plan.push(PlannedUserMount {
+                depth,
+                canonical_path,
+                mount,
+            });
+        }
+
+        plan.sort_by(|left, right| {
+            (left.depth, left.canonical_path.as_str())
+                .cmp(&(right.depth, right.canonical_path.as_str()))
+        });
+
+        for pair in plan.windows(2) {
+            if pair[0].canonical_path == pair[1].canonical_path {
+                return Err(AgentdError::Init(format!(
+                    "multiple volumes cannot mount the same guest path: {}",
+                    pair[0].canonical_path
+                )));
+            }
+        }
+
+        // A file can be a mount leaf, but it cannot contain another mount.
+        // Reject the complete plan before executing its first mount so this
+        // configuration cannot fail later with ENOTDIR after partial setup.
+        for file in plan.iter().filter(|planned| planned.mount.is_file()) {
+            let file_path = Utf8UnixPath::new(&file.canonical_path);
+            if let Some(descendant) = plan.iter().find(|candidate| {
+                candidate.depth > file.depth
+                    && Utf8UnixPath::new(&candidate.canonical_path).starts_with(file_path)
+            }) {
+                return Err(AgentdError::Init(format!(
+                    "file mount cannot contain another mount: {} is an ancestor of {}",
+                    file.canonical_path, descendant.canonical_path
+                )));
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn mount_order_key(guest: &str) -> AgentdResult<(usize, String)> {
+        let path = Utf8UnixPath::new(guest);
+        if !path.is_valid() || !path.is_absolute() {
+            return Err(AgentdError::Init(format!(
+                "invalid guest mount path: {guest}"
+            )));
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, Utf8UnixComponent::ParentDir))
+        {
+            return Err(AgentdError::Init(format!(
+                "guest mount path must not contain '..': {guest}"
+            )));
+        }
+
+        let canonical = path.normalize();
+        if canonical.as_str() == "/" {
+            return Err(AgentdError::Init(
+                "cannot mount a volume at guest root /".into(),
+            ));
+        }
+        let depth = canonical
+            .components()
+            .filter(Utf8Component::is_normal)
+            .count();
+        Ok((depth, canonical.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn planned_user_mounts_for_test<'a>(
+        dir_specs: &'a [DirMountSpec],
+        file_specs: &'a [FileMountSpec],
+        disk_specs: &'a [DiskMountSpec],
+        tmpfs_specs: &'a [TmpfsSpec],
+    ) -> AgentdResult<Vec<(&'static str, String)>> {
+        plan_user_mounts(dir_specs, file_specs, disk_specs, tmpfs_specs).map(|plan| {
+            plan.into_iter()
+                .map(|planned| {
+                    let kind = match planned.mount {
+                        UserMount::Dir(_) => "dir",
+                        UserMount::File(_) => "file",
+                        UserMount::Disk(_) => "disk",
+                        UserMount::Tmpfs(_) => "tmpfs",
+                    };
+                    (kind, planned.canonical_path)
+                })
+                .collect()
+        })
+    }
+
     /// Mounts a single virtiofs directory share from a parsed spec.
     fn mount_dir(spec: &DirMountSpec) -> AgentdResult<()> {
         let path = spec.guest_path.as_str();
@@ -648,52 +777,6 @@ mod linux {
                 spec.tag
             ))
         })?;
-
-        Ok(())
-    }
-
-    /// Applies every user-requested mount, parent paths before nested ones.
-    pub fn apply_user_mounts(
-        dirs: &[DirMountSpec],
-        files: &[FileMountSpec],
-        disks: &[DiskMountSpec],
-    ) -> AgentdResult<()> {
-        let mounts = super::user_mount_sequence(dirs, files, disks);
-        if mounts.is_empty() {
-            return Ok(());
-        }
-
-        if !files.is_empty() {
-            // Create the staging root directory the file mounts pass through.
-            fs::create_dir_all(microsandbox_protocol::FILE_MOUNTS_DIR).map_err(|e| {
-                AgentdError::Init(format!(
-                    "failed to create file mounts dir {}: {e}",
-                    microsandbox_protocol::FILE_MOUNTS_DIR
-                ))
-            })?;
-        }
-
-        // Read /proc/filesystems only when at least one disk mount needs
-        // autodetection, then reuse the candidate list across the sequence.
-        let fstypes = if disks.iter().any(|spec| spec.fstype.is_none()) {
-            Some(read_proc_filesystems()?)
-        } else {
-            None
-        };
-
-        for mount in &mounts {
-            match mount {
-                UserMount::Dir(spec) => mount_dir(spec)?,
-                UserMount::File(spec) => mount_file(spec)?,
-                UserMount::Disk(spec) => mount_disk(spec, fstypes.as_deref())?,
-            }
-        }
-
-        if !files.is_empty() {
-            // Best-effort cleanup of the staging root (succeeds only if all
-            // per-tag subdirs were already removed inside mount_file).
-            let _ = fs::remove_dir(microsandbox_protocol::FILE_MOUNTS_DIR);
-        }
 
         Ok(())
     }
@@ -927,14 +1010,6 @@ mod linux {
         Ok(())
     }
 
-    /// Mounts each tmpfs from the parsed specs.
-    pub fn apply_tmpfs_mounts(specs: &[TmpfsSpec]) -> AgentdResult<()> {
-        for spec in specs {
-            mount_tmpfs(spec)?;
-        }
-        Ok(())
-    }
-
     /// Ensure standard temporary directories are writable and sticky.
     pub fn ensure_standard_tmp_permissions() -> AgentdResult<()> {
         ensure_directory_mode("/tmp", 0o1777)?;
@@ -1090,122 +1165,7 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn dir_spec(guest_path: &str) -> DirMountSpec {
-        DirMountSpec {
-            tag: "tag".into(),
-            guest_path: guest_path.into(),
-            readonly: false,
-            noexec: false,
-            nosuid: false,
-            nodev: false,
-        }
-    }
-
-    fn disk_spec(guest_path: &str) -> DiskMountSpec {
-        DiskMountSpec {
-            id: "id".into(),
-            guest_path: guest_path.into(),
-            fstype: None,
-            readonly: false,
-            noexec: false,
-            nosuid: false,
-            nodev: false,
-        }
-    }
-
-    fn file_spec(guest_path: &str) -> FileMountSpec {
-        FileMountSpec {
-            tag: "tag".into(),
-            filename: "file".into(),
-            guest_path: guest_path.into(),
-            readonly: false,
-            noexec: false,
-            nosuid: false,
-            nodev: false,
-        }
-    }
-
-    #[test]
-    fn test_parent_first_order_keeps_duplicate_paths_in_place() {
-        let paths = ["/a", "/a", "/a/b"];
-        assert_eq!(parent_first_order(&paths), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn test_parent_first_order_puts_root_target_first() {
-        let paths = ["/a/b", "/"];
-        assert_eq!(parent_first_order(&paths), vec![1, 0]);
-    }
-
-    #[test]
-    fn test_user_mount_sequence_mounts_disk_parent_before_dir_child() {
-        let dirs = [dir_spec("/var/lib/distributed-docker/cache")];
-        let files = [];
-        let disks = [disk_spec("/var/lib/distributed-docker")];
-        let sequence = super::user_mount_sequence(&dirs, &files, &disks);
-        let order: Vec<&str> = sequence.iter().map(|mount| mount.guest_path()).collect();
-        assert_eq!(
-            order,
-            vec![
-                "/var/lib/distributed-docker",
-                "/var/lib/distributed-docker/cache"
-            ]
-        );
-    }
-
-    #[test]
-    fn test_user_mount_sequence_keeps_kind_grouping_without_nesting() {
-        let dirs = [dir_spec("/d")];
-        let files = [file_spec("/f")];
-        let disks = [disk_spec("/k")];
-        let sequence = super::user_mount_sequence(&dirs, &files, &disks);
-        let order: Vec<&str> = sequence.iter().map(|mount| mount.guest_path()).collect();
-        assert_eq!(order, vec!["/d", "/f", "/k"]);
-    }
-
-    #[test]
-    fn test_user_mount_sequence_mounts_disk_parent_before_file_child() {
-        let dirs = [];
-        let files = [file_spec("/opt/data/config.json")];
-        let disks = [disk_spec("/opt/data")];
-        let sequence = super::user_mount_sequence(&dirs, &files, &disks);
-        let order: Vec<&str> = sequence.iter().map(|mount| mount.guest_path()).collect();
-        assert_eq!(order, vec!["/opt/data", "/opt/data/config.json"]);
-    }
-
-    #[test]
-    fn test_parent_first_order_puts_parent_before_nested_child() {
-        let paths = [
-            "/var/lib/distributed-docker/docker/volumes",
-            "/var/lib/distributed-docker",
-        ];
-        assert_eq!(parent_first_order(&paths), vec![1, 0]);
-    }
-
-    #[test]
-    fn test_parent_first_order_keeps_unrelated_paths_in_place() {
-        let paths = ["/z", "/a", "/m/n"];
-        assert_eq!(parent_first_order(&paths), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn test_parent_first_order_handles_three_levels_reversed() {
-        let paths = ["/a/b/c", "/a/b", "/a"];
-        assert_eq!(parent_first_order(&paths), vec![2, 1, 0]);
-    }
-
-    #[test]
-    fn test_parent_first_order_ignores_redundant_separators() {
-        let paths = ["/a/./b", "/a//"];
-        assert_eq!(parent_first_order(&paths), vec![1, 0]);
-    }
-
-    #[test]
-    fn test_parent_first_order_does_not_nest_on_name_prefix() {
-        let paths = ["/data-extra", "/data"];
-        assert_eq!(parent_first_order(&paths), vec![0, 1]);
-    }
+    use crate::config::{DirMountSpec, DiskMountSpec, FileMountSpec, TmpfsSpec};
 
     #[test]
     fn test_ensure_scripts_profile_block_appends_block() {
@@ -1225,5 +1185,81 @@ mod tests {
         let profile = ensure_scripts_profile_block("");
         let updated = ensure_scripts_profile_block(&profile);
         assert_eq!(profile, updated);
+    }
+
+    #[test]
+    fn test_user_mount_plan_orders_mixed_kinds_parent_first() {
+        let dirs = vec![DirMountSpec {
+            tag: "workspace".into(),
+            guest_path: "/workspace".into(),
+            readonly: false,
+            noexec: false,
+            nosuid: false,
+            nodev: false,
+        }];
+        let files = vec![FileMountSpec {
+            tag: "config".into(),
+            filename: "app.toml".into(),
+            guest_path: "/workspace/persist/app.toml".into(),
+            readonly: true,
+            noexec: false,
+            nosuid: false,
+            nodev: false,
+        }];
+        let disks = vec![DiskMountSpec {
+            id: "durable".into(),
+            guest_path: "/workspace/persist".into(),
+            fstype: Some("ext4".into()),
+            readonly: false,
+            noexec: false,
+            nosuid: false,
+            nodev: false,
+        }];
+        let tmpfs = vec![TmpfsSpec {
+            path: "/workspace/persist/cache".into(),
+            size_mib: None,
+            mode: None,
+            noexec: false,
+            nosuid: false,
+            nodev: false,
+            readonly: false,
+        }];
+
+        let plan = linux::planned_user_mounts_for_test(&dirs, &files, &disks, &tmpfs).unwrap();
+
+        assert_eq!(
+            plan,
+            vec![
+                ("dir", "/workspace".into()),
+                ("disk", "/workspace/persist".into()),
+                ("file", "/workspace/persist/app.toml".into()),
+                ("tmpfs", "/workspace/persist/cache".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_user_mount_plan_rejects_file_mount_as_parent() {
+        let dirs = vec![DirMountSpec {
+            tag: "persist".into(),
+            guest_path: "/workspace/persist".into(),
+            readonly: false,
+            noexec: false,
+            nosuid: false,
+            nodev: false,
+        }];
+        let files = vec![FileMountSpec {
+            tag: "workspace".into(),
+            filename: "workspace".into(),
+            guest_path: "/workspace".into(),
+            readonly: true,
+            noexec: false,
+            nosuid: false,
+            nodev: false,
+        }];
+
+        let error = linux::planned_user_mounts_for_test(&dirs, &files, &[], &[]).unwrap_err();
+
+        assert!(error.to_string().contains("file mount cannot contain"));
     }
 }

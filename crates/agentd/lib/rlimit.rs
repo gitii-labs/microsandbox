@@ -22,7 +22,7 @@ pub(crate) fn parse_rlimit_resource(name: &str) -> Option<libc::c_int> {
 /// started through the per-exec API.
 ///
 /// Callers must have validated resource names upfront (e.g. via
-/// [`BootParams::from_env`](crate::config::BootParams::from_env)); unknown
+/// [`BootParams::from_bootstrap`](crate::config::BootParams::from_bootstrap)); unknown
 /// names here produce an [`AgentdError::Init`] rather than silently skipping.
 pub(crate) fn apply_baseline(rlimits: &[ExecRlimit]) -> AgentdResult<()> {
     for rlimit in rlimits {

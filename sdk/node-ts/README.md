@@ -10,10 +10,12 @@ For the full API reference and longer guides, use the docs site:
 - [SDK overview](https://docs.microsandbox.dev/sdk/overview)
 - [Repository examples](../../examples/typescript)
 
+A complete runtime in the configured home (`MSB_HOME`, or `~/.microsandbox` by default) takes precedence over platform-package binaries. Explicit binary paths still win. A partial home installation errors instead of falling back to the package. This also applies to the `msb` and `microsandbox` CLI entry points.
+
 ## Features
 
 - Hardware VM isolation with a guest Linux kernel
-- ESM-first TypeScript API with generated native bindings
+- ESM-first API with CommonJS `require()` support and generated native bindings
 - Collected and streaming command execution
 - Guest filesystem read, write, list, copy, stat, and stream operations
 - Named volumes, bind mounts, tmpfs mounts, and disk-image mounts
@@ -25,13 +27,17 @@ For the full API reference and longer guides, use the docs site:
 ## Requirements
 
 - Node.js 22+
-- Linux with KVM, macOS with Apple Silicon, or Windows with Windows Hypervisor Platform
-- Windows support is currently preview; see the [Windows troubleshooting guide](https://docs.microsandbox.dev/getting-started/windows-troubleshooting) for WHP and runtime setup notes.
+- Linux with KVM, macOS with Apple Silicon, or Windows 11 with WHP enabled
+- Windows support is currently preview; see the [Windows troubleshooting guide](https://docs.microsandbox.dev/troubleshooting/windows) for WHP and runtime setup notes.
 
-The package root is ESM-only for normal imports:
+The package root supports both ESM imports and CommonJS `require()` on Node.js 22+:
 
 ```typescript
 import { Sandbox } from "microsandbox";
+```
+
+```javascript
+const { Sandbox } = require("microsandbox");
 ```
 
 ## Supported Platforms
@@ -44,13 +50,24 @@ import { Sandbox } from "microsandbox";
 | Windows | x86_64 | `@superradcompany/microsandbox-win32-x64-msvc` |
 | Windows | ARM64 | `@superradcompany/microsandbox-win32-arm64-msvc` |
 
-The matching platform package is installed through npm optional dependencies and carries the native addon plus runtime binaries. If optional dependencies are omitted, reinstall with optional dependencies enabled, install the matching platform package explicitly, or set `MSB_PATH` to a working `msb` binary.
+The matching platform package carries the native addon plus runtime binaries. Keep npm optional dependencies enabled: omitting them also removes the required addon, which `MSB_PATH` cannot replace.
 
 ## Installation
 
 ```bash
 npm install microsandbox
 ```
+
+Runtime setup is normally included. To provision `msb` + `libkrunfw` separately, use the [CLI installer](https://docs.microsandbox.dev/getting-started/quickstart) or explicitly install them from your application:
+
+```typescript
+import { ensureRuntime } from "microsandbox";
+
+const runtime = await ensureRuntime();
+console.log(runtime.msbPath, runtime.libkrunfwPath);
+```
+
+Use `MSB_PATH` and `MSB_LIBKRUNFW_PATH` to select an external runtime; this does not remove the npm package's bundled files. See [Runtime setup](https://docs.microsandbox.dev/sdk/setup) for custom paths and versions.
 
 ## Quick Start
 
@@ -70,9 +87,64 @@ console.log(output.stdout().trim());
 
 `await using` calls `Sandbox.stop()` when the handle leaves scope. Use a plain `const sandbox = ...` and call lifecycle methods yourself when you need finer control.
 
+### Reusable Lifecycle Convergence
+
+Use `connectOrCreate` when a stable name should converge on one persisted sandbox. Existing configuration wins; the builder is used only if creation is necessary. Handles retain a stable `id`, so lifecycle calls on stale receivers refuse to act on a replacement that reused the name.
+
+```typescript
+const sandbox = await Sandbox.builder("worker")
+  .image("python")
+  .memory(MiB(1024))
+  .connectOrCreate();
+
+console.log(`${sandbox.name}: ${sandbox.id}`);
+const running = await (await Sandbox.get("worker")).connectOrStart();
+await running.requestStop();
+const stopped = await running.waitForStatus("stopped");
+const restarted = await stopped.restart();
+await restarted.destroy();
+```
+
+## Local Storage Usage And Cleanup
+
+`Storage.usage()` reports images, saved snapshots, sandboxes, volumes, branch RAM, and rebuildable snapshot RAM for the selected local backend. Unknown measurements are `null`. Logical byte counts and allocated blocks do not measure exclusive physical ownership because files can share disk blocks. All byte fields are `bigint`, preserving the full unsigned 64-bit range; object counts are numbers. To serialize a report with `JSON.stringify`, supply a replacer that converts bigints to decimal strings.
+
+```typescript
+import { Storage } from "microsandbox";
+
+const usage = await Storage.usage();
+console.log(usage.branchMemory.logicalBytes); // bigint | null
+
+const preview = await Storage.prune({ dryRun: true, olderThanSeconds: 3600 });
+console.log(preview.entries);
+
+const result = await Storage.prune({ olderThanSeconds: 3600 });
+console.log(result.logicalBytesRemoved);
+for (const entry of result.entries) {
+  if (entry.error !== null) console.error(entry.path, entry.error);
+}
+```
+
+Pruning removes only unused published runtime RAM. Live mappings, retained baselines, and pending handoffs remain protected. Saved snapshots, images, sandbox disks, volumes, and stable lock files are retained. `olderThanSeconds` must be a whole non-negative safe integer; the default is zero. `dryRun` defaults to false. The SDK does not prompt for confirmation, and each apply call rechecks ownership. Individual failures remain in `entries` alongside completed removals; `physicalBytesReclaimed` is unknown (`null`). Cloud backends reject these local-only operations. Each call captures its backend before returning the promise; changing the default while it runs cannot redirect it. An older native addon without these methods raises `UnsupportedOperationError` when they are called.
+
+`SandboxHandle.storageUsage()`, `Snapshot.storageUsage()`, and `SnapshotHandle.storageUsage()` report one object using its captured backend, with the same bigint byte fields and null unknowns. Snapshot records returned by `Snapshot.list()` contain metadata only; fetch a native handle with `Snapshot.get()` before inspecting its storage.
+
 ## Common Examples
 
 These snippets assume you already have a live `sandbox: Sandbox`.
+
+### Fork a Live Sandbox
+
+Forking copies a running or paused local sandbox's disk and execution state into an independent child. Memory uses copy-on-write automatically. The source keeps its previous running or paused state. Host resources require explicit bindings; see [forking and resource bindings](https://docs.microsandbox.dev/sandboxes/snapshots#forking).
+
+```typescript
+const child = await sandbox.fork("experiment");
+await child.stop();
+```
+
+Use `forkMany(["alice", "bob"])` to capture once for several children. Inspect every returned outcome: one child's startup failure does not remove successful siblings. See the [fork API reference](https://docs.microsandbox.dev/sdk/typescript/sandbox#forking).
+
+Restoring starts from a saved snapshot instead. Use `.cowMemory()` to request copy-on-write memory for a full-snapshot restore. A generation describes snapshot-history progression; a branch describes a distinct path through that history. The former live branch APIs and old CoW restore names remain deprecated aliases. See [restore migration notes](https://docs.microsandbox.dev/sandboxes/snapshots#migrating-restore-options) for the old-to-new names and language-specific deprecation notices.
 
 ### Command Execution
 
@@ -307,6 +379,16 @@ try {
 - The `microsandbox` and `msb` bin shims forward to the resolved `msb` binary. They do not install runtime files.
 - If no platform package is present, reinstall with optional dependencies enabled, install the matching `@superradcompany/microsandbox-<platform>` package, or set `MSB_PATH`.
 
+## Inspect a runtime version
+
+```typescript
+import { resolveRuntimeVersion } from "microsandbox";
+
+const version = await resolveRuntimeVersion("/path/to/msb");
+```
+
+This reads the embedded semantic version without executing the file or requiring firmware. It returns a version string, or `null` for older executables without the section. File access failures, malformed executable metadata and invalid version sections reject the promise. There is no implicit `--version` subprocess fallback, and normal sandbox launch does not perform this optional inspection.
+
 ## More Documentation
 
 - [Sandbox lifecycle](https://docs.microsandbox.dev/sdk/typescript/sandbox)
@@ -330,6 +412,8 @@ npm run typecheck
 npm test
 ```
 
+On a release branch whose native packages are not published yet, replace `npm ci` with `node ../../scripts/ci/build-unpublished-node-sdk.mjs`. This installs the locked build tools and builds TypeScript while restoring the package manifests afterward. Continue with `npm run build` to build the native addon locally. Standard `npm ci` works again after the post-release lockfile refresh.
+
 Run repository examples from the specific example directory:
 
 ```bash
@@ -341,3 +425,5 @@ npm start
 ## License
 
 Apache-2.0
+
+The size helpers and `Mebibytes` type are re-exported from `@microsandbox/types/size`, so values can be passed directly between this SDK and the standalone control client. The local npm workspace links that shared package with a versioned dependency for publishing. `npm ci`, `npm run build:ts`, and `npm run typecheck` work from this directory; the build and typecheck scripts build the shared types first.

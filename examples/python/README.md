@@ -33,10 +33,13 @@ uv run --project sdk/python python examples/python/net-basic/main.py
 uv run --project sdk/python python examples/python/fs-read-stream/main.py
 ```
 
+Configuration-focused examples intentionally replace their fixed-name sandbox so reruns match the source. `shell-attach` uses `connect_or_create` instead, preserving its interactive workspace and configuration across runs.
+
 ## Examples
 
 | Example | Description |
 |---------|-------------|
+| `lifecycle-convergence` | Live convergence and stale-handle identity-safety checks with timing metrics |
 | `cloud-backend` | Cloud backend lifecycle and live logs |
 | `root-oci` | OCI image rootfs |
 | `root-bind` | Bind-mounted local directory |
@@ -48,10 +51,12 @@ uv run --project sdk/python python examples/python/fs-read-stream/main.py
 | `snapshot-fork` | Snapshot a stopped sandbox and boot a fresh one from it |
 | `fs-read-stream` | Streaming file read |
 | `metrics-stream` | Streaming resource metrics |
-| `shell-attach` | Interactive shell attach |
+| `shell-attach` | Reusable interactive shell using `connect_or_create` |
 | `net-basic` | Basic networking |
 | `net-dns` | DNS filtering |
 | `net-policy` | Network policies |
 | `net-ports` | Port publishing |
 | `net-secrets` | Secret injection |
 | `net-tls` | TLS interception |
+
+The `snapshot-fork` example keeps its historical directory name; it demonstrates restoring a saved disk snapshot. Live forking uses the `fork` API.

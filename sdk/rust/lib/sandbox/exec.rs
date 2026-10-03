@@ -519,7 +519,7 @@ pub(crate) mod agent {
     use bytes::Bytes;
     use microsandbox_protocol::{
         exec::{ExecExited, ExecStarted, ExecStderr, ExecStdin, ExecStdout},
-        message::MessageType,
+        message::{Message, MessageType},
     };
     use tokio::sync::mpsc;
 
@@ -624,7 +624,7 @@ pub(crate) mod agent {
 
     /// Background task that converts raw protocol messages into [`ExecEvent`]s.
     async fn event_mapper_task(
-        mut rx: microsandbox_agent_client::MessageReceiver,
+        mut rx: mpsc::Receiver<Message>,
         tx: mpsc::UnboundedSender<ExecEvent>,
     ) {
         while let Some(msg) = rx.recv().await {

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use clap::{Args, Subcommand, ValueEnum};
 use console::style;
+use microsandbox::config::RegistryOptions;
 use microsandbox::image::Image;
 use microsandbox_image::{ImageArchiveFormat, ImageLoadOptions, Registry};
 
@@ -153,6 +154,13 @@ pub struct ImagePruneArgs {
     pub quiet: bool,
 }
 
+/// Optional settings supplied by callers that need more than the normal pull defaults.
+#[derive(Default)]
+struct PullOverrides {
+    materialization: Option<pull::PullMaterialization>,
+    explicit_auth: Option<microsandbox_image::RegistryAuth>,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -168,7 +176,10 @@ pub async fn run(args: ImageArgs) -> anyhow::Result<()> {
                 args.insecure,
                 args.ca_certs,
                 microsandbox_image::PullPolicy::IfMissing,
-                args.materialize,
+                PullOverrides {
+                    materialization: args.materialize,
+                    ..PullOverrides::default()
+                },
             )
             .await
         }
@@ -190,7 +201,10 @@ pub async fn run_pull(args: pull::PullArgs) -> anyhow::Result<()> {
         args.insecure,
         args.ca_certs,
         microsandbox_image::PullPolicy::IfMissing,
-        args.materialize,
+        PullOverrides {
+            materialization: args.materialize,
+            ..PullOverrides::default()
+        },
     )
     .await
 }
@@ -203,16 +217,20 @@ async fn run_pull_inner(
     insecure: bool,
     cli_ca_certs: Option<String>,
     pull_policy: microsandbox_image::PullPolicy,
-    materialization: Option<pull::PullMaterialization>,
+    pull_overrides: PullOverrides,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
+    let PullOverrides {
+        materialization,
+        explicit_auth,
+    } = pull_overrides;
 
     let backend = crate::commands::common::resolve_local_backend()?;
-    let local = crate::commands::common::local_backend_ref(&backend)?;
-    let global = local.config();
-    let oci_defaults = &global.sandbox_defaults.oci;
+    let backend = crate::commands::common::local_backend_ref(&backend)?;
+    let backend_config = backend.config();
+    let oci_defaults = &backend_config.sandbox_defaults.oci;
     let materialization = resolve_pull_materialization(materialization, oci_defaults)?;
-    let cache = microsandbox_image::GlobalCache::new(&local.cache_dir())?;
+    let cache = microsandbox_image::GlobalCache::new(&backend.cache_dir())?.operation();
     let platform = microsandbox_image::Platform::host_linux();
     let image_ref: microsandbox_image::Reference = reference
         .parse()
@@ -225,19 +243,14 @@ async fn run_pull_inner(
     };
 
     if let Some((result, metadata)) =
-        microsandbox_image::Registry::pull_cached(&cache, &image_ref, &options)?
+        microsandbox_image::Registry::pull_cached_async(&cache, &image_ref, &options).await?
     {
-        if let Err(e) = Image::persist(local, &reference, metadata).await {
-            tracing::warn!(error = %e, "failed to persist image metadata to database");
-        }
+        Image::persist(backend, &reference, metadata).await?;
 
         if !quiet {
-            eprintln!(
-                "   {} {:<12} {}{}",
-                style("✓").green(),
+            ui::success(
                 "Pulled",
-                reference,
-                style(" (already cached)").dim()
+                &format!("{reference}{}", style(" (already cached)").dim()),
             );
         }
 
@@ -272,22 +285,19 @@ async fn run_pull_inner(
 
     let _ = display_ready_rx.recv();
 
-    let auth = global.resolve_registry_auth(image_ref.registry())?;
-    let mut ca_certs = global.resolve_ca_certs().await?;
-    if let Some(path) = &cli_ca_certs {
-        let data = tokio::fs::read(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read CA certs from `{path}`: {e}"))?;
-        ca_certs.push(data);
-    }
-    let mut insecure_registries = global.insecure_registries();
-    if insecure {
-        insecure_registries.push(image_ref.registry().to_string());
-    }
+    let registry_options = RegistryOptions {
+        ca_cert_files: cli_ca_certs.into_iter().map(Into::into).collect(),
+        auth: explicit_auth,
+        insecure,
+        ..Default::default()
+    };
+    let config = backend
+        .registry_config(image_ref.registry(), registry_options)
+        .await?;
     let registry = Registry::builder(platform, cache)
-        .auth(auth)
-        .extra_ca_certs(ca_certs)
-        .add_insecure_registries(insecure_registries)
+        .auth(config.auth)
+        .extra_ca_certs(config.ca_certs)
+        .add_insecure_registries(config.insecure_registries)
         .build()?;
 
     let task = registry.pull_with_sender(&image_ref, &options, sender);
@@ -316,19 +326,13 @@ async fn run_pull_inner(
         }
     }
 
-    // Persist to database.
-    let cache = microsandbox_image::GlobalCache::new(&local.cache_dir())?;
-    match cache.read_image_metadata(&image_ref) {
-        Ok(Some(metadata)) => {
-            if let Err(e) = Image::persist(local, &reference, metadata).await {
-                tracing::warn!(error = %e, "failed to persist image metadata to database");
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read cached image metadata");
-        }
-    }
+    // Persist before the registry's operation scope releases the published artifacts.
+    let cache = microsandbox_image::GlobalCache::new(&backend.cache_dir())?.operation();
+    let metadata = cache
+        .read_image_metadata_async(&image_ref)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("image metadata missing after pull: {reference}"))?;
+    Image::persist(backend, &reference, metadata).await?;
 
     if !quiet {
         let suffix = if result.cached {
@@ -345,13 +349,7 @@ async fn run_pull_inner(
             }
         };
 
-        eprintln!(
-            "   {} {:<12} {}{}",
-            style("✓").green(),
-            "Pulled",
-            reference,
-            style(suffix).dim()
-        );
+        ui::success("Pulled", &format!("{reference}{}", style(suffix).dim()));
     }
 
     Ok(())
@@ -369,6 +367,16 @@ pub(crate) async fn pull_if_missing(
     quiet: bool,
     materialization: pull::PullMaterialization,
 ) -> anyhow::Result<()> {
+    pull_if_missing_with_auth(reference, quiet, materialization, None).await
+}
+
+/// Pull an image if missing, honoring an explicit per-sandbox registry credential.
+pub(crate) async fn pull_if_missing_with_auth(
+    reference: &str,
+    quiet: bool,
+    materialization: pull::PullMaterialization,
+    explicit_auth: Option<microsandbox_image::RegistryAuth>,
+) -> anyhow::Result<()> {
     // Local paths (directories, disk images) are not pullable.
     if reference.starts_with('.') || reference.starts_with('/') {
         return Ok(());
@@ -376,7 +384,7 @@ pub(crate) async fn pull_if_missing(
 
     let backend = crate::commands::common::resolve_local_backend()?;
     let local = crate::commands::common::local_backend_ref(&backend)?;
-    let cache = microsandbox_image::GlobalCache::new(&local.cache_dir())?;
+    let cache = microsandbox_image::GlobalCache::new(&local.cache_dir())?.operation();
     let image_ref: microsandbox_image::Reference = reference
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))?;
@@ -387,11 +395,9 @@ pub(crate) async fn pull_if_missing(
     };
 
     if let Some((_, metadata)) =
-        microsandbox_image::Registry::pull_cached(&cache, &image_ref, &options)?
+        microsandbox_image::Registry::pull_cached_async(&cache, &image_ref, &options).await?
     {
-        if let Err(e) = Image::persist(local, reference, metadata).await {
-            tracing::warn!(error = %e, "failed to persist image metadata to database");
-        }
+        Image::persist(local, reference, metadata).await?;
         return Ok(());
     }
 
@@ -402,7 +408,10 @@ pub(crate) async fn pull_if_missing(
         false,
         None,
         microsandbox_image::PullPolicy::IfMissing,
-        Some(materialization),
+        PullOverrides {
+            materialization: Some(materialization),
+            explicit_auth,
+        },
     )
     .await
 }
@@ -637,12 +646,19 @@ pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
         temp_input.path()
     };
 
-    let loaded = microsandbox_image::load_archive(
-        &cache_dir,
+    let cache_operation = microsandbox_image::GlobalCache::new(&cache_dir)?;
+    let loaded = microsandbox_image::load_archive_with(
+        &cache_operation,
         input_path,
         ImageLoadOptions {
             tags: args.tag.clone(),
             progress: Some(sender),
+        },
+        |image| async move {
+            Image::persist(local, &image.reference, image.metadata)
+                .await
+                .map(|_| ())
+                .map_err(|error| microsandbox_image::ImageError::Io(std::io::Error::other(error)))
         },
     )
     .await;
@@ -654,18 +670,9 @@ pub async fn run_load(args: ImageLoadArgs) -> anyhow::Result<()> {
     }
     let loaded = loaded?;
 
-    for image in &loaded {
-        Image::persist(local, &image.reference, image.metadata.clone()).await?;
-    }
-
     if !args.quiet {
         for image in &loaded {
-            eprintln!(
-                "   {} {:<12} {}",
-                style("✓").green(),
-                "Loaded",
-                image.reference
-            );
+            ui::success("Loaded", &image.reference);
         }
     }
 
@@ -697,12 +704,7 @@ pub async fn run_save(args: ImageSaveArgs) -> anyhow::Result<()> {
         io::copy(&mut file, &mut stdout)?;
         stdout.flush()?;
     } else if !args.quiet {
-        eprintln!(
-            "   {} {:<12} {}",
-            style("✓").green(),
-            "Saved",
-            output_path.display()
-        );
+        ui::success("Saved", &output_path.display().to_string());
     }
 
     Ok(())
@@ -775,6 +777,7 @@ pub async fn run_prune(args: ImagePruneArgs) -> anyhow::Result<()> {
             "fsmeta_removed": report.fsmeta_removed,
             "vmdk_removed": report.vmdk_removed,
             "bytes_reclaimed": report.bytes_reclaimed,
+            "skipped_in_use": report.skipped_in_use,
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
@@ -790,11 +793,19 @@ pub async fn run_prune(args: ImagePruneArgs) -> anyhow::Result<()> {
         && report.fsmeta_removed == 0
         && report.vmdk_removed == 0
     {
-        eprintln!("Nothing to prune.");
+        if report.skipped_in_use > 0 {
+            eprintln!(
+                "Nothing pruned; {} cache entries are in use.",
+                report.skipped_in_use
+            );
+        } else {
+            eprintln!("Nothing to prune.");
+        }
         return Ok(());
     }
 
     ui::success("Pruned", "image cache");
+    ui::detail_kv_indent("Skipped", &format!("{} in use", report.skipped_in_use));
     ui::detail_kv_indent("Image refs", &report.image_refs_removed.to_string());
     ui::detail_kv_indent("Manifests", &report.manifests_removed.to_string());
     ui::detail_kv_indent("Layers", &report.layers_removed.to_string());
@@ -831,7 +842,7 @@ fn format_bytes_u64(bytes: u64) -> String {
 /// Print the pull failure indicator line to stderr.
 fn pull_failure_line(quiet: bool, reference: &str) {
     if !quiet {
-        eprintln!("   {} {:<12} {}", style("✗").red(), "Pulling", reference);
+        ui::failure("Pulling", reference);
     }
 }
 

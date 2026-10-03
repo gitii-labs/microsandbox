@@ -6,7 +6,15 @@ mod cloud;
 mod command;
 mod domain;
 mod error;
+
+#[doc(hidden)]
+pub mod compat;
+mod guest_flush;
+#[doc(hidden)]
+pub mod helpers;
 pub mod modify;
+mod registry;
+pub mod snapshot;
 mod validation;
 
 #[cfg(feature = "ts")]
@@ -16,36 +24,55 @@ pub mod typescript;
 // Exports
 //--------------------------------------------------------------------------------------------------
 
+pub use microsandbox_types_macros::ConfigPatch;
+
 pub use cloud::{
-    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudDiskImageFormat, CloudErrorBody,
-    CloudErrorDetails, CloudHostPattern, CloudMessageResponse, CloudNetworkSpec, CloudPaginated,
-    CloudPatch, CloudPullPolicy, CloudRlimit, CloudRlimitResource, CloudRootfsSource,
+    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudCreateSnapshotRequest,
+    CloudDiskImageFormat, CloudErrorBody, CloudErrorDetails, CloudHostPattern,
+    CloudMessageResponse, CloudNetworkSpec, CloudPaginated, CloudPatch, CloudPullPolicy,
+    CloudRlimit, CloudRlimitResource, CloudRootfsSource, CloudSandboxComputeResources,
     CloudSandboxResources, CloudSandboxRuntimeOptions, CloudSandboxSpec, CloudSandboxStatus,
     CloudSandboxStatusReason, CloudSecretEntry, CloudSecretSource, CloudSecretsConfig,
-    CloudViolationAction, CloudVolumeMount,
+    CloudSnapshot, CloudSnapshotDetails, CloudSnapshotKind, CloudSnapshotLocation,
+    CloudSnapshotOperation, CloudSnapshotOperationStatus, CloudSnapshotSpec, CloudViolationAction,
+    CloudVolumeMount,
 };
 #[doc(hidden)]
 pub use command::{CommandResolutionError, ResolvedCommand, resolve_default_command};
 pub use domain::{
     Action, CertCacheConfig, CpuPlacement, DEFAULT_METRICS_SAMPLE_INTERVAL_MS,
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, DeploymentProfile, Destination,
-    DestinationGroup, Direction, DiskImageFormat, DnsConfig, EnvVar, FlatClone, HandoffInit,
-    HostPattern, HostPermissions, InterceptCaConfig, InterfaceOverrides, LogSource,
-    MAX_OAUTH_SENTINEL_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, MintEndpoint, MountOptions,
-    NamedVolumeCreate, NamedVolumeMode, NetworkPolicy, NetworkSpec, OAuthSecret, OciRootfsSource,
-    Patch, PortProtocol, PortRange, Protocol, PublishedPortSpec, PullPolicy, Rlimit,
-    RlimitResource, RootDisk, RootfsSource, Rule, SandboxLogLevel, SandboxPolicy, SandboxResources,
-    SandboxRuntimeOptions, SandboxSpec, ScopedUpstreamCaCert, ScopedVerifyUpstream,
-    SecretConfigError, SecretEntry, SecretInjection, SecretsConfig, SecurityProfile, SnapshotSpec,
-    StatVirtualization, TlsConfig, TransparentHugePagePolicy, ViolationAction, VolumeKind,
-    VolumeMount, VolumeSpec,
+    DestinationGroup, Direction, DiskImageFormat, DnsConfig, DnsConfigPatch, EnvVar, FlatClone,
+    GuestClockPolicy, HandoffInit, HostPattern, HostPermissions, HttpConfig, HttpConfigPatch,
+    InterceptCaConfig, InterfaceOverrides, InterfaceOverridesPatch, LogSource,
+    MAX_OAUTH_SENTINEL_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, MemoryPlacement, MintEndpoint,
+    MountOptions, NamedVolumeCreate, NamedVolumeMode, NetworkPolicy, NetworkRateLimitDirection,
+    NetworkRateLimiterConfig, NetworkRateLimiterConfigPatch, NetworkSpec, NetworkSpecPatch,
+    NumaPlacement, OAuthSecret, OciRootfsSource, OutboundProxy, OwnedVolumeStorage, Patch,
+    PlacementProfile, PortProtocol, PortRange, Protocol, PublishedPortSpec, PullPolicy,
+    RateLimitConfigError, RateLimiterConfig, Rlimit, RlimitResource, RootDisk, RootfsSource, Rule,
+    SandboxLogLevel, SandboxPolicy, SandboxPolicyPatch, SandboxResources, SandboxResourcesPatch,
+    SandboxRuntimeOptions, SandboxRuntimeOptionsPatch, SandboxSpec, SandboxSpecPatch,
+    ScopedUpstreamCaCert, ScopedVerifyUpstream, SecretConfigError, SecretEntry, SecretSubstitution,
+    SecretViolationAction, SecretsConfig, SecretsConfigPatch, SecurityProfile, SnapshotSpec,
+    Socks5Credentials, StatVirtualization, TlsConfig, TlsConfigPatch, TokenBucketConfig,
+    TransparentHugePagePolicy, VolumeKind, VolumeMount, VolumeSpec, VsockRouteSpec,
+    VsockSocketType, VsockSpec, VsockSpecPatch, WELL_KNOWN_NAT64_PREFIX,
+    canonicalize_volume_mounts, owned_volume_mount_id,
 };
-pub use error::{TypesError, TypesResult};
+pub use error::{SnapshotManifestError, SnapshotManifestResult, TypesError, TypesResult};
+pub use guest_flush::GuestFlush;
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
     ModificationPolicy, ModificationWarning, PlannedChange, ResourceConvergenceState, ResourceKind,
     ResourceResizeStatus, SandboxModificationPatch, SandboxModificationPlan, SecretChangeKind,
     SecretModificationPatch, SecretPlannedChange, SecretSource,
+};
+pub use registry::RegistryAuth;
+pub use snapshot::manifest::Manifest as SnapshotManifest;
+pub use snapshot::{
+    DiskCompactionDiskResult, DiskCompactionResult, DiskCompactionTarget,
+    ExternalMountRestorePolicy, ExternalMountWarning,
 };
 pub use validation::{
     MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, hostname_from_sandbox_name, validate_hostname,

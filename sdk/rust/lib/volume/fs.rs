@@ -2,20 +2,26 @@
 //!
 //! Unlike [`SandboxFsOps`](crate::sandbox::fs::SandboxFsOps) which goes through the
 //! agent protocol, [`VolumeFs`] reads + writes a volume's bytes directly. For
-//! the local backend that is `tokio::fs` against `volumes_dir/<name>/`; for
+//! the local backend that is capability-scoped access to `volumes_dir/<name>/`; for
 //! cloud it routes through msb-cloud HTTP.
 //!
 //! `VolumeFs` is a single type per D6.4 — no public variants. It borrows the
 //! parent volume's `Arc<dyn Backend>` + name and dispatches through the
 //! [`VolumeBackend`](crate::backend::VolumeBackend) trait.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
+#[cfg(feature = "cloud")]
+use std::pin::Pin;
+
 use bytes::Bytes;
+#[cfg(feature = "cloud")]
 use futures::{Stream, StreamExt};
+#[cfg(feature = "local")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "cloud")]
 use tokio::sync::mpsc;
+#[cfg(feature = "cloud")]
 use tokio::task::JoinHandle;
 
 use crate::backend::Backend;
@@ -29,6 +35,7 @@ use crate::{
 //--------------------------------------------------------------------------------------------------
 
 /// Chunk size for streaming volume reads (64 KiB).
+#[cfg(feature = "local")]
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 //--------------------------------------------------------------------------------------------------
@@ -39,7 +46,7 @@ const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 ///
 /// Borrows the parent volume's `Arc<dyn Backend>` + name and dispatches every
 /// op through the [`VolumeBackend`](crate::backend::VolumeBackend) trait.
-/// Local routes to `tokio::fs`; cloud routes to the authenticated volume API.
+/// Local operations stay beneath an open volume directory; cloud operations use the authenticated volume API.
 pub struct VolumeFs<'a> {
     backend: Arc<dyn Backend>,
     name: &'a str,
@@ -51,12 +58,15 @@ pub struct VolumeFsReadStream {
 }
 
 enum VolumeFsReadStreamInner {
+    #[cfg(feature = "local")]
     Local { file: tokio::fs::File, buf: Vec<u8> },
+    #[cfg(feature = "cloud")]
     Cloud(Pin<Box<dyn Stream<Item = MicrosandboxResult<Bytes>> + Send>>),
 }
 
 impl VolumeFsReadStream {
     /// Construct from an already-opened file. Local impl only.
+    #[cfg(feature = "local")]
     pub(crate) fn from_file(file: tokio::fs::File) -> Self {
         Self {
             inner: VolumeFsReadStreamInner::Local {
@@ -67,6 +77,7 @@ impl VolumeFsReadStream {
     }
 
     /// Construct from a cloud HTTP response stream.
+    #[cfg(feature = "cloud")]
     pub(crate) fn from_stream(
         stream: Pin<Box<dyn Stream<Item = MicrosandboxResult<Bytes>> + Send>>,
     ) -> Self {
@@ -82,7 +93,9 @@ pub struct VolumeFsWriteSink {
 }
 
 enum VolumeFsWriteSinkInner {
+    #[cfg(feature = "local")]
     Local(tokio::fs::File),
+    #[cfg(feature = "cloud")]
     Cloud {
         tx: mpsc::Sender<Bytes>,
         completion: JoinHandle<MicrosandboxResult<()>>,
@@ -91,6 +104,7 @@ enum VolumeFsWriteSinkInner {
 
 impl VolumeFsWriteSink {
     /// Construct from an already-opened file. Local impl only.
+    #[cfg(feature = "local")]
     pub(crate) fn from_file(file: tokio::fs::File) -> Self {
         Self {
             inner: VolumeFsWriteSinkInner::Local(file),
@@ -98,6 +112,7 @@ impl VolumeFsWriteSink {
     }
 
     /// Construct from a channel-backed cloud upload.
+    #[cfg(feature = "cloud")]
     pub(crate) fn from_channel(
         tx: mpsc::Sender<Bytes>,
         completion: JoinHandle<MicrosandboxResult<()>>,
@@ -250,7 +265,13 @@ impl VolumeFsReadStream {
     ///
     /// Returns `None` at EOF.
     pub async fn recv(&mut self) -> MicrosandboxResult<Option<Bytes>> {
+        // With neither backend enabled the private enum has no constructors. Match the value,
+        // not its reference: references are considered inhabited even for an empty enum.
+        #[cfg(not(any(feature = "local", feature = "cloud")))]
+        match self.inner {}
+        #[cfg(any(feature = "local", feature = "cloud"))]
         match &mut self.inner {
+            #[cfg(feature = "local")]
             VolumeFsReadStreamInner::Local { file, buf } => {
                 let n = file.read(buf).await?;
                 if n == 0 {
@@ -259,6 +280,7 @@ impl VolumeFsReadStream {
                     Ok(Some(Bytes::copy_from_slice(&buf[..n])))
                 }
             }
+            #[cfg(feature = "cloud")]
             VolumeFsReadStreamInner::Cloud(stream) => stream.next().await.transpose(),
         }
     }
@@ -280,11 +302,19 @@ impl VolumeFsReadStream {
 impl VolumeFsWriteSink {
     /// Write a chunk of data to the file.
     pub async fn write(&mut self, data: impl AsRef<[u8]>) -> MicrosandboxResult<()> {
+        #[cfg(not(any(feature = "local", feature = "cloud")))]
+        {
+            let _ = data;
+            match self.inner {}
+        }
+        #[cfg(any(feature = "local", feature = "cloud"))]
         match &mut self.inner {
+            #[cfg(feature = "local")]
             VolumeFsWriteSinkInner::Local(file) => {
                 file.write_all(data.as_ref()).await?;
                 Ok(())
             }
+            #[cfg(feature = "cloud")]
             VolumeFsWriteSinkInner::Cloud { tx, .. } => tx
                 .send(Bytes::copy_from_slice(data.as_ref()))
                 .await
@@ -295,10 +325,12 @@ impl VolumeFsWriteSink {
     /// Flush and close the file.
     pub async fn close(self) -> MicrosandboxResult<()> {
         match self.inner {
+            #[cfg(feature = "local")]
             VolumeFsWriteSinkInner::Local(mut file) => {
                 file.flush().await?;
                 Ok(())
             }
+            #[cfg(feature = "cloud")]
             VolumeFsWriteSinkInner::Cloud { tx, completion } => {
                 drop(tx);
                 completion.await.map_err(|error| {
@@ -313,6 +345,16 @@ impl VolumeFsWriteSink {
 // Module: local (free fn impls called by LocalBackend's VolumeBackend impl)
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(feature = "local")]
+#[path = "fs_root.rs"]
+mod rooted;
+
+/// Internal capability adapter shared with native SDK bindings.
+#[cfg(feature = "local")]
+#[doc(hidden)]
+pub use rooted::RootedVolumeFs;
+
+#[cfg(feature = "local")]
 pub(crate) mod local {
     //! Local FS ops keyed by `(volume_name, rel_path)`.
     //!
@@ -322,9 +364,10 @@ pub(crate) mod local {
     //! so `with_backend` scoping and explicit `LocalBackend::builder()`
     //! constructions correctly route to the right host directory.
 
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use bytes::Bytes;
+    use cap_std::fs::Metadata;
 
     use crate::{
         MicrosandboxError, MicrosandboxResult,
@@ -332,66 +375,22 @@ pub(crate) mod local {
         sandbox::fs::{FsEntry, FsEntryKind, FsMetadata},
     };
 
-    use super::{VolumeFsReadStream, VolumeFsWriteSink};
+    use super::{VolumeFsReadStream, VolumeFsWriteSink, rooted::RootedVolumeFs};
 
-    /// Resolve a relative path against the volume root, preventing path traversal.
-    pub(crate) fn resolve_relative(root: &Path, path: &str) -> MicrosandboxResult<PathBuf> {
-        // Strip leading slash for joining.
-        let clean = path.strip_prefix('/').unwrap_or(path);
-
-        let joined = root.join(clean);
-
-        // Canonicalize what exists, then check prefix. If the path doesn't exist
-        // yet (for writes), canonicalize the parent and verify.
-        let canonical = if joined.exists() {
-            joined
-                .canonicalize()
-                .map_err(|e| MicrosandboxError::SandboxFsOps(format!("resolve path: {e}")))?
-        } else {
-            // Find the deepest existing ancestor.
-            let mut ancestor = joined.as_path();
-            loop {
-                if let Some(parent) = ancestor.parent() {
-                    if parent.exists() {
-                        let canon_parent = parent.canonicalize().map_err(|e| {
-                            MicrosandboxError::SandboxFsOps(format!("resolve parent: {e}"))
-                        })?;
-                        // Reconstruct with remaining components.
-                        let remainder = joined.strip_prefix(parent).unwrap_or(Path::new(""));
-                        break canon_parent.join(remainder);
-                    }
-                    ancestor = parent;
-                } else {
-                    break joined.clone();
-                }
-            }
-        };
-
-        // Ensure the root itself is canonicalized for comparison.
-        let canon_root = if root.exists() {
-            root.canonicalize()
-                .map_err(|e| MicrosandboxError::SandboxFsOps(format!("resolve root: {e}")))?
-        } else {
-            root.to_path_buf()
-        };
-
-        if !canonical.starts_with(&canon_root) {
-            return Err(MicrosandboxError::SandboxFsOps(
-                "path traversal outside volume root".into(),
-            ));
-        }
-
-        Ok(canonical)
-    }
-
-    /// Volume root directory on the host for the named volume.
-    fn volume_root(local: &LocalBackend, name: &str) -> PathBuf {
-        local.volume_path(name)
-    }
-
-    /// Resolve `(volume_name, path)` to a canonical host path.
-    fn resolve(local: &LocalBackend, name: &str, path: &str) -> MicrosandboxResult<PathBuf> {
-        resolve_relative(&volume_root(local, name), path)
+    // Run directory-relative filesystem calls off the async executor. Every operation
+    // opens its root once and keeps that capability through resolution and use.
+    async fn with_root<T: Send + 'static>(
+        local: &LocalBackend,
+        name: &str,
+        operation: impl FnOnce(RootedVolumeFs) -> MicrosandboxResult<T> + Send + 'static,
+    ) -> MicrosandboxResult<T> {
+        crate::volume::validate_volume_name(name)?;
+        let root_path = local.volume_path(name);
+        tokio::task::spawn_blocking(move || operation(RootedVolumeFs::open(&root_path)?))
+            .await
+            .map_err(|error| {
+                MicrosandboxError::SandboxFsOps(format!("volume filesystem task failed: {error}"))
+            })?
     }
 
     /// Normalize a volume-relative path to `/`-separated absolute form
@@ -421,9 +420,11 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<Bytes> {
-        let full = resolve(local, name, path)?;
-        let data = tokio::fs::read(&full).await?;
-        Ok(Bytes::from(data))
+        let path = path.to_owned();
+        with_root(local, name, move |root| {
+            Ok(Bytes::from(root.dir.read(root.resolve(&path)?)?))
+        })
+        .await
     }
 
     pub(crate) async fn read_to_string(
@@ -431,9 +432,11 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<String> {
-        let full = resolve(local, name, path)?;
-        let data = tokio::fs::read_to_string(&full).await?;
-        Ok(data)
+        let path = path.to_owned();
+        with_root(local, name, move |root| {
+            Ok(root.dir.read_to_string(root.resolve(&path)?)?)
+        })
+        .await
     }
 
     pub(crate) async fn write(
@@ -442,12 +445,15 @@ pub(crate) mod local {
         path: &str,
         data: &[u8],
     ) -> MicrosandboxResult<()> {
-        let full = resolve(local, name, path)?;
-        if let Some(parent) = full.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&full, data).await?;
-        Ok(())
+        let path = path.to_owned();
+        let data = data.to_vec();
+        with_root(local, name, move |root| {
+            let path = root.resolve(&path)?;
+            root.ensure_parent(&path)?;
+            root.dir.write(path, data)?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn list(
@@ -455,30 +461,23 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<Vec<FsEntry>> {
-        let root = volume_root(local, name);
-        let full = resolve_relative(&root, path)?;
-        // Present entries as the request path joined with '/'. Deriving them from
-        // host paths instead (strip_prefix + display) breaks on Windows: `display()`
-        // renders host separators, and canonicalization adds a `\\?\` verbatim
-        // prefix that defeats the strip against the un-canonicalized root.
-        let base = normalize_slash_path(path);
-        let mut dir = tokio::fs::read_dir(&full).await?;
-        let mut entries = Vec::new();
-
-        while let Some(entry) = dir.next_entry().await? {
-            let entry_name = entry.file_name();
-            let entry_path = if base == "/" {
-                format!("/{}", entry_name.to_string_lossy())
-            } else {
-                format!("{base}/{}", entry_name.to_string_lossy())
-            };
-
-            match entry.metadata().await {
-                Ok(meta) => {
-                    entries.push(metadata_to_entry(&entry_path, &meta));
-                }
-                Err(_) => {
-                    entries.push(FsEntry {
+        let path = path.to_owned();
+        with_root(local, name, move |root| {
+            // Keep the public slash-separated spelling separate from host path handling.
+            let base = normalize_slash_path(&path);
+            let dir = root.dir.read_dir(root.resolve(&path)?)?;
+            let mut entries = Vec::new();
+            for entry in dir {
+                let entry = entry?;
+                let entry_name = entry.file_name();
+                let entry_path = if base == "/" {
+                    format!("/{}", entry_name.to_string_lossy())
+                } else {
+                    format!("{base}/{}", entry_name.to_string_lossy())
+                };
+                match entry.metadata() {
+                    Ok(meta) => entries.push(metadata_to_entry(&entry_path, &meta)),
+                    Err(_) => entries.push(FsEntry {
                         path: entry_path,
                         kind: FsEntryKind::Other,
                         size: 0,
@@ -487,12 +486,12 @@ pub(crate) mod local {
                         gid: 0,
                         accessed: None,
                         modified: None,
-                    });
+                    }),
                 }
             }
-        }
-
-        Ok(entries)
+            Ok(entries)
+        })
+        .await
     }
 
     pub(crate) async fn mkdir(
@@ -500,9 +499,12 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<()> {
-        let full = resolve(local, name, path)?;
-        tokio::fs::create_dir_all(&full).await?;
-        Ok(())
+        let path = path.to_owned();
+        with_root(local, name, move |root| {
+            root.dir.create_dir_all(root.resolve(&path)?)?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn remove(
@@ -511,15 +513,18 @@ pub(crate) mod local {
         path: &str,
         recursive: bool,
     ) -> MicrosandboxResult<()> {
-        let root = volume_root(local, name);
-        let full = resolve_relative(&root, path)?;
-        if recursive {
-            ensure_not_volume_root(&root, &full, "remove_dir")?;
-            tokio::fs::remove_dir_all(&full).await?;
-        } else {
-            tokio::fs::remove_file(&full).await?;
-        }
-        Ok(())
+        let path = path.to_owned();
+        with_root(local, name, move |root| {
+            let path = root.resolve_entry(&path)?;
+            ensure_not_volume_root(&path, if recursive { "remove_dir" } else { "remove" })?;
+            if recursive {
+                root.remove_dir_all(&path)?;
+            } else {
+                root.dir.remove_file(path)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn copy(
@@ -528,15 +533,16 @@ pub(crate) mod local {
         from: &str,
         to: &str,
     ) -> MicrosandboxResult<()> {
-        let src = resolve(local, name, from)?;
-        let dst = resolve(local, name, to)?;
-
-        if let Some(parent) = dst.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        tokio::fs::copy(&src, &dst).await?;
-        Ok(())
+        let from = from.to_owned();
+        let to = to.to_owned();
+        with_root(local, name, move |root| {
+            let source = root.resolve(&from)?;
+            let destination = root.resolve(&to)?;
+            root.ensure_parent(&destination)?;
+            root.dir.copy(source, &root.dir, destination)?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn rename(
@@ -545,15 +551,18 @@ pub(crate) mod local {
         from: &str,
         to: &str,
     ) -> MicrosandboxResult<()> {
-        let src = resolve(local, name, from)?;
-        let dst = resolve(local, name, to)?;
-
-        if let Some(parent) = dst.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        tokio::fs::rename(&src, &dst).await?;
-        Ok(())
+        let from = from.to_owned();
+        let to = to.to_owned();
+        with_root(local, name, move |root| {
+            let source = root.resolve_entry(&from)?;
+            let destination = root.resolve_entry(&to)?;
+            ensure_not_volume_root(&source, "rename")?;
+            ensure_not_volume_root(&destination, "rename")?;
+            root.ensure_parent(&destination)?;
+            root.dir.rename(source, &root.dir, destination)?;
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn stat(
@@ -561,9 +570,13 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<FsMetadata> {
-        let full = resolve(local, name, path)?;
-        let meta = tokio::fs::symlink_metadata(&full).await?;
-        Ok(std_metadata_to_fs(&meta))
+        let path = path.to_owned();
+        with_root(local, name, move |root| {
+            Ok(std_metadata_to_fs(
+                &root.dir.symlink_metadata(root.resolve_entry(&path)?)?,
+            ))
+        })
+        .await
     }
 
     pub(crate) async fn exists(
@@ -571,8 +584,12 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<bool> {
-        let full = resolve(local, name, path)?;
-        Ok(tokio::fs::try_exists(&full).await.unwrap_or(false))
+        let path = path.to_owned();
+        with_root(local, name, move |root| {
+            // Only absence is false: confinement and permission failures remain errors.
+            Ok(root.dir.try_exists(root.resolve(&path)?)?)
+        })
+        .await
     }
 
     pub(crate) async fn read_stream(
@@ -580,9 +597,14 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<VolumeFsReadStream> {
-        let full = resolve(local, name, path)?;
-        let file = tokio::fs::File::open(&full).await?;
-        Ok(VolumeFsReadStream::from_file(file))
+        let path = path.to_owned();
+        let file = with_root(local, name, move |root| {
+            Ok(root.dir.open(root.resolve(&path)?)?.into_std())
+        })
+        .await?;
+        Ok(VolumeFsReadStream::from_file(tokio::fs::File::from_std(
+            file,
+        )))
     }
 
     pub(crate) async fn write_stream(
@@ -590,36 +612,38 @@ pub(crate) mod local {
         name: &str,
         path: &str,
     ) -> MicrosandboxResult<VolumeFsWriteSink> {
-        let full = resolve(local, name, path)?;
-        if let Some(parent) = full.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = tokio::fs::File::create(&full).await?;
-        Ok(VolumeFsWriteSink::from_file(file))
+        let path = path.to_owned();
+        let file = with_root(local, name, move |root| {
+            let path = root.resolve(&path)?;
+            root.ensure_parent(&path)?;
+            Ok(root.dir.create(path)?.into_std())
+        })
+        .await?;
+        Ok(VolumeFsWriteSink::from_file(tokio::fs::File::from_std(
+            file,
+        )))
     }
 
-    //----------------------------------------------------------------------------------------------
-    // Functions: helpers
-    //----------------------------------------------------------------------------------------------
-
-    fn ensure_not_volume_root(root: &Path, path: &Path, operation: &str) -> MicrosandboxResult<()> {
-        let canon_root = if root.exists() {
-            root.canonicalize()
-                .map_err(|e| MicrosandboxError::SandboxFsOps(format!("resolve root: {e}")))?
-        } else {
-            root.to_path_buf()
-        };
-
-        if path == canon_root {
+    fn ensure_not_volume_root(path: &Path, operation: &str) -> MicrosandboxResult<()> {
+        // A missing suffix can retain `..` to preserve OS semantics. Check its
+        // textual destination too, before a write creates those missing parents.
+        let mut depth = 0usize;
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(_) => depth += 1,
+                std::path::Component::ParentDir => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth == 0 {
             return Err(MicrosandboxError::SandboxFsOps(format!(
                 "{operation} cannot target the volume root"
             )));
         }
-
         Ok(())
     }
 
-    fn std_kind(meta: &std::fs::Metadata) -> FsEntryKind {
+    fn std_kind(meta: &Metadata) -> FsEntryKind {
         if meta.is_file() {
             FsEntryKind::File
         } else if meta.is_dir() {
@@ -631,21 +655,21 @@ pub(crate) mod local {
         }
     }
 
-    fn std_modified(meta: &std::fs::Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
+    fn std_modified(meta: &Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
         meta.modified()
             .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|t| t.into_std().duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0).unwrap_or_default())
     }
 
-    fn std_accessed(meta: &std::fs::Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
+    fn std_accessed(meta: &Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
         meta.accessed()
             .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|t| t.into_std().duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0).unwrap_or_default())
     }
 
-    fn metadata_to_entry(path: &str, meta: &std::fs::Metadata) -> FsEntry {
+    fn metadata_to_entry(path: &str, meta: &Metadata) -> FsEntry {
         FsEntry {
             path: path.to_string(),
             kind: std_kind(meta),
@@ -658,14 +682,14 @@ pub(crate) mod local {
         }
     }
 
-    fn std_created(meta: &std::fs::Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
+    fn std_created(meta: &Metadata) -> Option<chrono::DateTime<chrono::Utc>> {
         meta.created()
             .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|t| t.into_std().duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0).unwrap_or_default())
     }
 
-    fn std_metadata_to_fs(meta: &std::fs::Metadata) -> FsMetadata {
+    fn std_metadata_to_fs(meta: &Metadata) -> FsMetadata {
         FsMetadata {
             kind: std_kind(meta),
             size: meta.len(),
@@ -680,28 +704,28 @@ pub(crate) mod local {
     }
 
     #[cfg(unix)]
-    fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
-        use std::os::unix::fs::MetadataExt;
+    fn metadata_mode(meta: &Metadata) -> u32 {
+        use cap_std::fs::MetadataExt;
 
         meta.mode()
     }
 
     #[cfg(unix)]
-    fn metadata_uid(meta: &std::fs::Metadata) -> u32 {
-        use std::os::unix::fs::MetadataExt;
+    fn metadata_uid(meta: &Metadata) -> u32 {
+        use cap_std::fs::MetadataExt;
 
         meta.uid()
     }
 
     #[cfg(unix)]
-    fn metadata_gid(meta: &std::fs::Metadata) -> u32 {
-        use std::os::unix::fs::MetadataExt;
+    fn metadata_gid(meta: &Metadata) -> u32 {
+        use cap_std::fs::MetadataExt;
 
         meta.gid()
     }
 
     #[cfg(windows)]
-    fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
+    fn metadata_mode(meta: &Metadata) -> u32 {
         match (meta.is_dir(), meta.permissions().readonly()) {
             (true, true) => 0o555,
             (true, false) => 0o755,
@@ -711,12 +735,12 @@ pub(crate) mod local {
     }
 
     #[cfg(windows)]
-    fn metadata_uid(_meta: &std::fs::Metadata) -> u32 {
+    fn metadata_uid(_meta: &Metadata) -> u32 {
         0
     }
 
     #[cfg(windows)]
-    fn metadata_gid(_meta: &std::fs::Metadata) -> u32 {
+    fn metadata_gid(_meta: &Metadata) -> u32 {
         0
     }
 }
@@ -725,7 +749,7 @@ pub(crate) mod local {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "local"))]
 mod tests {
     use super::*;
     use crate::backend::LocalBackend;
@@ -803,9 +827,356 @@ mod tests {
         assert!(!root.join("nested").exists());
     }
 
+    #[tokio::test]
+    async fn all_operations_reject_missing_suffix_traversal() {
+        let (temp, backend) = local_backend().await;
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside").unwrap();
+        local::write(&backend, "vol", "source", b"inside")
+            .await
+            .unwrap();
+        for path in ["../outside/sentinel", "missing/../../../outside/sentinel"] {
+            assert!(local::read(&backend, "vol", path).await.is_err());
+            assert!(local::read_to_string(&backend, "vol", path).await.is_err());
+            assert!(local::read_stream(&backend, "vol", path).await.is_err());
+            assert!(
+                local::write(&backend, "vol", path, b"changed")
+                    .await
+                    .is_err()
+            );
+            assert!(local::write_stream(&backend, "vol", path).await.is_err());
+            assert!(local::list(&backend, "vol", path).await.is_err());
+            assert!(local::mkdir(&backend, "vol", path).await.is_err());
+            assert!(local::stat(&backend, "vol", path).await.is_err());
+            assert!(local::exists(&backend, "vol", path).await.is_err());
+            assert!(local::remove(&backend, "vol", path, false).await.is_err());
+            assert!(local::remove(&backend, "vol", path, true).await.is_err());
+            assert!(
+                local::copy(&backend, "vol", path, "destination")
+                    .await
+                    .is_err()
+            );
+            assert!(local::copy(&backend, "vol", "source", path).await.is_err());
+            assert!(
+                local::rename(&backend, "vol", path, "destination")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                local::rename(&backend, "vol", "source", path)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert_eq!(
+            local::read(&backend, "vol", "source").await.unwrap(),
+            b"inside"[..]
+        );
+        assert!(!backend.volume_path("vol").join("missing").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_parent_components_keep_os_lookup_semantics() {
+        let (_temp, backend) = local_backend().await;
+        local::write(&backend, "vol", "file", b"inside")
+            .await
+            .unwrap();
+        assert!(
+            local::read(&backend, "vol", "missing/../file")
+                .await
+                .is_err()
+        );
+        assert!(!backend.volume_path("vol").join("missing").exists());
+        local::write(&backend, "vol", "missing/../file", b"updated")
+            .await
+            .unwrap();
+        assert!(backend.volume_path("vol").join("missing").is_dir());
+        assert_eq!(
+            local::read(&backend, "vol", "file").await.unwrap(),
+            b"updated"[..]
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_parent_components_keep_windows_lookup_semantics() {
+        let (_temp, backend) = local_backend().await;
+        local::write(&backend, "vol", "file", b"inside")
+            .await
+            .unwrap();
+        // Win32 normalizes this spelling before opening it; unlike Unix, the
+        // canceled component need not exist. Preserve the platform's API behavior.
+        let expected = std::fs::read(backend.volume_path("vol").join("missing/../file")).unwrap();
+        assert_eq!(
+            local::read(&backend, "vol", "missing/../file")
+                .await
+                .unwrap(),
+            expected
+        );
+        local::write(&backend, "vol", "missing/../file", b"updated")
+            .await
+            .unwrap();
+        assert_eq!(
+            local::read(&backend, "vol", "file").await.unwrap(),
+            b"updated"[..]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_reports_links_without_reading_external_target_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, backend) = local_backend().await;
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, vec![0u8; 8192]).unwrap();
+        let link = backend.volume_path("vol").join("link");
+        symlink(&outside, &link).unwrap();
+        let entries = local::list(&backend, "vol", "/").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, crate::sandbox::fs::FsEntryKind::Symlink);
+        assert_eq!(
+            entries[0].size,
+            std::fs::symlink_metadata(link).unwrap().len()
+        );
+        assert_ne!(entries[0].size, 8192);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinks_cannot_read_or_mutate_external_targets() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, backend) = local_backend().await;
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside").unwrap();
+        let root = backend.volume_path("vol");
+        symlink(&outside, root.join("link")).unwrap();
+        symlink(outside.join("missing"), root.join("dangling")).unwrap();
+        local::write(&backend, "vol", "source", b"inside")
+            .await
+            .unwrap();
+
+        for path in ["link/sentinel", "link/new/child", "dangling/child"] {
+            assert!(local::read(&backend, "vol", path).await.is_err());
+            assert!(local::read_to_string(&backend, "vol", path).await.is_err());
+            assert!(local::read_stream(&backend, "vol", path).await.is_err());
+            assert!(
+                local::write(&backend, "vol", path, b"changed")
+                    .await
+                    .is_err()
+            );
+            assert!(local::write_stream(&backend, "vol", path).await.is_err());
+            assert!(local::list(&backend, "vol", path).await.is_err());
+            assert!(local::mkdir(&backend, "vol", path).await.is_err());
+            assert!(local::stat(&backend, "vol", path).await.is_err());
+            assert!(local::exists(&backend, "vol", path).await.is_err());
+            assert!(local::remove(&backend, "vol", path, false).await.is_err());
+            assert!(local::remove(&backend, "vol", path, true).await.is_err());
+            assert!(
+                local::copy(&backend, "vol", path, "destination")
+                    .await
+                    .is_err()
+            );
+            assert!(local::copy(&backend, "vol", "source", path).await.is_err());
+            assert!(
+                local::rename(&backend, "vol", path, "destination")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                local::rename(&backend, "vol", "source", path)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+        assert!(!root.join("destination").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_volume_links_and_parent_components_keep_their_meaning() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, backend) = local_backend().await;
+        let root = backend.volume_path("vol");
+        local::write(&backend, "vol", "/nested/deeper/file", b"inside")
+            .await
+            .unwrap();
+        local::write(&backend, "vol", "/nested/peer", b"peer")
+            .await
+            .unwrap();
+        symlink("nested/deeper", root.join("relative")).unwrap();
+        symlink(root.join("nested/deeper"), root.join("absolute")).unwrap();
+        symlink("nested/missing", root.join("dangling-inside")).unwrap();
+        for path in [
+            "relative/../peer",
+            "absolute/../peer",
+            "/nested/deeper/../peer",
+        ] {
+            assert_eq!(
+                local::read(&backend, "vol", path).await.unwrap(),
+                b"peer"[..]
+            );
+        }
+        local::write(&backend, "vol", "dangling-inside", b"created")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("nested/missing")).unwrap(),
+            b"created"
+        );
+        assert!(!local::exists(&backend, "vol", "missing").await.unwrap());
+        assert_eq!(
+            local::stat(&backend, "vol", "absolute/file")
+                .await
+                .unwrap()
+                .size,
+            6
+        );
+        local::copy(&backend, "vol", "absolute/file", "copied/new/file")
+            .await
+            .unwrap();
+        local::rename(&backend, "vol", "copied/new/file", "renamed/new/file")
+            .await
+            .unwrap();
+        assert_eq!(
+            local::read(&backend, "vol", "renamed/new/file")
+                .await
+                .unwrap(),
+            b"inside"[..]
+        );
+        local::remove(&backend, "vol", "renamed", true)
+            .await
+            .unwrap();
+        assert!(!root.join("renamed").exists());
+        // Entry operations preserve the link itself, including a missing target.
+        symlink("nested/missing-target", root.join("final-link")).unwrap();
+        assert_eq!(
+            local::stat(&backend, "vol", "final-link")
+                .await
+                .unwrap()
+                .kind,
+            crate::sandbox::fs::FsEntryKind::Symlink
+        );
+        local::rename(&backend, "vol", "final-link", "moved-link")
+            .await
+            .unwrap();
+        assert!(
+            root.join("moved-link")
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink()
+        );
+        local::remove(&backend, "vol", "moved-link", false)
+            .await
+            .unwrap();
+        assert!(root.join("moved-link").symlink_metadata().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streams_keep_opened_file_after_parent_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, backend) = local_backend().await;
+        let root = backend.volume_path("vol");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("read"), b"outside").unwrap();
+        std::fs::write(outside.join("write"), b"outside").unwrap();
+        local::write(&backend, "vol", "nested/read", b"inside")
+            .await
+            .unwrap();
+        let reader = local::read_stream(&backend, "vol", "nested/read")
+            .await
+            .unwrap();
+        let mut writer = local::write_stream(&backend, "vol", "nested/write")
+            .await
+            .unwrap();
+        std::fs::rename(root.join("nested"), root.join("moved")).unwrap();
+        symlink(&outside, root.join("nested")).unwrap();
+        assert_eq!(reader.collect().await.unwrap(), b"inside"[..]);
+        writer.write(b"new inside").await.unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(
+            std::fs::read(root.join("moved/write")).unwrap(),
+            b"new inside"
+        );
+        assert_eq!(std::fs::read(outside.join("write")).unwrap(), b"outside");
+    }
+
+    #[tokio::test]
+    async fn invalid_volume_names_cannot_choose_a_different_root() {
+        let (_temp, backend) = local_backend().await;
+        for name in ["..", ".", "../vol", "/tmp"] {
+            assert!(local::write(&backend, name, "file", b"data").await.is_err());
+            assert!(local::read(&backend, name, "file").await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_and_recursive_remove_cannot_target_root_aliases() {
+        let (_temp, backend) = local_backend().await;
+        local::write(&backend, "vol", "nested/file", b"data")
+            .await
+            .unwrap();
+        let paths = ["", "/", ".", "nested/..", "missing/.."];
+        for path in paths {
+            assert!(local::remove(&backend, "vol", path, true).await.is_err());
+            assert!(local::rename(&backend, "vol", path, "moved").await.is_err());
+            assert!(
+                local::rename(&backend, "vol", "nested", path)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            local::read(&backend, "vol", "nested/file").await.unwrap(),
+            b"data"[..]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relocated_roots_and_alternate_internal_links_remain_usable() {
+        use std::os::unix::fs::symlink;
+        let (temp, backend) = local_backend().await;
+        let root = backend.volume_path("vol");
+        let moved = temp.path().join("relocated");
+        std::fs::rename(&root, &moved).unwrap();
+        symlink(&moved, &root).unwrap();
+        let alias = temp.path().join("shortcut");
+        symlink(&moved, &alias).unwrap();
+        symlink(alias.join("report"), moved.join("report-link")).unwrap();
+        local::write(&backend, "vol", "report-link", b"inside")
+            .await
+            .unwrap();
+        assert_eq!(
+            local::read(&backend, "vol", "report-link").await.unwrap(),
+            b"inside"[..]
+        );
+        symlink(".", moved.join("root-link")).unwrap();
+        local::rename(&backend, "vol", "root-link", "renamed-link")
+            .await
+            .unwrap();
+        local::remove(&backend, "vol", "renamed-link", false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(moved.join("report")).unwrap(), b"inside");
+    }
+
     async fn local_backend() -> (tempfile::TempDir, LocalBackend) {
         let temp = tempfile::tempdir().unwrap();
         let backend = LocalBackend::builder()
+            .config_path(temp.path().join("config.json"))
+            .managed_config_path(temp.path().join("managed.json"))
             .home(temp.path())
             .build()
             .await

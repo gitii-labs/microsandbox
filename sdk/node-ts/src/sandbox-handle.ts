@@ -1,4 +1,11 @@
-import { withMappedErrors } from "./internal/error-mapping.js";
+import { remapKeysToCamel } from "./internal/config.js";
+import { mapNapiError, withMappedErrors } from "./internal/error-mapping.js";
+import { validateStopTimeout } from "./internal/stop.js";
+import {
+  compactionResultFromJson,
+  type DiskCompactionOptions,
+  type DiskCompactionResult,
+} from "./compact.js";
 import {
   modificationPlanFromJson,
   modifyOptionsToNapi,
@@ -6,7 +13,12 @@ import {
   type SandboxModificationPlan,
 } from "./modify.js";
 import { metricsFromNapi } from "./internal/metrics.js";
-import type { NapiSandboxConfig, NapiSandboxHandle } from "./internal/napi.js";
+import type {
+  NapiSandboxConfig,
+  NapiSandboxDestroyOptions,
+  NapiSandboxHandle,
+  NapiSandboxRestartOptions,
+} from "./internal/napi.js";
 import {
   LogEntry,
   LogStream,
@@ -24,6 +36,7 @@ import {
 import type { SandboxStatus } from "./sandbox-status.js";
 import type { SandboxMetrics } from "./metrics.js";
 import { Snapshot } from "./snapshot.js";
+import { storageUsageFromHandle, type StorageItemUsage } from "./storage.js";
 
 export interface SandboxStopResult {
   readonly name: string;
@@ -34,10 +47,15 @@ export interface SandboxStopResult {
   readonly source: string | null;
 }
 
+export type RestartOptions = NapiSandboxRestartOptions;
+export type DestroyOptions = NapiSandboxDestroyOptions;
+
 export class SandboxHandle {
   private readonly inner: NapiSandboxHandle;
   /** Sandbox name. Names are limited to 128 UTF-8 bytes. */
   readonly name: string;
+  /** Stable identity that changes when this name is removed and recreated. */
+  readonly id: string;
   readonly status: SandboxStatus;
   /** Backend retained by this handle. */
   readonly backendKind: "local" | "cloud";
@@ -49,6 +67,7 @@ export class SandboxHandle {
   constructor(inner: NapiSandboxHandle) {
     this.inner = inner;
     this.name = inner.name;
+    this.id = inner.id;
     this.status = inner.status as SandboxStatus;
     this.backendKind = inner.backendKind;
     this.configJson = inner.configJson;
@@ -65,6 +84,11 @@ export class SandboxHandle {
   async refresh(): Promise<SandboxHandle> {
     const raw = await withMappedErrors(() => this.inner.refresh());
     return new SandboxHandle(raw);
+  }
+
+  /** Observe the managed sandbox directory using this handle's captured backend. */
+  async storageUsage(): Promise<StorageItemUsage> {
+    return storageUsageFromHandle(this.inner, "SandboxHandle.storageUsage()");
   }
 
   /** Get point-in-time metrics. */
@@ -104,6 +128,14 @@ export class SandboxHandle {
     return modificationPlanFromJson(raw);
   }
 
+  /** Compact sealed root and owned-data disk layers, running or stopped. */
+  async compact(opts?: DiskCompactionOptions): Promise<DiskCompactionResult> {
+    const raw = await withMappedErrors(() =>
+      this.inner.compact(opts?.layers, opts?.dryRun, opts?.disk, opts?.rootDiskOnly),
+    );
+    return compactionResultFromJson(raw);
+  }
+
   /** Resume in attached mode. */
   async start(): Promise<Sandbox> {
     const raw = await withMappedErrors(() => this.inner.start());
@@ -138,11 +170,62 @@ export class SandboxHandle {
   }
 
   /**
-   * Gracefully shut down within 150_000 ms; use `stopWithTimeout` to override.
-   * Throws on deadline expiry or unclean exit without automatically killing.
+   * Connect when this exact sandbox is running, wait while it is starting, or
+   * start it when it is created, stopped, or crashed.
+   *
+   * `detached` applies only when a start is required. A same-name replacement
+   * is rejected instead of becoming the target of this handle.
+   */
+  async connectOrStart(options?: { detached?: boolean }): Promise<Sandbox> {
+    const detached = options?.detached ?? false;
+    const raw = await withMappedErrors(() =>
+      this.inner.connectOrStart(detached),
+    );
+    // Connecting to an existing running sandbox never takes lifecycle
+    // ownership; only a start can return an owning attached handle.
+    return new Sandbox(raw, this.name);
+  }
+
+  /**
+   * Wait indefinitely for graceful shutdown and release of the targeted runtime's
+   * ownership. No implicit kill; use `stopWithTimeout` for a bounded wait.
    */
   async stop(): Promise<void> {
     await withMappedErrors(() => this.inner.stop());
+  }
+
+  /** @deprecated Use fork() for live execution duplication. */
+  async branch(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
+    return this.fork(name, options);
+  }
+
+  /** @deprecated Use forkMany() for capture-once live duplication. */
+  async branchMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
+    return this.forkMany(names, options);
+  }
+
+  /** Create an independent local CoW child without a durable full snapshot. */
+  async fork(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
+    const child = await withMappedErrors(() => this.inner.fork(name, options.recordIntegrity, options.guestFlush));
+    return new Sandbox(child, name, false);
+  }
+
+  /** Capture once; return each named child's startup outcome in input order. */
+  async forkMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
+    const outcomes = await withMappedErrors(() => this.inner.forkMany(names, options.recordIntegrity, options.guestFlush));
+    return outcomes.map(o => o.sandbox
+      ? { name: o.name, sandbox: new Sandbox(o.sandbox, o.name, false) }
+      : { name: o.name, error: mapNapiError(new Error(o.error ?? "Child startup failed")) as Error });
+  }
+
+  /** Suspend this resident VM without creating a snapshot. */
+  async pause(options: { guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<void> {
+    await withMappedErrors(() => this.inner.pause(options.guestFlush));
+  }
+
+  /** Explicit resident resume; no snapshot is created. */
+  async resume(): Promise<void> {
+    await withMappedErrors(() => this.inner.resume());
   }
 
   async requestStop(): Promise<void> {
@@ -150,11 +233,11 @@ export class SandboxHandle {
   }
 
   /**
-   * Stop gracefully with an explicit deadline in milliseconds. Throws on
-   * expiry or unclean exit. `0` is rejected — it leaves no window in which a
-   * shutdown could be confirmed; use `kill()` for a forced stop.
+   * One graceful-completion budget in milliseconds. Expiry throws StopTimeoutError
+   * without killing. Zero expires before dispatch; a delivered request may finish later.
    */
   async stopWithTimeout(timeoutMs: number): Promise<void> {
+    validateStopTimeout(timeoutMs);
     await withMappedErrors(() => this.inner.stopWithTimeout(timeoutMs));
   }
 
@@ -172,6 +255,32 @@ export class SandboxHandle {
 
   async requestDrain(): Promise<void> {
     await withMappedErrors(() => this.inner.requestDrain());
+  }
+
+  /**
+   * Wait until this exact persisted sandbox reaches `status`.
+   * This method has no built-in timeout and rejects same-name replacements.
+   */
+  async waitForStatus(status: SandboxStatus): Promise<SandboxHandle> {
+    const raw = await withMappedErrors(() => this.inner.waitForStatus(status));
+    return new SandboxHandle(raw);
+  }
+
+  /**
+   * Stop and start this exact persisted sandbox.
+   * Graceful shutdown and a ten-second convergence timeout are the defaults.
+   */
+  async restart(options?: RestartOptions): Promise<Sandbox> {
+    const raw = await withMappedErrors(() => this.inner.restart(options));
+    return new Sandbox(raw, this.name);
+  }
+
+  /**
+   * Stop and remove this exact persisted sandbox.
+   * The identity check refuses to remove a same-name replacement.
+   */
+  async destroy(options?: DestroyOptions): Promise<void> {
+    await withMappedErrors(() => this.inner.destroy(options));
   }
 
   async waitUntilStopped(): Promise<SandboxStopResult> {
@@ -212,12 +321,13 @@ export class SandboxHandle {
   }
 
   /**
-   * Snapshot this (stopped) sandbox under a bare name. Resolves under
+   * Snapshot this sandbox's disk under a bare name. Resolves under
    * `~/.microsandbox/snapshots/<name>/`. For an explicit filesystem
    * destination, move the artifact with `Snapshot.save`/`Snapshot.load`.
    *
-   * The sandbox must be stopped (or crashed); running sandboxes are
-   * rejected with a `SnapshotSandboxRunning` error.
+   * Live sources use automatic guest writeback. A paused source needs a matching
+   * prior flush and is never resumed implicitly. Use Snapshot.builder to select
+   * another guestFlush policy.
    */
   async snapshot(name: string): Promise<Snapshot> {
     const raw = await withMappedErrors(() => this.inner.snapshot(name));
@@ -241,18 +351,4 @@ function sandboxStopResultFromNapi(result: {
     observedAt: new Date(result.observedAt),
     source: result.source ?? null,
   };
-}
-
-function remapKeysToCamel(v: any): any {
-  if (Array.isArray(v)) return v.map(remapKeysToCamel);
-  if (v && typeof v === "object" && v.constructor === Object) {
-    const out: any = {};
-    for (const [k, val] of Object.entries(v)) out[snakeToCamel(k)] = remapKeysToCamel(val);
-    return out;
-  }
-  return v;
-}
-
-function snakeToCamel(s: string): string {
-  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 }

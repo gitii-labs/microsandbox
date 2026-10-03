@@ -20,6 +20,15 @@ mod m20260714_000001_add_snapshot_scope;
 mod m20260719_000001_create_cpu_allocations;
 mod m20260723_000001_snapshot_artifact_transition;
 mod m20260803_000001_create_writeback_allocations;
+mod m20260808_000001_create_memory_allocation_nodes;
+mod m20260810_000001_rebuild_sandbox_labels;
+mod m20260813_000001_share_cpu_allocations;
+mod m20260818_000001_sandbox_network_slot;
+mod m20260824_000001_mount_owner_config;
+mod m20260829_000001_split_snapshot_identity;
+mod m20260910_000001_snapshot_groups;
+mod m20260922_000001_migrate_secret_config;
+mod m20261001_000001_guest_clock_config;
 pub mod schema_metadata;
 
 use sea_orm_migration::prelude::*;
@@ -65,6 +74,19 @@ impl MigratorTrait for Migrator {
             Box::new(m20260723_000001_snapshot_artifact_transition::Migration),
             Box::new(m20260719_000001_create_cpu_allocations::Migration),
             Box::new(m20260803_000001_create_writeback_allocations::Migration),
+            Box::new(m20260808_000001_create_memory_allocation_nodes::Migration),
+            Box::new(m20260810_000001_rebuild_sandbox_labels::Migration),
+            Box::new(m20260813_000001_share_cpu_allocations::Migration),
+            Box::new(m20260824_000001_mount_owner_config::Migration),
+            // This backdated migration first shipped in v0.6.16, after the
+            // v0.6.15 mount-owner marker. Keep release order here even though
+            // the identifiers sort differently.
+            Box::new(m20260818_000001_sandbox_network_slot::Migration),
+            // Unreleased snapshot-stack migrations follow the complete released prefix.
+            Box::new(m20260829_000001_split_snapshot_identity::Migration),
+            Box::new(m20260910_000001_snapshot_groups::Migration),
+            Box::new(m20260922_000001_migrate_secret_config::Migration),
+            Box::new(m20261001_000001_guest_clock_config::Migration),
         ]
     }
 }

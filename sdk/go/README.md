@@ -11,6 +11,8 @@ For the full API reference and longer guides, use Go docs and the microsandbox d
 - [SDK overview](https://docs.microsandbox.dev/sdk/overview)
 - [Repository examples](./examples)
 
+`EnsureRuntime` reuses any complete `msb` and `libkrunfw` pair in `MSB_HOME` (or `~/.microsandbox` by default), without executing the binary or requiring its version to equal the SDK version. It refuses partial installations. The SDK version selects newly downloaded artifacts; it does not trigger replacement of an existing pair.
+
 ## Features
 
 - Hardware VM isolation with a guest Linux kernel
@@ -27,7 +29,7 @@ For the full API reference and longer guides, use Go docs and the microsandbox d
 
 - Go 1.22+
 - CGO enabled and a C compiler/toolchain available
-- Linux with KVM, macOS with Apple Silicon, or Windows 10/11 with Windows Hypervisor Platform enabled
+- Linux with KVM, macOS with Apple Silicon, or Windows 11 with WHP enabled
 
 ## Supported Platforms
 
@@ -38,7 +40,7 @@ For the full API reference and longer guides, use Go docs and the microsandbox d
 | Linux | ARM64 | Embedded FFI library |
 | Windows | x86_64, ARM64 | Embedded FFI library; runtime support is in preview |
 
-The Go binary embeds the SDK FFI library and extracts it on first use. The `msb` runtime and `libkrunfw` are installed separately into `~/.microsandbox/` by `EnsureInstalled` (`%USERPROFILE%\.microsandbox` on Windows).
+The Go binary embeds the SDK FFI library and extracts it on first use. The `msb` runtime and `libkrunfw` are installed separately into `MSB_HOME` (default `~/.microsandbox/`) by `EnsureRuntime` (`%USERPROFILE%\.microsandbox` on Windows).
 
 ## Installation
 
@@ -46,15 +48,15 @@ The Go binary embeds the SDK FFI library and extracts it on first use. The `msb`
 go get github.com/superradcompany/microsandbox/sdk/go
 ```
 
-Call `EnsureInstalled` at process startup when your program will create local sandboxes. It is idempotent and surfaces runtime download/setup failures before the first sandbox operation.
+Call `EnsureRuntime` at process startup when your program will create local sandboxes. It is idempotent and surfaces runtime download/setup failures before the first sandbox operation.
 
 ```go
-if err := microsandbox.EnsureInstalled(ctx); err != nil {
+if _, err := microsandbox.EnsureRuntime(ctx, microsandbox.RuntimeConfig{}, microsandbox.InstallOptions{}); err != nil {
     log.Fatalf("microsandbox setup: %v", err)
 }
 ```
 
-Use `IsInstalled` if you only need to check whether `msb` and `libkrunfw` are already present at the SDK install location.
+Use `IsRuntimeInstalled(RuntimeConfig{})` for a boolean availability check or `ResolveRuntime(RuntimeConfig{})` to require an existing pair and obtain its paths without installing runtime binaries. `InstallRuntime` explicitly provisions the selected source. All setup calls use the shared Rust resolver and installer; the first call may also materialize the embedded SDK FFI library.
 
 ## Quick Start
 
@@ -74,7 +76,7 @@ func main() {
     ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
     defer cancel()
 
-    if err := microsandbox.EnsureInstalled(ctx); err != nil {
+    if _, err := microsandbox.EnsureRuntime(ctx, microsandbox.RuntimeConfig{}, microsandbox.InstallOptions{}); err != nil {
         log.Fatal(err)
     }
 
@@ -104,9 +106,43 @@ func main() {
 }
 ```
 
+### Reusable Lifecycle Convergence
+
+Use `ConnectOrCreateSandbox` when a stable name should converge on one persisted sandbox. Existing configuration wins; options are used only if creation is necessary. Handles retain a stable `ID`, so lifecycle calls on stale receivers refuse to act on a replacement that reused the name.
+
+```go
+sb, err := microsandbox.ConnectOrCreateSandbox(ctx, "worker",
+    microsandbox.WithImage("python"),
+    microsandbox.WithMemory(1024),
+)
+
+fmt.Printf("%s: %s\n", sb.Name(), sb.ID())
+handle, err := microsandbox.GetSandbox(ctx, "worker")
+running, err := handle.ConnectOrStart(ctx)
+err = running.RequestStop(ctx)
+stopped, err := running.WaitForStatus(ctx, microsandbox.SandboxStatusStopped)
+restarted, err := stopped.Restart(ctx)
+err = restarted.Destroy(ctx)
+```
+
 ## Common Examples
 
 These snippets assume you already have a live `sb *microsandbox.Sandbox` and `ctx context.Context`. See [sdk/go/examples](./examples) for complete runnable programs.
+
+### Fork a Live Sandbox
+
+Forking copies a running or paused local sandbox's disk and execution state into an independent child. Memory uses copy-on-write automatically. The source keeps its previous running or paused state. Host resources require explicit bindings; see [forking and resource bindings](https://docs.microsandbox.dev/sandboxes/snapshots#forking).
+
+```go
+child, err := sb.Fork(ctx, "experiment")
+if err != nil { return err }
+defer child.Close()
+if err := child.Stop(ctx); err != nil { return err }
+```
+
+Use `ForkMany(ctx, []string{"alice", "bob"})` to capture once for several children. Inspect every returned outcome: one child's startup failure does not remove successful siblings. See the [fork API reference](https://docs.microsandbox.dev/sdk/go/sandbox#forking).
+
+Restoring starts from a saved snapshot instead. Use `WithCowMemory()` to request copy-on-write memory for a full-snapshot restore. A generation describes snapshot-history progression; a branch describes a distinct path through that history. The former live branch APIs and old CoW restore names remain deprecated aliases. See [restore migration notes](https://docs.microsandbox.dev/sandboxes/snapshots#migrating-restore-options) for the old-to-new names and language-specific deprecation notices.
 
 ### Command Execution
 
@@ -250,7 +286,7 @@ sb, err := microsandbox.CreateSandbox(ctx, "go-readme-agent",
     microsandbox.WithSecrets(microsandbox.Secret.Env(
         "OPENAI_API_KEY",
         os.Getenv("OPENAI_API_KEY"),
-        microsandbox.SecretEnvOptions{AllowHosts: []string{"api.openai.com"}},
+        microsandbox.SecretEnvOptions{Allow: []string{"api.openai.com"}},
     )),
     microsandbox.WithReplace(),
 )
@@ -317,6 +353,37 @@ if err == nil && sample != nil {
 }
 ```
 
+### Storage Usage and Runtime Cache Cleanup
+
+```go
+usage, err := microsandbox.StorageUsage(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(usage.BranchMemory.LogicalBytes)
+
+item, err := sb.StorageUsage(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(item.Name, item.LogicalBytes)
+
+preview, err := microsandbox.PruneStorage(ctx, microsandbox.StoragePruneOptions{
+    DryRun: true,
+    OlderThanSeconds: 600,
+})
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(preview.Entries)
+```
+
+Reports contain integer byte counts; optional pointer fields are `nil` when unknown. Logical bytes are file lengths, and allocated bytes may count shared CoW blocks repeatedly. They do not measure exclusive disk ownership. `sb.StorageUsage(ctx)` observes the live sandbox's managed directory through its retained backend and stable identity; host bind mounts and shared runtime-memory caches are excluded.
+
+Go's metadata-only `SandboxHandle`, `SnapshotArtifact`, and `SnapshotHandle` do not yet expose per-object storage methods because they do not retain a native backend-bound receiver. Use the detailed `Sandboxes.Items` and `Snapshots.Items` fields in `StorageUsage(ctx)` for observations through the selected backend.
+
+`PruneStorage` is an explicit cleanup operation and does not prompt. `DryRun: true` only previews; calling with `DryRun: false` rechecks ownership and removes unused runtime RAM. It retains durable snapshots, named volumes, sandbox disks, and handoff locks. Check each entry for partial errors. Logical bytes removed are reported separately from physical bytes reclaimed, which remain unknown. Remote backends and native bundles predating storage support return `ErrUnsupportedOperation`.
+
 ### Typed Errors
 
 Go SDK errors can be checked with `IsKind` and unwrapped with `errors.As`.
@@ -357,10 +424,12 @@ go run ./examples/snapshot-fork
 | `patches` | Pre-boot rootfs patches |
 | `ports` | Guest TCP port publishing |
 | `secrets` | Secret placeholder injection |
-| `snapshot-fork` | Snapshot a stopped sandbox and boot a fork |
+| `snapshot-fork` | Snapshot a stopped sandbox and restore a fresh sandbox |
 | `streaming` | Streaming exec, signals, and cancellation |
 | `tls` | TLS interception configuration |
 | `volumes` | Named volume lifecycle |
+
+The `snapshot-fork` example keeps its historical directory name; it demonstrates restoring a saved disk snapshot. Live forking uses the `Fork` API.
 
 ## More Documentation
 
@@ -399,6 +468,13 @@ Use `libmicrosandbox_go_ffi.so` for Linux. Full integration tests require local 
 ```bash
 go test -tags "smoke microsandbox_ffi_path" -count=1 .
 go test -tags "integration microsandbox_ffi_path" -v -count=1 ./integration/...
+```
+
+The storage smoke test uses a fresh process and temporary home, requires no VM, and only prunes its own synthetic RAM files:
+
+```bash
+MSB_STORAGE_NATIVE_LIBRARY="$PWD/../../target/debug/libmicrosandbox_go_ffi.dylib" \
+    go test -tags storage_native ./internal/ffi -run '^TestStorageNativeReportsAndPruning$' -count=1
 ```
 
 ## License
