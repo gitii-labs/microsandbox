@@ -2198,8 +2198,15 @@ mod tests {
                 .await
                 .unwrap();
             // Wait for the output to reach the guest socket without letting the relay run, so it
-            // is certainly the relay that takes it, and then blocks on the budget.
+            // is certainly the relay that takes it, and then blocks on the budget. This blocks the
+            // runtime, so the test's own timeout cannot fire; the spin has a deadline of its own.
+            const DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
+            let spin_started = std::time::Instant::now();
             while readable(probe.as_raw_fd()) == 0 {
+                assert!(
+                    spin_started.elapsed() < DELIVERY_DEADLINE,
+                    "the destination's output never reached the guest socket"
+                );
                 std::thread::yield_now();
             }
             while readable(probe.as_raw_fd()) != 0 {

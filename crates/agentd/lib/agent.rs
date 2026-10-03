@@ -5380,35 +5380,15 @@ mod tests {
         assert_eq!((reply.id, reply.t), (7, MessageType::TcpFailed));
     }
 
-    #[tokio::test]
-    async fn owner_disconnect_drops_tcp_sockets_before_acknowledgement() {
-        let id_start = 1;
-        let id_end_exclusive = microsandbox_protocol::AGENT_RELAY_ID_RANGE_STEP;
-        let incarnation = [0x5a; CLIENT_INCARNATION_SIZE];
-        let mut state = AgentState::default();
-        establish_relay_client(
-            &mut state,
-            RelayClientConnected {
-                id_start,
-                id_end_exclusive,
-                incarnation,
-            },
-        )
-        .unwrap();
-        let (mut sender, _output) = SessionOutputSender::channel();
-        let owned = open_loopback_tcp(&mut state, &sender, 2).await;
-        let other = open_loopback_tcp(&mut state, &sender, id_end_exclusive + 1).await;
-        // A stream the host cancelled after it finished in order, still draining.
-        let _draining_peer = open_loopback_tcp(&mut state, &sender, 3).await;
-        let draining = state.tcp_sessions.remove(&3).unwrap();
-        draining.close_write().await.unwrap();
-        while !draining.finished_in_order() {
-            tokio::task::yield_now().await;
-        }
-        let draining_relay = draining.relay_probe();
-        cancel_tcp_session(&mut state, draining);
-        assert_eq!(state.draining_tcp.len(), 1);
-
+    /// Release the relay client owning `id_start..id_end_exclusive` through the agent, returning
+    /// what it wrote back.
+    async fn release_owner(
+        state: &mut AgentState,
+        sender: &mut SessionOutputSender,
+        id_start: u32,
+        id_end_exclusive: u32,
+        incarnation: [u8; CLIENT_INCARNATION_SIZE],
+    ) -> Vec<u8> {
         let config = AgentdConfig {
             user: None,
             security_profile: Default::default(),
@@ -5431,9 +5411,9 @@ mod tests {
                 },
             )
             .unwrap(),
-            &mut state,
+            state,
             &mut activity,
-            &mut sender,
+            sender,
             &mut out,
             &config,
             &mut workload,
@@ -5441,6 +5421,45 @@ mod tests {
         )
         .await
         .unwrap();
+        out
+    }
+
+    fn owner_state(
+        id_start: u32,
+        id_end_exclusive: u32,
+        incarnation: [u8; CLIENT_INCARNATION_SIZE],
+    ) -> AgentState {
+        let mut state = AgentState::default();
+        establish_relay_client(
+            &mut state,
+            RelayClientConnected {
+                id_start,
+                id_end_exclusive,
+                incarnation,
+            },
+        )
+        .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn owner_disconnect_drops_tcp_sockets_before_acknowledgement() {
+        let id_start = 1;
+        let id_end_exclusive = microsandbox_protocol::AGENT_RELAY_ID_RANGE_STEP;
+        let incarnation = [0x5a; CLIENT_INCARNATION_SIZE];
+        let mut state = owner_state(id_start, id_end_exclusive, incarnation);
+        let (mut sender, _output) = SessionOutputSender::channel();
+        let owned = open_loopback_tcp(&mut state, &sender, 2).await;
+        let other = open_loopback_tcp(&mut state, &sender, id_end_exclusive + 1).await;
+
+        let out = release_owner(
+            &mut state,
+            &mut sender,
+            id_start,
+            id_end_exclusive,
+            incarnation,
+        )
+        .await;
 
         // Combined mode emits the acknowledgement inline. By then the owner's
         // socket is gone, while another client's stream is untouched.
@@ -5458,14 +5477,53 @@ mod tests {
             guest_closed_before_return(owned),
             "acknowledged before the socket closed"
         );
-        // The draining stream was ended and awaited before the acknowledgement too: its relay
-        // task, which owns the socket, is gone, not merely dropped from the table.
+        drop(other);
+    }
+
+    #[tokio::test]
+    async fn owner_disconnect_ends_draining_streams_before_acknowledgement() {
+        let id_start = 1;
+        let id_end_exclusive = microsandbox_protocol::AGENT_RELAY_ID_RANGE_STEP;
+        let incarnation = [0x5b; CLIENT_INCARNATION_SIZE];
+        let mut state = owner_state(id_start, id_end_exclusive, incarnation);
+        let (mut sender, _output) = SessionOutputSender::channel();
+        // The owner's only stream: one the host cancelled after it finished in order, still
+        // draining. Nothing else the release awaits can give its aborted task a turn.
+        let _draining_peer = open_loopback_tcp(&mut state, &sender, 3).await;
+        let draining = state.tcp_sessions.remove(&3).unwrap();
+        draining.close_write().await.unwrap();
+        while !draining.finished_in_order() {
+            tokio::task::yield_now().await;
+        }
+        let draining_relay = draining.relay_probe();
+        cancel_tcp_session(&mut state, draining);
+        assert_eq!(state.draining_tcp.len(), 1);
+        assert!(state.tcp_sessions.is_empty());
+
+        let out = release_owner(
+            &mut state,
+            &mut sender,
+            id_start,
+            id_end_exclusive,
+            incarnation,
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            encode_relay_client_disconnected_ack(RelayClientDisconnectedAck {
+                id_start,
+                id_end_exclusive,
+                incarnation,
+            })
+            .to_vec()
+        );
+        // The relay task, which owns the socket, is gone, not merely dropped from the table.
         assert!(state.draining_tcp.is_empty());
         assert!(
             draining_relay.relay_gone(),
             "acknowledged while the draining relay still held its socket"
         );
-        drop(other);
     }
 
     #[test]
