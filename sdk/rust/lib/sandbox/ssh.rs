@@ -70,7 +70,8 @@ const SSH_IN_PROCESS_DUPLEX_CAPACITY: usize = 512 * 1024;
 /// transport is aborted rather than leave the peer's open unanswered.
 const SSH_OPEN_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long a closed direct-tcpip channel may wait to close its guest stream.
+/// How long a closed direct-tcpip channel's guest stream may go without progress (credit for the
+/// remaining input, then the guest's terminal reply) before it is cancelled.
 const SSH_TCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Mirrors agentd's largest session-output item queue. The negotiated receive window bounds raw
@@ -2328,8 +2329,14 @@ fn reject_ssh_open(reply: ChannelOpenHandle, session: &Session) {
 /// Own one SSH direct-tcpip channel from the guest connect to its remote cleanup.
 ///
 /// Runs off the SSH session loop, so a slow guest connect or a stalled guest stream holds only
-/// this channel. Every per-channel future runs inside it rather than in a task of its own, so
-/// leaving it on `stop` cancels them all before the guest stream is closed.
+/// this channel. Every per-channel future runs inside it rather than in a task of its own.
+///
+/// Closing the SSH channel ends only the guest-to-SSH output, which has nowhere left to go.
+/// SSH input the peer sent before its close is still forwarded and finished, and the guest's own
+/// terminal reply closes the stream, so the destination receives every byte. That close phase is
+/// bounded by [`SSH_TCP_CLOSE_TIMEOUT`] of idleness: a guest that stops granting credit for the
+/// input, or never answers the finish, is cancelled instead, which discards what it has not
+/// delivered.
 async fn run_tcp_forward(
     open: TcpChannelOpen,
     client: Arc<AgentClient>,
@@ -2367,46 +2374,79 @@ async fn run_tcp_forward(
         return;
     };
 
-    if confirmed {
+    let terminated = if confirmed {
         let (output_tx, output_rx) = mpsc::channel(TCP_OUTPUT_QUEUE_CAPACITY);
-        let relays = async {
-            tokio::join!(
-                relay_ssh_to_tcp(
-                    channel,
-                    tcp_id,
-                    input,
-                    session.clone(),
-                    Arc::clone(&client),
-                    bulk_sender.as_ref().map(Arc::clone),
-                ),
-                relay_tcp_output_to_ssh(
-                    channel,
-                    tcp_id,
-                    output_rx,
-                    writer,
-                    session.clone(),
-                    Arc::clone(&client),
-                    bulk_receiver.as_ref().map(Arc::clone),
-                ),
-                relay_tcp_to_ssh(
-                    tcp_rx,
-                    output_tx,
-                    bulk_sender.as_ref().map(Arc::clone),
-                    bulk_receiver,
-                ),
-            );
-        };
-        // A closed SSH channel cancels relays still waiting on the guest or the peer; relays that
-        // finished first still leave the guest stream to close once the SSH channel does.
-        tokio::select! {
-            () = relays => channel_stopped(&mut stop).await,
-            () = channel_stopped(&mut stop) => {}
+        let mut input = Box::pin(relay_ssh_to_tcp(
+            channel,
+            tcp_id,
+            input,
+            session.clone(),
+            Arc::clone(&client),
+            bulk_sender.as_ref().map(Arc::clone),
+        ));
+        let mut output = Box::pin(relay_tcp_output_to_ssh(
+            channel,
+            tcp_id,
+            output_rx,
+            writer,
+            session.clone(),
+            Arc::clone(&client),
+            bulk_receiver.as_ref().map(Arc::clone),
+        ));
+        let mut guest = Box::pin(relay_tcp_to_ssh(
+            tcp_rx,
+            output_tx,
+            bulk_sender.as_ref().map(Arc::clone),
+            bulk_receiver,
+        ));
+        let mut finished = None;
+        let mut terminated = None;
+        let mut output_done = false;
+        // Relays that finish before the SSH channel closes still leave the guest stream to close
+        // once it does.
+        loop {
+            tokio::select! {
+                delivered = &mut input, if finished.is_none() => finished = Some(delivered),
+                () = &mut output, if !output_done => output_done = true,
+                terminal = &mut guest, if terminated.is_none() => terminated = Some(terminal),
+                () = channel_stopped(&mut stop) => break,
+            }
         }
-    }
+        // Output to a closed SSH channel has nowhere to go and may wait on its window forever.
+        drop(output);
+        // The guest pump keeps applying credit while the input drains. The deadline is idle
+        // time: every credit grant re-arms it until the finish is sent, and from then on it
+        // bounds the wait for the guest's terminal reply.
+        loop {
+            if let Some(terminal) = terminated {
+                break terminal;
+            }
+            if finished == Some(false) {
+                break false;
+            }
+            let draining = finished.is_none();
+            let credited = async {
+                match bulk_sender.as_deref() {
+                    Some(bulk) if draining => bulk.credit_ready.notified().await,
+                    _ => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                delivered = &mut input, if finished.is_none() => finished = Some(delivered),
+                terminal = &mut guest, if terminated.is_none() => terminated = Some(terminal),
+                () = credited => {}
+                () = tokio::time::sleep(SSH_TCP_CLOSE_TIMEOUT) => break false,
+            }
+        }
+    } else {
+        false
+    };
 
     let cleanup = async {
-        match &bulk_sender {
-            Some(bulk) => {
+        match (&bulk_sender, terminated) {
+            // The guest closed the stream itself; its terminal reply released the route.
+            (Some(_), true) => {}
+            (Some(bulk), false) => {
                 bulk.close();
                 let _ = client
                     .cancel_bulk(
@@ -2419,10 +2459,12 @@ async fn run_tcp_forward(
                     )
                     .await;
             }
-            None => {
-                let _ = client
-                    .send(tcp_id, MessageType::TcpClose, &TcpClose {})
-                    .await;
+            (None, terminated) => {
+                if !terminated {
+                    let _ = client
+                        .send(tcp_id, MessageType::TcpClose, &TcpClose {})
+                        .await;
+                }
                 client.forget_stream(tcp_id).await;
             }
         }
@@ -2441,7 +2483,7 @@ async fn run_tcp_forward(
 ///
 /// This may wait on guest bulk credit safely: the input arrives through the manual-window queue,
 /// so the Russh session loop never waits on it and stays free to process the opposite direction's
-/// channel-window updates and outbound data.
+/// channel-window updates and outbound data. Returns whether the guest accepted the end of input.
 async fn relay_ssh_to_tcp(
     channel: ChannelId,
     tcp_id: u32,
@@ -2449,12 +2491,11 @@ async fn relay_ssh_to_tcp(
     session: russh::server::Handle,
     client: Arc<AgentClient>,
     bulk_sender: Option<Arc<TcpBulkSender>>,
-) {
+) -> bool {
     loop {
-        // A closed queue means the channel is gone; the supervisor owns the cleanup.
-        let Some(item) = input.recv().await else {
-            return;
-        };
+        // A closed queue means the channel is gone: the peer sends nothing more, so finish the
+        // guest's input after the bytes it sent before closing.
+        let item = input.recv().await.unwrap_or(SshTcpInput::Eof);
         let (result, finished) = match item {
             SshTcpInput::Eof => (
                 match bulk_sender.as_ref() {
@@ -2485,15 +2526,10 @@ async fn relay_ssh_to_tcp(
                 let credited = match sent {
                     Ok(()) => match u32::try_from(len) {
                         Ok(len) => {
-                            session
-                                .adjust_receive_window(channel, len)
-                                .await
-                                .map_err(|()| {
-                                    MicrosandboxError::Custom(
-                                        "SSH connection closed while returning receive window"
-                                            .into(),
-                                    )
-                                })
+                            // A connection that is already gone needs no window back, and the
+                            // input it sent before leaving is still delivered.
+                            let _ = session.adjust_receive_window(channel, len).await;
+                            Ok(())
                         }
                         Err(_) => Err(MicrosandboxError::Custom(
                             "SSH direct-tcpip packet exceeds the receive window".into(),
@@ -2515,10 +2551,10 @@ async fn relay_ssh_to_tcp(
                 sender.close();
             }
             let _ = session.close(channel).await;
-            return;
+            return false;
         }
         if finished {
-            return;
+            return true;
         }
     }
 }
@@ -2587,14 +2623,25 @@ async fn relay_tcp_output_to_ssh<W>(
 /// Pump agent frames without waiting on the SSH channel's output window. The bounded output queue
 /// can hold agentd's complete per-flow record queue, while negotiated credit independently bounds
 /// its payload bytes.
+///
+/// Once the SSH channel is closed and its output relay gone, guest output is discarded while
+/// this keeps applying host-to-guest credit, so input sent before the close can still drain.
+/// Returns whether the guest ended the stream with a terminal reply.
 async fn relay_tcp_to_ssh(
     mut tcp_rx: tokio::sync::mpsc::Receiver<AgentFrame>,
     output: mpsc::Sender<TcpOutput>,
     bulk_sender: Option<Arc<TcpBulkSender>>,
     bulk_receiver: Option<Arc<Mutex<BulkReceiveState>>>,
-) {
+) -> bool {
     let _close_guard = TcpRelayCloseGuard(bulk_sender.as_ref().map(Arc::clone));
-    while let Some(frame) = tcp_rx.recv().await {
+    // Only the guest's own end of the stream releases its route; a protocol failure leaves the
+    // stream open for the caller to cancel.
+    let mut terminal = false;
+    loop {
+        let Some(frame) = tcp_rx.recv().await else {
+            terminal = true;
+            break;
+        };
         match frame {
             AgentFrame::Bulk(record) => {
                 let Some(receiver) = bulk_receiver.as_ref() else {
@@ -2608,16 +2655,14 @@ async fn relay_tcp_to_ssh(
                         break;
                     }
                 };
-                if output
-                    .send(TcpOutput::Data {
+                forward(
+                    &output,
+                    TcpOutput::Data {
                         payload: record.payload,
                         consumed_offset: Some(end),
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+                    },
+                )
+                .await;
             }
             AgentFrame::Control(msg) => match msg.t {
                 MessageType::TcpData => {
@@ -2634,16 +2679,14 @@ async fn relay_tcp_to_ssh(
                             break;
                         }
                     };
-                    if output
-                        .send(TcpOutput::Data {
+                    forward(
+                        &output,
+                        TcpOutput::Data {
                             payload: Bytes::from(data.data),
                             consumed_offset: None,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                        },
+                    )
+                    .await;
                 }
                 MessageType::BulkCredit => {
                     let Some(sender) = bulk_sender.as_ref() else {
@@ -2682,9 +2725,7 @@ async fn relay_tcp_to_ssh(
                         tracing::warn!("ssh direct-tcpip: invalid TCP bulk finish: {error}");
                         break;
                     }
-                    if output.send(TcpOutput::Eof).await.is_err() {
-                        return;
-                    }
+                    forward(&output, TcpOutput::Eof).await;
                 }
                 MessageType::BulkCancel => {
                     match msg.payload::<BulkCancel>() {
@@ -2709,14 +2750,13 @@ async fn relay_tcp_to_ssh(
                     if let Err(error) = msg.payload::<TcpEof>() {
                         tracing::warn!("ssh direct-tcpip: failed to decode tcp eof: {error}");
                     }
-                    if output.send(TcpOutput::Eof).await.is_err() {
-                        return;
-                    }
+                    forward(&output, TcpOutput::Eof).await;
                 }
                 MessageType::TcpClosed => {
                     if let Err(error) = msg.payload::<TcpClosed>() {
                         tracing::warn!("ssh direct-tcpip: failed to decode tcp closed: {error}");
                     }
+                    terminal = true;
                     break;
                 }
                 MessageType::TcpFailed => {
@@ -2729,6 +2769,7 @@ async fn relay_tcp_to_ssh(
                             tracing::warn!("ssh direct-tcpip: failed to decode tcp failed: {error}")
                         }
                     }
+                    terminal = true;
                     break;
                 }
                 _ => {}
@@ -2736,7 +2777,14 @@ async fn relay_tcp_to_ssh(
         }
     }
 
-    let _ = output.send(TcpOutput::Close).await;
+    forward(&output, TcpOutput::Close).await;
+    terminal
+}
+
+/// Hand one guest event to the SSH output relay. Once the SSH channel is closed that relay is gone
+/// and the event has nowhere to go.
+async fn forward(output: &mpsc::Sender<TcpOutput>, event: TcpOutput) {
+    let _ = output.send(event).await;
 }
 
 async fn build_authorized_keys(

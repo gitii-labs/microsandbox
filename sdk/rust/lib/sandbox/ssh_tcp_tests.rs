@@ -18,6 +18,13 @@ use tokio::task::JoinSet;
 /// Host-to-guest bytes the scripted agent admits before it returns credit.
 const AGENT_CREDIT: u64 = 64 * 1024;
 
+/// Host-to-guest credit a paced guest grants at a time.
+const PACED_CREDIT: u64 = 8 * 1024;
+
+/// How long a paced guest takes to grant each [`PACED_CREDIT`]: well inside the forward's idle
+/// close bound, while draining one SSH window this way takes twice that bound.
+const CREDIT_PACE: Duration = Duration::from_millis(SSH_TCP_CLOSE_TIMEOUT.as_millis() as u64 / 4);
+
 /// Receive window the SSH server grants each channel.
 const SSH_WINDOW: u32 = 64 * 1024;
 
@@ -47,6 +54,50 @@ struct GuestSend {
     credit: Notify,
 }
 
+/// Sends a connection's one terminal reply, as agentd does once both directions have ended or
+/// the destination has failed.
+struct GuestTerminal {
+    id: u32,
+    open_directions: std::sync::atomic::AtomicU8,
+    sent: AtomicBool,
+    out: mpsc::UnboundedSender<ToHost>,
+}
+
+impl GuestTerminal {
+    fn direction_ended(&self) {
+        if self.open_directions.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.send();
+        }
+    }
+
+    fn send(&self) {
+        if !self.sent.swap(true, Ordering::SeqCst) {
+            // A host that hung up has no use for the reply.
+            let _ = self
+                .out
+                .send(control(MessageType::TcpClosed, self.id, &TcpClosed {}));
+        }
+    }
+}
+
+/// How a guest returns host-to-guest credit, chosen by destination port.
+#[derive(Clone, Copy, Default)]
+struct GuestPorts {
+    /// Never hands host bytes to its destination, so never returns credit, like a guest whose
+    /// destination has stopped reading.
+    stalled: Option<u16>,
+    /// Returns [`PACED_CREDIT`] at a time, each [`CREDIT_PACE`] after the last bytes were written.
+    paced: Option<u16>,
+}
+
+/// How one connection returns host-to-guest credit.
+#[derive(Clone, Copy, PartialEq)]
+enum Credit {
+    Returned,
+    Withheld,
+    Paced,
+}
+
 /// One forwarded guest connection. Dropping it aborts its socket tasks, which closes the socket.
 struct GuestConnection {
     to_socket: mpsc::UnboundedSender<ToSocket>,
@@ -60,9 +111,8 @@ fn control<T: serde::Serialize>(t: MessageType, id: u32, payload: &T) -> ToHost 
 
 /// Serve one agent connection the way agentd serves bulk TCP: the guest-to-host flow is sent
 /// against the host's credit, and host-to-guest credit is returned once the destination socket
-/// has the bytes. A connection to `stalled_port` never hands host bytes to its destination, so
-/// it never returns credit, like a guest whose destination has stopped reading.
-async fn run_agent(listener: TcpListener, stalled_port: Option<u16>) {
+/// has the bytes, except where `ports` says otherwise.
+async fn run_agent(listener: TcpListener, ports: GuestPorts) {
     let (socket, _) = listener.accept().await.unwrap();
     let (mut reader, mut writer) = socket.into_split();
     writer.write_all(&1u32.to_be_bytes()).await.unwrap();
@@ -100,7 +150,7 @@ async fn run_agent(listener: TcpListener, stalled_port: Option<u16>) {
         let message = codec::raw_frame_to_message(frame).unwrap();
         match message.t {
             MessageType::TcpConnect => {
-                let connection = open_guest_connection(&message, &out, stalled_port).await;
+                let connection = open_guest_connection(&message, &out, ports).await;
                 connections.insert(message.id, connection);
             }
             MessageType::BulkCredit => {
@@ -136,10 +186,22 @@ async fn run_agent(listener: TcpListener, stalled_port: Option<u16>) {
 async fn open_guest_connection(
     message: &Message,
     out: &mpsc::UnboundedSender<ToHost>,
-    stalled_port: Option<u16>,
+    ports: GuestPorts,
 ) -> GuestConnection {
     let id = message.id;
     let request: TcpConnect = message.payload().unwrap();
+    let credit = if ports.stalled == Some(request.port) {
+        Credit::Withheld
+    } else if ports.paced == Some(request.port) {
+        Credit::Paced
+    } else {
+        Credit::Returned
+    };
+    let initial_credit = if credit == Credit::Paced {
+        PACED_CREDIT
+    } else {
+        AGENT_CREDIT
+    };
     let offer = request
         .bulk
         .expect("SSH forwarding negotiates bulk TCP with a generation-9 agent");
@@ -151,7 +213,7 @@ async fn open_guest_connection(
         flows: BULK_FLOW_MASK_HOST_TO_GUEST | BULK_FLOW_MASK_GUEST_TO_HOST,
         format: offer.format,
         max_record_payload: offer.max_record_payload.min(DEFAULT_BULK_RECORD_PAYLOAD),
-        host_to_guest_credit_limit: AGENT_CREDIT,
+        host_to_guest_credit_limit: initial_credit,
         guest_to_host_credit_limit: offer.guest_to_host_credit_limit,
     };
     out.send(control(MessageType::TcpConnected, id, &TcpConnected {}))
@@ -175,18 +237,25 @@ async fn open_guest_connection(
         BulkKind::Tcp,
         BulkFlow::HostToGuest,
         accepted.max_record_payload,
-        AGENT_CREDIT,
+        initial_credit,
         AGENT_CREDIT,
     )
     .unwrap();
     let (to_socket, events) = mpsc::unbounded_channel();
     let (socket_reader, socket_writer) = socket.into_split();
+    let terminal = Arc::new(GuestTerminal {
+        id,
+        open_directions: std::sync::atomic::AtomicU8::new(2),
+        sent: AtomicBool::new(false),
+        out: out.clone(),
+    });
     let mut tasks = JoinSet::new();
     tasks.spawn(relay_socket_to_host(
         id,
         socket_reader,
         Arc::clone(&send),
         out.clone(),
+        Arc::clone(&terminal),
     ));
     tasks.spawn(relay_host_to_socket(
         id,
@@ -194,7 +263,8 @@ async fn open_guest_connection(
         events,
         receive,
         out.clone(),
-        stalled_port == Some(request.port),
+        credit,
+        terminal,
     ));
     GuestConnection {
         to_socket,
@@ -208,6 +278,7 @@ async fn relay_socket_to_host(
     mut socket: OwnedReadHalf,
     send: Arc<GuestSend>,
     out: mpsc::UnboundedSender<ToHost>,
+    terminal: Arc<GuestTerminal>,
 ) {
     let mut buffer = vec![0; DEFAULT_BULK_RECORD_PAYLOAD as usize];
     loop {
@@ -226,6 +297,7 @@ async fn relay_socket_to_host(
             Ok(0) => {
                 let finish = send.state.lock().await.finish().unwrap();
                 let _ = out.send(control(MessageType::BulkFinish, id, &finish));
+                terminal.direction_ended();
                 return;
             }
             Ok(read) => {
@@ -239,7 +311,7 @@ async fn relay_socket_to_host(
                 }));
             }
             Err(_) => {
-                let _ = out.send(control(MessageType::TcpClosed, id, &TcpClosed {}));
+                terminal.send();
                 return;
             }
         }
@@ -252,21 +324,35 @@ async fn relay_host_to_socket(
     mut events: mpsc::UnboundedReceiver<ToSocket>,
     mut receive: BulkReceiveState,
     out: mpsc::UnboundedSender<ToHost>,
-    stalled: bool,
+    credit_mode: Credit,
+    terminal: Arc<GuestTerminal>,
 ) {
     while let Some(event) = events.recv().await {
         match event {
             ToSocket::Record(record) => {
                 // Admission also proves the host never sends past the credit it was given.
                 let end = receive.accept_record(&record).unwrap();
-                if stalled {
+                if credit_mode == Credit::Withheld {
                     continue;
                 }
                 // A destination that went away is reported by the socket reader.
                 if socket.write_all(&record.payload).await.is_err() {
                     return;
                 }
-                if let Some(credit) = receive.consume(end).unwrap() {
+                let credit = receive.consume(end).unwrap();
+                let credit = if credit_mode == Credit::Paced {
+                    // The pace between grants is what the paced guest exists to exercise.
+                    tokio::time::sleep(CREDIT_PACE).await;
+                    Some(BulkCredit {
+                        kind: BulkKind::Tcp,
+                        flow: BulkFlow::HostToGuest,
+                        consumed_offset: end,
+                        credit_limit: end + PACED_CREDIT,
+                    })
+                } else {
+                    credit
+                };
+                if let Some(credit) = credit {
                     let _ = out.send(control(MessageType::BulkCredit, id, &credit));
                 }
             }
@@ -275,6 +361,7 @@ async fn relay_host_to_socket(
                 if socket.shutdown().await.is_err() {
                     return;
                 }
+                terminal.direction_ended();
             }
         }
     }
@@ -327,7 +414,7 @@ struct FixtureOptions {
     client: Client,
     client_window: u32,
     event_buffer_size: Option<usize>,
-    stalled_port: Option<u16>,
+    ports: GuestPorts,
 }
 
 impl Default for FixtureOptions {
@@ -336,7 +423,7 @@ impl Default for FixtureOptions {
             client: Client::default(),
             client_window: SSH_WINDOW,
             event_buffer_size: None,
-            stalled_port: None,
+            ports: GuestPorts::default(),
         }
     }
 }
@@ -353,7 +440,7 @@ impl Fixture {
     async fn new(options: FixtureOptions) -> Self {
         let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let agent_address = agent_listener.local_addr().unwrap();
-        let agent = tokio::spawn(run_agent(agent_listener, options.stalled_port));
+        let agent = tokio::spawn(run_agent(agent_listener, options.ports));
         let agent_client = Arc::new(
             AgentClient::connect_stream_with_timeout(
                 TcpStream::connect(agent_address).await.unwrap(),
@@ -500,11 +587,14 @@ async fn stalled_guest_stream_holds_its_peer_and_leaves_the_connection_live() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let stalled = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let fixture = Fixture::new(FixtureOptions {
-            stalled_port: Some(stalled.local_addr().unwrap().port()),
+            ports: GuestPorts {
+                stalled: Some(stalled.local_addr().unwrap().port()),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await;
-        let (forwarded, _held) = fixture.open_to(&stalled).await;
+        let (forwarded, mut held) = fixture.open_to(&stalled).await;
         // The guest admits its credit and the server returns window for exactly those bytes.
         forwarded
             .data_bytes(vec![0u8; AGENT_CREDIT as usize + SSH_WINDOW as usize])
@@ -527,7 +617,16 @@ async fn stalled_guest_stream_holds_its_peer_and_leaves_the_connection_live() {
 
         close(live).await;
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        // Closing while the guest withholds credit cannot drain the queued input, so the forward
+        // cancels its guest stream once the close bound passes, and the connection stays live.
         close(forwarded).await;
+        assert_eq!(
+            tokio::time::timeout(2 * SSH_TCP_CLOSE_TIMEOUT, held.read(&mut [0]))
+                .await
+                .expect("a stalled forward's guest stream closes within the close bound")
+                .unwrap(),
+            0
+        );
         close(session).await;
         fixture.finish().await;
     })
@@ -566,6 +665,71 @@ async fn paused_ssh_output_keeps_input_and_other_channel_close_live() {
         assert_eq!(other.read(&mut [0]).await.unwrap(), 0);
         close(first).await;
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        fixture.finish().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Input sent before the peer's EOF and close reaches the destination whole, past several guest
+/// credit windows, and the forward still ends while the destination keeps its own side open.
+#[tokio::test]
+async fn eof_and_close_deliver_every_byte_before_the_forward_ends() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let fixture = Fixture::new(FixtureOptions::default()).await;
+        let (forwarded, mut peer) = fixture.open().await;
+        let payload = (0..4 * AGENT_CREDIT)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let reading = tokio::spawn(async move {
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            (received, peer)
+        });
+        forwarded.data_bytes(payload.clone()).await.unwrap();
+        forwarded.eof().await.unwrap();
+        close(forwarded).await;
+        let (received, _open) = reading.await.unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert!(received == payload);
+        fixture.finish().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A guest that keeps granting credit, each grant well inside the close bound, drains the input
+/// queued at close completely even though the whole drain outlasts that bound.
+#[tokio::test]
+async fn slowly_credited_input_drains_completely_after_close() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let paced = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let fixture = Fixture::new(FixtureOptions {
+            ports: GuestPorts {
+                paced: Some(paced.local_addr().unwrap().port()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+        let (forwarded, mut peer) = fixture.open_to(&paced).await;
+        // The first grant plus one SSH window: the window's worth is still queued at close.
+        let payload = (0..PACED_CREDIT + u64::from(SSH_WINDOW))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        let grants = u64::from(SSH_WINDOW) / PACED_CREDIT;
+        assert!(CREDIT_PACE * grants as u32 >= 2 * SSH_TCP_CLOSE_TIMEOUT);
+        let reading = tokio::spawn(async move {
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        forwarded.data_bytes(payload.clone()).await.unwrap();
+        forwarded.eof().await.unwrap();
+        close(forwarded).await;
+        let received = reading.await.unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert!(received == payload);
         fixture.finish().await;
     })
     .await
