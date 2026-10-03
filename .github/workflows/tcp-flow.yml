@@ -38,12 +38,31 @@ jobs:
       - run: cargo test --locked -p microsandbox-runtime --lib runner::relay::tests
       - run: cargo test --locked -p microsandbox-network --lib
       - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::ssh
+      - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::tcp
+      - run: cargo test --locked -p microsandbox --test snapshot_artifact create_from_disk_snapshot
+      - run: cargo test --locked -p microsandbox-go
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib queued_reservations_survive
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib channels::tests
       - run: cargo check --locked --manifest-path sdk/go/native/Cargo.toml
       - run: cargo clippy --keep-going --locked -p microsandbox-agent-client -p microsandbox-runtime -p microsandbox --features microsandbox/ssh,microsandbox-agent-client/uds --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
       - run: rustfmt --edition 2024 --config skip_children=true --check vendor/russh/src/server/mod.rs vendor/russh/src/server/session.rs vendor/russh/src/server/encrypted.rs vendor/russh/src/client/mod.rs vendor/russh/src/client/session.rs vendor/russh/src/client/encrypted.rs vendor/russh/src/channels/mod.rs vendor/russh/src/channels/io/tx.rs vendor/russh/src/lib_inner.rs
+  go-sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          # sdk/go has no external dependencies; nothing to cache.
+          cache: false
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go vet -tags "integration microsandbox_ffi_path" ./integration
+      - run: go test ./...
   typescript-protocol:
     runs-on: ubuntu-latest
     defaults:
