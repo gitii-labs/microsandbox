@@ -40,6 +40,8 @@ mod exec_adapter;
 mod restore;
 mod setup;
 mod storage;
+#[cfg(unix)]
+mod tcp;
 mod volume_fs;
 
 use std::{

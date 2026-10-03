@@ -279,6 +279,14 @@ static msb_cancel_unregister_fn  ptr_msb_cancel_unregister  = NULL;
 static msb_sandbox_create_fn     ptr_msb_sandbox_create     = NULL;
 typedef char *(*msb_sandbox_restore_fn)(uint64_t, const char *, const char *, uint8_t *, size_t);
 static msb_sandbox_restore_fn ptr_msb_sandbox_restore = NULL;
+typedef char *(*msb_sandbox_dial_tcp_fn)(uint64_t, uint64_t, const char *, uint16_t, uint8_t *, size_t);
+typedef char *(*msb_tcp_conn_status_fn)(uint64_t, uint8_t *, size_t);
+typedef char *(*msb_tcp_conn_close_fn)(uint64_t, uint64_t, uint8_t *, size_t);
+typedef char *(*msb_tcp_conn_abort_fn)(uint64_t, uint64_t, uint8_t *, size_t);
+static msb_sandbox_dial_tcp_fn ptr_msb_sandbox_dial_tcp = NULL;
+static msb_tcp_conn_status_fn ptr_msb_tcp_conn_status = NULL;
+static msb_tcp_conn_close_fn ptr_msb_tcp_conn_close = NULL;
+static msb_tcp_conn_abort_fn ptr_msb_tcp_conn_abort = NULL;
 typedef char *(*msb_creation_progress_open_fn)(uint8_t *, size_t);
 typedef char *(*msb_creation_progress_recv_fn)(uint64_t, uint64_t, uint8_t *, size_t);
 typedef char *(*msb_creation_progress_close_fn)(uint64_t, uint8_t *, size_t);
@@ -487,6 +495,11 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE_OPTIONAL(msb_runtime_setup);
 	RESOLVE(msb_sandbox_create);
 	RESOLVE(msb_sandbox_restore);
+	// Absent on hosts without Unix socket pairs.
+	RESOLVE_OPTIONAL(msb_sandbox_dial_tcp);
+	RESOLVE_OPTIONAL(msb_tcp_conn_status);
+	RESOLVE_OPTIONAL(msb_tcp_conn_close);
+	RESOLVE_OPTIONAL(msb_tcp_conn_abort);
 	RESOLVE_OPTIONAL(msb_creation_progress_open);
 	RESOLVE_OPTIONAL(msb_creation_progress_recv);
 	RESOLVE_OPTIONAL(msb_creation_progress_close);
@@ -673,6 +686,19 @@ char *call_msb_sandbox_shell_path(uint64_t cancel_id, uint64_t handle, uint8_t *
     return ptr_msb_sandbox_shell_path ? ptr_msb_sandbox_shell_path(cancel_id, handle, buf, buf_len) : NULL;
 }
 bool has_sandbox_restore(void) { return ptr_msb_sandbox_restore != NULL; }
+bool has_tcp_dial(void) { return ptr_msb_sandbox_dial_tcp && ptr_msb_tcp_conn_status && ptr_msb_tcp_conn_close && ptr_msb_tcp_conn_abort; }
+char *call_msb_sandbox_dial_tcp(uint64_t cancel_id, uint64_t handle, const char *host, uint16_t port, uint8_t *buf, size_t buf_len) {
+    return ptr_msb_sandbox_dial_tcp(cancel_id, handle, host, port, buf, buf_len);
+}
+char *call_msb_tcp_conn_status(uint64_t conn, uint8_t *buf, size_t buf_len) {
+    return ptr_msb_tcp_conn_status(conn, buf, buf_len);
+}
+char *call_msb_tcp_conn_close(uint64_t cancel_id, uint64_t conn, uint8_t *buf, size_t buf_len) {
+    return ptr_msb_tcp_conn_close(cancel_id, conn, buf, buf_len);
+}
+char *call_msb_tcp_conn_abort(uint64_t cancel_id, uint64_t conn, uint8_t *buf, size_t buf_len) {
+    return ptr_msb_tcp_conn_abort(cancel_id, conn, buf, buf_len);
+}
 char *call_msb_sandbox_restore(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len) {
     return ptr_msb_sandbox_restore ? ptr_msb_sandbox_restore(cancel_id, name, opts_json, buf, buf_len) : NULL;
 }
@@ -6022,4 +6048,93 @@ func RuntimeSetup(ctx context.Context, operation, configJSON, optionsJSON string
 	return call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
 		return C.call_msb_runtime_setup(cancelID, op, config, options, buf, bufLen)
 	})
+}
+
+// TCPConn is the native half of a guest TCP connection; its bytes travel over
+// the socket returned by DialTCP. Release it with Close or Abort.
+type TCPConn struct {
+	handle C.uint64_t
+}
+
+// TCPStatus says why each direction of a TCPConn ended, when not in order.
+type TCPStatus struct {
+	ReadError  *string `json:"read_error"`
+	WriteError *string `json:"write_error"`
+}
+
+// DialTCP opens a TCP connection from inside the guest. It returns the native
+// handle and a file descriptor the caller owns: one end of a Unix stream socket
+// pair carrying the connection's bytes.
+func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPConn, int, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, -1, err
+	}
+	if !bool(C.has_tcp_dial()) {
+		return nil, -1, &Error{Kind: KindUnsupportedOperation, Message: "native SDK cannot dial guest TCP on this host"}
+	}
+	cHost := C.CString(host)
+	defer C.free(unsafe.Pointer(cHost))
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_sandbox_dial_tcp(cancelID, s.h(), cHost, C.uint16_t(port), buf, bufLen)
+	})
+	if err != nil {
+		return nil, -1, err
+	}
+	var resp struct {
+		Conn uint64 `json:"conn"`
+		FD   int    `json:"fd"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return nil, -1, fmt.Errorf("parse dial_tcp response: %w", err)
+	}
+	return &TCPConn{handle: C.uint64_t(resp.Conn)}, resp.FD, nil
+}
+
+// Status reports why each direction ended, if not in order.
+func (c *TCPConn) Status() (TCPStatus, error) {
+	buf := make([]byte, defaultBufSize)
+	errPtr := C.call_msb_tcp_conn_status(c.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	if errPtr != nil {
+		msg := C.GoString(errPtr)
+		C.call_msb_free_string(errPtr)
+		var e Error
+		if jerr := json.Unmarshal([]byte(msg), &e); jerr != nil {
+			e = Error{Kind: KindInternal, Message: msg}
+		}
+		return TCPStatus{}, &e
+	}
+	var status TCPStatus
+	if err := json.Unmarshal([]byte(C.GoString((*C.char)(unsafe.Pointer(&buf[0])))), &status); err != nil {
+		return TCPStatus{}, fmt.Errorf("parse tcp_conn_status: %w", err)
+	}
+	return status, nil
+}
+
+// Close delivers every byte written to the socket, then releases the guest
+// connection in order. It reports whether the guest acknowledged the release.
+func (c *TCPConn) Close(ctx context.Context) (acknowledged bool, err error) {
+	return c.release(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_tcp_conn_close(cancelID, c.handle, buf, bufLen)
+	})
+}
+
+// Abort resets the guest connection and reports whether the guest acknowledged it.
+func (c *TCPConn) Abort(ctx context.Context) (acknowledged bool, err error) {
+	return c.release(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_tcp_conn_abort(cancelID, c.handle, buf, bufLen)
+	})
+}
+
+func (c *TCPConn) release(ctx context.Context, fn func(C.uint64_t, *C.uint8_t, C.size_t) *C.char) (bool, error) {
+	out, err := call(ctx, fn)
+	if err != nil {
+		return false, err
+	}
+	var resp struct {
+		Cleanup string `json:"cleanup"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return false, fmt.Errorf("parse tcp release response: %w", err)
+	}
+	return resp.Cleanup == "acknowledged", nil
 }

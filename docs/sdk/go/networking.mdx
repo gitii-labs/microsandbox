@@ -161,6 +161,59 @@ Make services running in the sandbox reachable on explicit host addresses and po
   </div>
 </div>
 
+## Guest TCP
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">DialTCP()</span>
+
+<Tooltip tip="Needs a Unix host: the connection's bytes travel over a socket pair."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```go
+func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPConn, error)
+```
+
+<Accordion title="Example">
+
+```go
+conn, err := sb.DialTCP(ctx, "127.0.0.1", 8080)
+if err != nil {
+    return err
+}
+defer conn.Close()
+_, err = conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+```
+
+</Accordion>
+
+Open a TCP connection from inside the guest to `host:port`, without publishing a port. The guest resolves `host`, so loopback reaches the guest's own listeners. `ctx` bounds the dial only. Each connection has its own agent connection, so many can be open at once.
+
+Both directions are bounded by bulk credit: the guest admits written bytes only up to the window it granted, and gets credit back for bytes it sent only as `Read` takes them. A destination that stops reading stops `Write` after at most that window plus socket buffers.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Bounds the dial.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>host</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Destination address or name, resolved by the guest.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>port</code><span className="msb-type">uint16</span></div>
+    <div className="msb-param-desc">Destination port.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#tcpconn">*TCPConn</a></div>
+    <div className="msb-param-desc">The open connection. Close or Abort it to release it.</div>
+  </div>
+</div>
+
 ## NetworkPolicy
 
 Factory namespace returning high-level [`*NetworkConfig`](#networkconfig) values. Access through the package-level `NetworkPolicy` value.
@@ -629,6 +682,23 @@ One token bucket of a rate limiter. The bucket starts full and refills continuou
 | Size | `uint64` | Bucket capacity in tokens: bytes for bandwidth buckets, frames for ops buckets. Must be greater than zero |
 | RefillTime | `time.Duration` | Time to refill `Size` tokens. Must be at least one millisecond |
 | OneTimeBurst | `uint64` | Extra startup-only tokens. Optional |
+
+### TCPConn
+
+<p className="msb-backref">Returned by <a href="#sb-dialtcp">DialTCP()</a></p>
+
+A `net.Conn` to a guest-side TCP destination, with deadlines.
+
+| Method | Behavior |
+|--------|----------|
+| `Read` | Returns `io.EOF` once the destination ended its side in order, and an error if the guest connection failed first. |
+| `Write` | Blocks while the guest withholds credit; honours the write deadline. |
+| `CloseWrite()` | Half-close: the destination reads end of stream after every byte written before it. `Read` continues. |
+| `Close()` | Orderly close: delivers every written byte, then releases the guest connection without a reset. Bytes the guest stops accepting for longer than an idle bound are discarded with an error. |
+| `Abort()` | Discards unwritten bytes and resets the destination. |
+| `SetDeadline`, `SetReadDeadline`, `SetWriteDeadline` | As on `net.Conn`. |
+
+`Close` and `Abort` return `ErrTCPCleanupUnknown` when the guest did not confirm, in time, that it released its socket.
 
 ### PortBinding
 

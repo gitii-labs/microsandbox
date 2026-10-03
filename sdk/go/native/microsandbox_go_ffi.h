@@ -1114,6 +1114,38 @@ char *msb_storage_prune(uint64_t cancel_id,
                         uintptr_t buf_len);
 
 /**
+ * Open a TCP connection from inside the guest to `host:port`.
+ *
+ * Returns `{"conn":<handle>,"fd":<fd>}`. Go owns `fd`, one end of a close-on-exec Unix stream
+ * socket pair carrying the connection's bytes. Release the handle with `msb_tcp_conn_close`
+ * or `msb_tcp_conn_abort`.
+ */
+char *msb_sandbox_dial_tcp(uint64_t cancel_id,
+                           Handle handle,
+                           const char *host,
+                           uint16_t port,
+                           unsigned char *buf,
+                           uintptr_t buf_len);
+
+/**
+ * Why each direction ended, if not in order: `{"read_error":<string|null>,"write_error":...}`.
+ */
+char *msb_tcp_conn_status(Handle conn, unsigned char *buf, uintptr_t buf_len);
+
+/**
+ * Orderly close, after Go closed its socket: deliver every byte Go wrote, then release the
+ * guest connection without a reset. Returns `{"cleanup":"acknowledged"|"unknown"}`, or an
+ * error when bytes could not be delivered within the idle bound.
+ */
+char *msb_tcp_conn_close(uint64_t cancel_id, Handle conn, unsigned char *buf, uintptr_t buf_len);
+
+/**
+ * Abort: discard unwritten bytes and reset the guest connection.
+ * Returns `{"cleanup":"acknowledged"|"unknown"}`.
+ */
+char *msb_tcp_conn_abort(uint64_t cancel_id, Handle conn, unsigned char *buf, uintptr_t buf_len);
+
+/**
  * Run an offline disk operation (create, inspect, grow_copy). The caller holds
  * the stopped/detached lifecycle lock. Output uses the standard FFI JSON ABI.
  */
