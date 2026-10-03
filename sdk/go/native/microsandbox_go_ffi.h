@@ -1117,8 +1117,9 @@ char *msb_storage_prune(uint64_t cancel_id,
  * Open a TCP connection from inside the guest to `host:port`.
  *
  * Returns `{"conn":<handle>,"fd":<fd>}`. Go owns `fd`, one end of a close-on-exec Unix stream
- * socket pair carrying the connection's bytes. Release the handle with `msb_tcp_conn_close`
- * or `msb_tcp_conn_abort`.
+ * socket pair carrying the connection's bytes. Go's end of stream aborts the connection unless
+ * `msb_tcp_conn_finish` announced it first. Release the handle with `msb_tcp_conn_close` or
+ * `msb_tcp_conn_abort`.
  */
 char *msb_sandbox_dial_tcp(uint64_t cancel_id,
                            Handle handle,
@@ -1128,14 +1129,20 @@ char *msb_sandbox_dial_tcp(uint64_t cancel_id,
                            uintptr_t buf_len);
 
 /**
+ * Announce Go's half-close: its socket's next end of stream finishes the guest stream in order.
+ * Call it before shutting the socket's write side down.
+ */
+char *msb_tcp_conn_finish(Handle conn, unsigned char *buf, uintptr_t buf_len);
+
+/**
  * Why each direction ended, if not in order: `{"read_error":<string|null>,"write_error":...}`.
  */
 char *msb_tcp_conn_status(Handle conn, unsigned char *buf, uintptr_t buf_len);
 
 /**
- * Orderly close, after Go closed its socket: deliver every byte Go wrote, then release the
- * guest connection without a reset. Returns `{"cleanup":"acknowledged"|"unknown"}`, or an
- * error when bytes could not be delivered within the idle bound.
+ * Orderly close, after `msb_tcp_conn_finish` and Go's half-close: deliver every byte Go wrote,
+ * then release the guest connection without a reset. Returns
+ * `{"cleanup":"acknowledged"|"unknown"}`, or an error when any byte was not delivered.
  */
 char *msb_tcp_conn_close(uint64_t cancel_id, Handle conn, unsigned char *buf, uintptr_t buf_len);
 

@@ -5,27 +5,17 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use microsandbox_agent_client::AgentFrame;
 use microsandbox_protocol::{
-    bulk::{
-        BULK_FLOW_MASK_GUEST_TO_HOST, BULK_FLOW_MASK_HOST_TO_GUEST, BulkCancel, BulkCancelReason,
-        BulkCredit, BulkFinish, BulkFlow, BulkKind, BulkOffer, BulkReceiveState, BulkRecord,
-        BulkSendState,
-    },
     fs::{
         FS_CHUNK_SIZE, FsEntryInfo, FsOp, FsOpenOptions, FsRequest, FsResponse, FsResponseData,
         FsSetAttrs,
     },
     message::MessageType,
-    tcp::{TcpClose, TcpClosed, TcpConnect, TcpConnected, TcpData, TcpEof, TcpFailed},
 };
 use microsandbox_types::{ConfigPatch, EnvVar};
 use russh::client::Msg as ClientMsg;
@@ -35,13 +25,13 @@ use russh::keys::{
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Sig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 
-use super::attach;
 #[cfg(windows)]
 use super::terminal::{
     WindowsTerminalEvent, WindowsTerminalEventPump, WindowsTerminalGuard, current_terminal_size,
 };
+use super::{attach, tcp};
 use crate::config::{
     DEFAULT_SSH_INACTIVITY_TIMEOUT_SECS, GlobalConfigPatch,
     layers::{BackendConfig, ConfigLayers, Overlay},
@@ -72,11 +62,7 @@ const SSH_OPEN_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a closed direct-tcpip channel's guest stream may go without progress (credit for the
 /// remaining input, then the guest's terminal reply) before it is cancelled.
-const SSH_TCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Mirrors agentd's largest session-output item queue. The negotiated receive window bounds raw
-/// bytes; this item bound lets control credits pass while russh waits for the peer's output window.
-const TCP_OUTPUT_QUEUE_CAPACITY: usize = 1024;
+const SSH_TCP_CLOSE_TIMEOUT: Duration = tcp::GUEST_TCP_CLOSE_IDLE_TIMEOUT;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -240,15 +226,6 @@ enum ChannelState {
     Sftp,
 }
 
-/// Host-to-guest credit state shared by SSH callbacks and the guest-to-host relay task.
-struct TcpBulkSender {
-    state: Mutex<BulkSendState>,
-    credit_ready: Notify,
-    closed: AtomicBool,
-}
-
-struct TcpRelayCloseGuard(Option<Arc<TcpBulkSender>>);
-
 /// One item of SSH direct-tcpip input, in the order the peer sent it.
 enum SshTcpInput {
     Data(Bytes),
@@ -265,23 +242,6 @@ struct TcpChannelOpen {
     port: u16,
     reply: ChannelOpenHandle,
     session: russh::server::Handle,
-}
-
-/// A guest TCP connection opened for an SSH direct-tcpip channel.
-struct TcpForward {
-    tcp_id: u32,
-    tcp_rx: mpsc::Receiver<AgentFrame>,
-    bulk_sender: Option<Arc<TcpBulkSender>>,
-    bulk_receiver: Option<Arc<Mutex<BulkReceiveState>>>,
-}
-
-enum TcpOutput {
-    Data {
-        payload: Bytes,
-        consumed_offset: Option<u64>,
-    },
-    Eof,
-    Close,
 }
 
 #[derive(Clone)]
@@ -1092,119 +1052,6 @@ impl SshServer {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Methods: TcpBulkSender
-//--------------------------------------------------------------------------------------------------
-
-impl TcpBulkSender {
-    fn new(state: BulkSendState) -> Self {
-        Self {
-            state: Mutex::new(state),
-            credit_ready: Notify::new(),
-            closed: AtomicBool::new(false),
-        }
-    }
-
-    async fn send(&self, client: &AgentClient, id: u32, data: Bytes) -> MicrosandboxResult<()> {
-        let mut remaining = data;
-        while !remaining.is_empty() {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(MicrosandboxError::Custom(
-                    "TCP bulk stream is already closed".into(),
-                ));
-            }
-            // Register the waiter before inspecting credit so an update cannot be lost between
-            // the check and the await.
-            let notified = self.credit_ready.notified();
-            let next = {
-                let mut state = self.state.lock().await;
-                let len = remaining
-                    .len()
-                    .min(state.max_record_payload() as usize)
-                    .min(state.available_credit() as usize);
-                if len == 0 {
-                    None
-                } else {
-                    let offset = state.admit(len).map_err(|error| {
-                        MicrosandboxError::Custom(format!("admit TCP bulk record: {error}"))
-                    })?;
-                    Some((offset, len))
-                }
-            };
-
-            let Some((offset, len)) = next else {
-                if self.closed.load(Ordering::Acquire) {
-                    return Err(MicrosandboxError::Custom(
-                        "TCP bulk stream closed while waiting for credit".into(),
-                    ));
-                }
-                notified.await;
-                continue;
-            };
-            client
-                .send_bulk(BulkRecord {
-                    id,
-                    kind: BulkKind::Tcp,
-                    flow: BulkFlow::HostToGuest,
-                    offset,
-                    payload: remaining.split_to(len),
-                })
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn apply_credit(&self, credit: BulkCredit) -> MicrosandboxResult<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(MicrosandboxError::Custom(
-                "TCP bulk stream is already closed".into(),
-            ));
-        }
-        let advanced = self
-            .state
-            .lock()
-            .await
-            .apply_credit(credit)
-            .map_err(|error| {
-                MicrosandboxError::Custom(format!("apply TCP bulk credit: {error}"))
-            })?;
-        // A repeated or stale grant is no progress, so it must not look like one.
-        if advanced {
-            self.credit_ready.notify_waiters();
-        }
-        Ok(())
-    }
-
-    /// Bytes the guest has reported written to its destination, and whether that is every byte
-    /// sent to it.
-    async fn consumed(&self) -> (u64, bool) {
-        let state = self.state.lock().await;
-        (
-            state.consumed_offset(),
-            state.consumed_offset() == state.next_offset(),
-        )
-    }
-
-    async fn finish(&self, client: &AgentClient, id: u32) -> MicrosandboxResult<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(MicrosandboxError::Custom(
-                "TCP bulk stream is already closed".into(),
-            ));
-        }
-        let finish =
-            self.state.lock().await.finish().map_err(|error| {
-                MicrosandboxError::Custom(format!("finish TCP bulk flow: {error}"))
-            })?;
-        client.send(id, MessageType::BulkFinish, &finish).await?;
-        Ok(())
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.credit_ready.notify_waiters();
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
 // Methods: SshSession
 //--------------------------------------------------------------------------------------------------
 
@@ -1736,14 +1583,6 @@ impl Overlay for SshTimeoutPatch {
     }
 }
 
-impl Drop for TcpRelayCloseGuard {
-    fn drop(&mut self) {
-        if let Some(sender) = &self.0 {
-            sender.close();
-        }
-    }
-}
-
 impl russh::client::Handler for SshClientHandler {
     type Error = anyhow::Error;
 
@@ -2185,125 +2024,6 @@ impl AsyncWrite for SshStdioStream {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Open the guest TCP connection for an SSH direct-tcpip channel and negotiate its bulk
-/// transfer. `None` is a refusal the SSH peer sees as a rejected open.
-async fn connect_tcp_forward(
-    client: &AgentClient,
-    host_to_connect: &str,
-    port_to_connect: u16,
-) -> anyhow::Result<Option<TcpForward>> {
-    let req = TcpConnect {
-        host: host_to_connect.to_string(),
-        port: port_to_connect,
-        bulk: client
-            .supports(MessageType::BulkAccepted)
-            .then(BulkOffer::tcp),
-    };
-    let (tcp_id, mut tcp_rx) = client.stream_frames(MessageType::TcpConnect, &req).await?;
-    let Some(first) = tcp_rx.recv().await else {
-        tracing::debug!(
-            host = host_to_connect,
-            port = port_to_connect,
-            "ssh direct-tcpip rejected because agent stream closed before connect reply"
-        );
-        return Ok(None);
-    };
-
-    let AgentFrame::Control(first) = first else {
-        tracing::warn!(
-            host = host_to_connect,
-            port = port_to_connect,
-            "ssh direct-tcpip received raw data before connect reply"
-        );
-        return Ok(None);
-    };
-    match first.t {
-        MessageType::TcpConnected => {
-            let _: TcpConnected = first.payload()?;
-            let (bulk_sender, bulk_receiver) = match req.bulk {
-                Some(offer) => {
-                    let Some(AgentFrame::Control(accepted_message)) = tcp_rx.recv().await else {
-                        tracing::warn!(
-                            host = host_to_connect,
-                            port = port_to_connect,
-                            "ssh direct-tcpip stream closed before bulk acceptance"
-                        );
-                        return Ok(None);
-                    };
-                    if accepted_message.t != MessageType::BulkAccepted {
-                        tracing::warn!(
-                            host = host_to_connect,
-                            port = port_to_connect,
-                            message_type = accepted_message.t.as_str(),
-                            "ssh direct-tcpip received unexpected bulk negotiation reply"
-                        );
-                        return Ok(None);
-                    }
-                    let accepted =
-                        accepted_message.payload::<microsandbox_protocol::bulk::BulkAccepted>()?;
-                    let accepted = accepted
-                        .validate_against(
-                            offer,
-                            BulkKind::Tcp,
-                            BULK_FLOW_MASK_HOST_TO_GUEST | BULK_FLOW_MASK_GUEST_TO_HOST,
-                        )
-                        .map_err(|error| {
-                            MicrosandboxError::Custom(format!(
-                                "invalid TCP bulk acceptance: {error}"
-                            ))
-                        })?;
-                    let sender = BulkSendState::new(
-                        BulkKind::Tcp,
-                        BulkFlow::HostToGuest,
-                        accepted.max_record_payload,
-                        accepted.host_to_guest_credit_limit,
-                    )
-                    .map_err(|error| {
-                        MicrosandboxError::Custom(format!("create TCP bulk send state: {error}"))
-                    })?;
-                    let receiver = BulkReceiveState::new(
-                        BulkKind::Tcp,
-                        BulkFlow::GuestToHost,
-                        accepted.max_record_payload,
-                        accepted.guest_to_host_credit_limit,
-                        offer.guest_to_host_credit_limit,
-                    )
-                    .map_err(|error| {
-                        MicrosandboxError::Custom(format!("create TCP bulk receive state: {error}"))
-                    })?;
-                    (Some(Arc::new(TcpBulkSender::new(sender))), Some(receiver))
-                }
-                None => (None, None),
-            };
-            Ok(Some(TcpForward {
-                tcp_id,
-                tcp_rx,
-                bulk_sender,
-                bulk_receiver: bulk_receiver.map(|receiver| Arc::new(Mutex::new(receiver))),
-            }))
-        }
-        MessageType::TcpFailed => {
-            let failed: TcpFailed = first.payload()?;
-            tracing::debug!(
-                host = host_to_connect,
-                port = port_to_connect,
-                error = failed.error,
-                "ssh direct-tcpip rejected because guest TCP connect failed"
-            );
-            Ok(None)
-        }
-        other => {
-            tracing::warn!(
-                host = host_to_connect,
-                port = port_to_connect,
-                message_type = other.as_str(),
-                "ssh direct-tcpip rejected unexpected agent reply"
-            );
-            Ok(None)
-        }
-    }
-}
-
 /// Deliver a definitive open reply without ever leaving an SSH callback waiting on queue space.
 ///
 /// A reply that cannot be queued in time aborts the transport through its separate signal, so a
@@ -2329,11 +2049,6 @@ async fn finish_ssh_open(
             false
         }
     }
-}
-
-/// Wait until the SSH channel or its session is gone. A dropped sender is a dropped session.
-async fn channel_stopped(stop: &mut watch::Receiver<bool>) {
-    let _ = stop.wait_for(|closed| *closed).await;
 }
 
 /// Reject an open from inside an SSH callback without waiting on the session's own queue.
@@ -2373,156 +2088,88 @@ async fn run_tcp_forward(
         mut reply,
         session,
     } = open;
-    let forward = tokio::select! {
+    let link = tokio::select! {
         biased;
-        () = channel_stopped(&mut stop) => None,
-        forward = connect_tcp_forward(&client, &host, port) => match forward {
-            Ok(forward) => forward,
+        () = tcp::stopped(&mut stop) => None,
+        link = tcp::open_tcp(&client, &host, port) => match link {
+            Ok(link) => Some(link),
             Err(error) => {
-                tracing::warn!(host, port, "ssh direct-tcpip connect failed: {error}");
+                tracing::debug!(host, port, "ssh direct-tcpip rejected: {error}");
                 None
             }
         },
     };
     // Queue the confirmation before anything the new channel's relays could write to it.
-    let confirmed = finish_ssh_open(&mut reply, forward.is_some(), &session).await;
-    let Some(TcpForward {
-        tcp_id,
-        tcp_rx,
-        bulk_sender,
-        bulk_receiver,
-    }) = forward
+    let confirmed = finish_ssh_open(&mut reply, link.is_some(), &session).await;
+    let Some(tcp::TcpLink {
+        id: tcp_id,
+        frames,
+        sender,
+        receiver,
+    }) = link
     else {
         return;
     };
 
     let terminated = if confirmed {
-        let (output_tx, output_rx) = mpsc::channel(TCP_OUTPUT_QUEUE_CAPACITY);
-        let mut input = Box::pin(relay_ssh_to_tcp(
+        let (output_tx, output_rx) = mpsc::channel(tcp::TCP_OUTPUT_QUEUE_CAPACITY);
+        let input = std::pin::pin!(relay_ssh_to_tcp(
             channel,
             tcp_id,
             input,
             session.clone(),
             Arc::clone(&client),
-            bulk_sender.as_ref().map(Arc::clone),
+            Arc::clone(&sender),
         ));
-        let mut output = Box::pin(relay_tcp_output_to_ssh(
-            tcp_id,
-            output_rx,
-            writer,
-            Arc::clone(&client),
-            bulk_receiver.as_ref().map(Arc::clone),
-            stop.clone(),
-        ));
-        let mut guest = Box::pin(relay_tcp_to_ssh(
-            tcp_rx,
+        let output_stop = stop.clone();
+        let output_session = session.clone();
+        let output_client = Arc::clone(&client);
+        let receiver_pump = Arc::clone(&receiver);
+        let output = std::pin::pin!(async move {
+            tcp::relay_tcp_output(
+                tcp_id,
+                output_rx,
+                writer,
+                output_client,
+                receiver,
+                output_stop.clone(),
+            )
+            .await;
+            // EOF closed only the SSH channel's write half. The guest's terminal event owns the
+            // channel and emits SSH CLOSE, so Russh wakes the input half too.
+            if !*output_stop.borrow() {
+                let _ = output_session.close(channel).await;
+            }
+        });
+        let guest = std::pin::pin!(tcp::pump_tcp(
+            frames,
             output_tx,
-            bulk_sender.as_ref().map(Arc::clone),
-            bulk_receiver,
+            Arc::clone(&sender),
+            receiver_pump,
         ));
-        let mut finished = None;
-        let mut terminated = None;
-        let mut output_done = false;
-        // Relays that finish before the SSH channel closes still leave the guest stream to close
-        // once it does.
-        loop {
-            tokio::select! {
-                delivered = &mut input, if finished.is_none() => finished = Some(delivered),
-                () = &mut output, if !output_done => {
-                    output_done = true;
-                    // EOF closed only the SSH channel's write half. The guest's terminal event
-                    // owns the channel and emits SSH CLOSE, so Russh wakes the input half too.
-                    let _ = session.close(channel).await;
-                }
-                terminal = &mut guest, if terminated.is_none() => terminated = Some(terminal),
-                () = channel_stopped(&mut stop) => break,
-            }
-        }
-        // The relays keep running: the guest pump applies credit and the output relay discards
-        // and credits guest output. The deadline is idle time. While the input drains, every
-        // credit grant re-arms it; after the finish only the guest reporting more bytes written
-        // does, until it has written all of them. From then on it bounds the wait for the guest's
-        // terminal reply.
-        let mut deadline = tokio::time::Instant::now() + SSH_TCP_CLOSE_TIMEOUT;
-        let mut last_consumed = 0;
-        loop {
-            if let Some(terminal) = terminated {
-                break terminal;
-            }
-            if finished == Some(false) {
-                break false;
-            }
-            // Create the waiter before reading the state a grant changes: a `Notified` receives
-            // `notify_waiters` from its creation on, so a grant in between still wakes it.
-            let mut credit_ready = std::pin::pin!(
-                bulk_sender
-                    .as_deref()
-                    .map(|bulk| bulk.credit_ready.notified())
-            );
-            let awaiting_credit = match bulk_sender.as_deref() {
-                Some(bulk) => finished.is_none() || !bulk.consumed().await.1,
-                None => false,
-            };
-            let credited = async {
-                match credit_ready.as_mut().as_pin_mut() {
-                    Some(notified) if awaiting_credit => notified.await,
-                    _ => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                delivered = &mut input, if finished.is_none() => {
-                    finished = Some(delivered);
-                    deadline = tokio::time::Instant::now() + SSH_TCP_CLOSE_TIMEOUT;
-                }
-                () = &mut output, if !output_done => output_done = true,
-                terminal = &mut guest, if terminated.is_none() => terminated = Some(terminal),
-                () = credited => {
-                    if let Some(bulk) = bulk_sender.as_deref() {
-                        let (consumed, _) = bulk.consumed().await;
-                        if finished.is_none() || consumed > last_consumed {
-                            deadline = tokio::time::Instant::now() + SSH_TCP_CLOSE_TIMEOUT;
-                        }
-                        last_consumed = consumed;
-                    }
-                }
-                () = tokio::time::sleep_until(deadline) => break false,
-            }
-        }
+        tcp::supervise_tcp(&sender, input, output, guest, &mut stop)
+            .await
+            .terminated
     } else {
         false
     };
 
-    let cleanup = async {
-        match (&bulk_sender, terminated) {
-            // The guest closed the stream itself; its terminal reply released the route.
-            (Some(_), true) => {}
-            (Some(bulk), false) => {
-                bulk.close();
-                let _ = client
-                    .cancel_bulk(
-                        tcp_id,
-                        &BulkCancel {
-                            kind: BulkKind::Tcp,
-                            reason: BulkCancelReason::CallerCancelled,
-                            message: "SSH direct-tcpip channel was closed".into(),
-                        },
-                    )
-                    .await;
-            }
-            (None, terminated) => {
-                if !terminated {
-                    let _ = client
-                        .send(tcp_id, MessageType::TcpClose, &TcpClose {})
-                        .await;
-                }
-                client.forget_stream(tcp_id).await;
-            }
-        }
-    };
+    // The guest closed the stream itself; its terminal reply released the route.
+    if terminated {
+        return;
+    }
     // The agent connection may itself be stalled; never hold this channel's supervisor on it.
-    if tokio::time::timeout(SSH_TCP_CLOSE_TIMEOUT, cleanup)
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        SSH_TCP_CLOSE_TIMEOUT,
+        tcp::cancel_tcp(
+            &client,
+            tcp_id,
+            &sender,
+            "SSH direct-tcpip channel was closed",
+        ),
+    )
+    .await
+    .is_err()
     {
         tracing::warn!(tcp_id, "ssh direct-tcpip guest cleanup timed out");
     }
@@ -2541,7 +2188,7 @@ async fn relay_ssh_to_tcp(
     mut input: mpsc::UnboundedReceiver<SshTcpInput>,
     session: russh::server::Handle,
     client: Arc<AgentClient>,
-    bulk_sender: Option<Arc<TcpBulkSender>>,
+    sender: Arc<tcp::TcpBulkSender>,
 ) -> bool {
     loop {
         // A queue closed without an orderly close means the SSH session died: the input may be
@@ -2551,33 +2198,11 @@ async fn relay_ssh_to_tcp(
         };
         let (result, finished) = match item {
             // An orderly close ends the input after the bytes the peer sent before it.
-            SshTcpInput::Eof | SshTcpInput::Close => (
-                match bulk_sender.as_ref() {
-                    Some(sender) => sender.finish(&client, tcp_id).await,
-                    None => client
-                        .send(tcp_id, MessageType::TcpEof, &TcpEof {})
-                        .await
-                        .map_err(MicrosandboxError::from),
-                },
-                true,
-            ),
+            SshTcpInput::Eof | SshTcpInput::Close => (sender.finish(&client, tcp_id).await, true),
             SshTcpInput::Data(data) => {
                 let len = data.len();
-                let sent = match bulk_sender.as_ref() {
-                    Some(sender) => sender.send(&client, tcp_id, data).await,
-                    None => client
-                        .send(
-                            tcp_id,
-                            MessageType::TcpData,
-                            &TcpData {
-                                data: data.to_vec(),
-                            },
-                        )
-                        .await
-                        .map_err(MicrosandboxError::from),
-                };
                 // The guest stream holds these bytes now; let the SSH peer send as many again.
-                let credited = match sent {
+                let credited = match sender.send(&client, tcp_id, data).await {
                     Ok(()) => match u32::try_from(len) {
                         Ok(len) => {
                             // A connection that is already gone needs no window back, and the
@@ -2601,9 +2226,7 @@ async fn relay_ssh_to_tcp(
                 tcp_id,
                 "ssh direct-tcpip: host-to-guest relay failed: {error}"
             );
-            if let Some(sender) = &bulk_sender {
-                sender.close();
-            }
+            sender.close();
             let _ = session.close(channel).await;
             return false;
         }
@@ -2611,238 +2234,6 @@ async fn relay_ssh_to_tcp(
             return true;
         }
     }
-}
-
-/// Drain guest TCP data into the independently writable Russh channel stream.
-///
-/// Once the SSH channel is closed its output has nowhere to go: guest data is discarded but still
-/// credited, so the guest keeps reading its destination while the forward closes.
-async fn relay_tcp_output_to_ssh<W>(
-    tcp_id: u32,
-    mut output: mpsc::Receiver<TcpOutput>,
-    mut writer: W,
-    client: Arc<AgentClient>,
-    bulk_receiver: Option<Arc<Mutex<BulkReceiveState>>>,
-    mut stop: watch::Receiver<bool>,
-) where
-    W: AsyncWrite + Unpin,
-{
-    let mut open = true;
-    while let Some(event) = output.recv().await {
-        match event {
-            TcpOutput::Data {
-                payload,
-                consumed_offset,
-            } => {
-                if open {
-                    // A closed channel may never return the window this write waits on.
-                    open = tokio::select! {
-                        written = writer.write_all(&payload) => written.is_ok(),
-                        () = channel_stopped(&mut stop) => false,
-                    };
-                }
-                let Some(consumed_offset) = consumed_offset else {
-                    continue;
-                };
-                let Some(receiver) = bulk_receiver.as_ref() else {
-                    tracing::warn!("ssh direct-tcpip: raw output lost its receive state");
-                    break;
-                };
-                let credit = match receiver.lock().await.consume(consumed_offset) {
-                    Ok(credit) => credit,
-                    Err(error) => {
-                        tracing::warn!(
-                            "ssh direct-tcpip: failed to advance TCP bulk credit: {error}"
-                        );
-                        break;
-                    }
-                };
-                if let Some(credit) = credit
-                    && let Err(error) = client.send(tcp_id, MessageType::BulkCredit, &credit).await
-                {
-                    tracing::warn!(
-                        "ssh direct-tcpip: failed to replenish TCP bulk credit: {error}"
-                    );
-                    break;
-                }
-            }
-            TcpOutput::Eof => {
-                if open && writer.shutdown().await.is_err() {
-                    open = false;
-                }
-            }
-            TcpOutput::Close => break,
-        }
-    }
-
-    let _ = writer.shutdown().await;
-}
-
-/// Pump agent frames without waiting on the SSH channel's output window. The bounded output queue
-/// can hold agentd's complete per-flow record queue, while negotiated credit independently bounds
-/// its payload bytes.
-///
-/// Once the SSH channel is closed and its output relay gone, guest output is discarded while
-/// this keeps applying host-to-guest credit, so input sent before the close can still drain.
-/// Returns whether the guest ended the stream with a terminal reply.
-async fn relay_tcp_to_ssh(
-    mut tcp_rx: tokio::sync::mpsc::Receiver<AgentFrame>,
-    output: mpsc::Sender<TcpOutput>,
-    bulk_sender: Option<Arc<TcpBulkSender>>,
-    bulk_receiver: Option<Arc<Mutex<BulkReceiveState>>>,
-) -> bool {
-    let _close_guard = TcpRelayCloseGuard(bulk_sender.as_ref().map(Arc::clone));
-    // Only the guest's own end of the stream releases its route; a protocol failure leaves the
-    // stream open for the caller to cancel.
-    let mut terminal = false;
-    loop {
-        let Some(frame) = tcp_rx.recv().await else {
-            terminal = true;
-            break;
-        };
-        match frame {
-            AgentFrame::Bulk(record) => {
-                let Some(receiver) = bulk_receiver.as_ref() else {
-                    tracing::warn!("ssh direct-tcpip: raw data arrived without bulk negotiation");
-                    break;
-                };
-                let end = match receiver.lock().await.accept_record(&record) {
-                    Ok(end) => end,
-                    Err(error) => {
-                        tracing::warn!("ssh direct-tcpip: invalid raw TCP record: {error}");
-                        break;
-                    }
-                };
-                forward(
-                    &output,
-                    TcpOutput::Data {
-                        payload: record.payload,
-                        consumed_offset: Some(end),
-                    },
-                )
-                .await;
-            }
-            AgentFrame::Control(msg) => match msg.t {
-                MessageType::TcpData => {
-                    if bulk_receiver.is_some() {
-                        tracing::warn!(
-                            "ssh direct-tcpip: CBOR TCP data arrived after bulk acceptance"
-                        );
-                        break;
-                    }
-                    let data = match msg.payload::<TcpData>() {
-                        Ok(data) => data,
-                        Err(error) => {
-                            tracing::warn!("ssh direct-tcpip: failed to decode tcp data: {error}");
-                            break;
-                        }
-                    };
-                    forward(
-                        &output,
-                        TcpOutput::Data {
-                            payload: Bytes::from(data.data),
-                            consumed_offset: None,
-                        },
-                    )
-                    .await;
-                }
-                MessageType::BulkCredit => {
-                    let Some(sender) = bulk_sender.as_ref() else {
-                        tracing::warn!("ssh direct-tcpip: bulk credit arrived without negotiation");
-                        break;
-                    };
-                    let credit = match msg.payload::<BulkCredit>() {
-                        Ok(credit) => credit,
-                        Err(error) => {
-                            tracing::warn!(
-                                "ssh direct-tcpip: failed to decode TCP bulk credit: {error}"
-                            );
-                            break;
-                        }
-                    };
-                    if let Err(error) = sender.apply_credit(credit).await {
-                        tracing::warn!("ssh direct-tcpip: invalid TCP bulk credit: {error}");
-                        break;
-                    }
-                }
-                MessageType::BulkFinish => {
-                    let Some(receiver) = bulk_receiver.as_ref() else {
-                        tracing::warn!("ssh direct-tcpip: bulk finish arrived without negotiation");
-                        break;
-                    };
-                    let finish = match msg.payload::<BulkFinish>() {
-                        Ok(finish) => finish,
-                        Err(error) => {
-                            tracing::warn!(
-                                "ssh direct-tcpip: failed to decode TCP bulk finish: {error}"
-                            );
-                            break;
-                        }
-                    };
-                    if let Err(error) = receiver.lock().await.accept_finish(finish) {
-                        tracing::warn!("ssh direct-tcpip: invalid TCP bulk finish: {error}");
-                        break;
-                    }
-                    forward(&output, TcpOutput::Eof).await;
-                }
-                MessageType::BulkCancel => {
-                    match msg.payload::<BulkCancel>() {
-                        Ok(cancel) => tracing::debug!(
-                            reason = ?cancel.reason,
-                            message = cancel.message,
-                            "ssh direct-tcpip: guest cancelled TCP bulk stream"
-                        ),
-                        Err(error) => tracing::warn!(
-                            "ssh direct-tcpip: failed to decode TCP bulk cancellation: {error}"
-                        ),
-                    }
-                    break;
-                }
-                MessageType::TcpEof => {
-                    if bulk_receiver.is_some() {
-                        tracing::warn!(
-                            "ssh direct-tcpip: CBOR TCP EOF arrived after bulk acceptance"
-                        );
-                        break;
-                    }
-                    if let Err(error) = msg.payload::<TcpEof>() {
-                        tracing::warn!("ssh direct-tcpip: failed to decode tcp eof: {error}");
-                    }
-                    forward(&output, TcpOutput::Eof).await;
-                }
-                MessageType::TcpClosed => {
-                    if let Err(error) = msg.payload::<TcpClosed>() {
-                        tracing::warn!("ssh direct-tcpip: failed to decode tcp closed: {error}");
-                    }
-                    terminal = true;
-                    break;
-                }
-                MessageType::TcpFailed => {
-                    match msg.payload::<TcpFailed>() {
-                        Ok(failed) => tracing::debug!(
-                            error = failed.error,
-                            "ssh direct-tcpip: guest TCP stream failed"
-                        ),
-                        Err(error) => {
-                            tracing::warn!("ssh direct-tcpip: failed to decode tcp failed: {error}")
-                        }
-                    }
-                    terminal = true;
-                    break;
-                }
-                _ => {}
-            },
-        }
-    }
-
-    forward(&output, TcpOutput::Close).await;
-    terminal
-}
-
-/// Hand one guest event to the SSH output relay. Once the SSH channel is closed that relay is gone
-/// and the event has nowhere to go.
-async fn forward(output: &mpsc::Sender<TcpOutput>, event: TcpOutput) {
-    let _ = output.send(event).await;
 }
 
 async fn build_authorized_keys(

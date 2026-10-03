@@ -1120,7 +1120,7 @@ struct SandboxCreateOpts {
     image: Option<String>,
     image_fstype: Option<String>,
     /// Host directory used directly as the root filesystem (bind rootfs).
-    /// Mutually exclusive with `image` and `snapshot`.
+    /// Mutually exclusive with `image` and `from_snapshot`.
     image_bind: Option<String>,
     /// Structured root disk config for an OCI rootfs.
     root_disk: Option<RootDiskOpts>,
@@ -2460,7 +2460,7 @@ pub unsafe extern "C" fn msb_sandbox_create(
 
             if opts.image_bind.is_some() && opts.image.is_some() {
                 return Err(FfiError::invalid_argument(
-                    "image_bind is mutually exclusive with image and snapshot",
+                    "image_bind is mutually exclusive with image",
                 ));
             }
             if let Some(img) = opts.image {
