@@ -78,6 +78,18 @@ pub struct TcpSession {
     drain: watch::Sender<bool>,
 }
 
+/// Watches a session's teardown state, which the session and its relay task share.
+#[cfg(test)]
+pub(crate) struct RelayProbe(std::sync::Weak<Mutex<Teardown>>);
+
+#[cfg(test)]
+impl RelayProbe {
+    /// Whether the session is dropped and its relay task has ended.
+    pub(crate) fn relay_gone(&self) -> bool {
+        self.0.upgrade().is_none()
+    }
+}
+
 /// How [`TcpSession::close`] ends the relay.
 enum Teardown {
     /// Abort the task. Before a connection, and after the relay ended.
@@ -273,6 +285,12 @@ impl TcpSession {
         }
         self.close();
         None
+    }
+
+    /// A probe that reports when both this session and its relay task are gone.
+    #[cfg(test)]
+    pub(crate) fn relay_probe(&self) -> RelayProbe {
+        RelayProbe(Arc::downgrade(&self.teardown))
     }
 
     /// Whether the host-to-guest side ended in order while the relay still runs.
@@ -1853,6 +1871,26 @@ mod tests {
         );
     }
 
+    fn set_socket_option(
+        fd: std::os::fd::RawFd,
+        level: libc::c_int,
+        option: libc::c_int,
+        value: libc::c_int,
+    ) {
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    level,
+                    option,
+                    (&value as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&value) as libc::socklen_t,
+                )
+            },
+            0
+        );
+    }
+
     fn socket_buffer(fd: std::os::fd::RawFd, option: libc::c_int) -> usize {
         let mut bytes: libc::c_int = 0;
         let mut len = std::mem::size_of_val(&bytes) as libc::socklen_t;
@@ -2017,6 +2055,112 @@ mod tests {
         .unwrap();
     }
 
+    /// A connected loopback pair: the guest end, and a destination whose receive buffer is
+    /// small and which never reads unless the test does, as a blocking-free std socket.
+    async fn guest_and_destination() -> (TcpStream, std::net::TcpStream) {
+        /// Guest send buffer asked for; the kernel caps it at twice `net.core.wmem_max`.
+        const SEND_BUFFER: libc::c_int = 1024 * 1024;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        set_socket_buffer(listener.as_raw_fd(), libc::SO_RCVBUF, 16 * 1024);
+        let guest = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (destination, _) = listener.accept().await.unwrap();
+        set_socket_buffer(guest.as_raw_fd(), libc::SO_SNDBUF, SEND_BUFFER);
+        let destination = destination.into_std().unwrap();
+        destination.set_nonblocking(true).unwrap();
+        (guest, destination)
+    }
+
+    /// Queue as much as the guest kernel accepts, leaving it to drain to the destination.
+    fn fill_send_queue(guest: TcpStream) -> TcpStream {
+        use std::io::Write;
+        let mut guest = guest.into_std().unwrap();
+        let chunk = [0x33; 16 * 1024];
+        loop {
+            match guest.write(&chunk) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill the guest send queue: {error}"),
+            }
+        }
+        TcpStream::from_std(guest).unwrap()
+    }
+
+    /// Assert a paused-clock wait ended at `bound`: not before, and no later than the timer
+    /// wheel's rounding of a deadline up to its next millisecond.
+    fn assert_ended_at(started: tokio::time::Instant, bound: Duration) {
+        const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= bound && elapsed <= bound + TIMER_RESOLUTION,
+            "ended after {elapsed:?}, expected {bound:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_the_destination_never_takes_ends_at_the_idle_bound() {
+        let (guest, _destination) = guest_and_destination().await;
+        let mut guest = fill_send_queue(guest);
+        assert!(unsent(guest.as_raw_fd()) > 0);
+        let (mut reader, _writer) = guest.split();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            2 * TCP_DRAIN_MAX,
+            drain_destination(&mut reader, &mut [0; 1024]),
+        )
+        .await
+        .expect("a drain without progress must end");
+        assert_ended_at(started, TCP_DRAIN_IDLE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_keeps_progressing_is_cut_at_the_cap() {
+        use std::io::Read;
+        let (guest, mut destination) = guest_and_destination().await;
+        let mut guest = fill_send_queue(guest);
+        let (mut reader, _writer) = guest.split();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        // Twice in every idle bound the destination takes one read, so the guest kernel
+        // keeps delivering more of its queue, far slower than it could.
+        let slow_destination = tokio::spawn(async move {
+            // Enough to reopen the destination's window, while even a send queue capped by a
+            // default `wmem_max` outlasts the cap at this pace.
+            let mut buffer = [0; 8 * 1024];
+            loop {
+                tokio::time::sleep(TCP_DRAIN_IDLE_TIMEOUT / 2).await;
+                // The guest counts bytes as delivered once acknowledged, and the paused clock
+                // leaves no real time for a delayed acknowledgement.
+                set_socket_option(
+                    destination.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_QUICKACK,
+                    1,
+                );
+                match destination.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("destination read: {error}"),
+                }
+            }
+        });
+        tokio::time::timeout(
+            2 * TCP_DRAIN_MAX,
+            drain_destination(&mut reader, &mut [0; 1024]),
+        )
+        .await
+        .expect("a drain must end at its cap");
+        assert_ended_at(started, TCP_DRAIN_MAX);
+        assert!(
+            unsent(reader.as_ref().as_raw_fd()) > 0,
+            "the destination was still taking bytes when the cap cut it"
+        );
+        slow_destination.abort();
+    }
+
     /// Bytes waiting to be read on a socket.
     fn readable(fd: std::os::fd::RawFd) -> usize {
         let mut bytes: libc::c_int = 0;
@@ -2053,6 +2197,18 @@ mod tests {
             peer.write_all(b"output read before the cancel")
                 .await
                 .unwrap();
+            // Wait for the output to reach the guest socket without letting the relay run, so it
+            // is certainly the relay that takes it, and then blocks on the budget. This blocks the
+            // runtime, so the test's own timeout cannot fire; the spin has a deadline of its own.
+            const DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
+            let spin_started = std::time::Instant::now();
+            while readable(probe.as_raw_fd()) == 0 {
+                assert!(
+                    spin_started.elapsed() < DELIVERY_DEADLINE,
+                    "the destination's output never reached the guest socket"
+                );
+                std::thread::yield_now();
+            }
             while readable(probe.as_raw_fd()) != 0 {
                 tokio::task::yield_now().await;
             }
