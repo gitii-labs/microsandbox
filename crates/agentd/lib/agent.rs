@@ -5303,7 +5303,11 @@ mod tests {
         let mut peer = peer.into_std().unwrap();
         peer.set_nonblocking(false).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        matches!(peer.read(&mut [0u8; 1]), Ok(0))
+        // Teardown resets a stream that was still relaying; either way the socket is gone.
+        match peer.read(&mut [0u8; 1]) {
+            Ok(read) => read == 0,
+            Err(error) => error.kind() == std::io::ErrorKind::ConnectionReset,
+        }
     }
 
     #[tokio::test]

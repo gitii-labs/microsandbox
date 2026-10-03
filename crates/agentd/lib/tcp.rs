@@ -3,6 +3,8 @@
 //! Handles `core.tcp.*` protocol messages by opening TCP sockets from
 //! inside the guest and relaying bytes between those sockets and the host.
 
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -62,6 +64,9 @@ pub struct TcpSession {
     bulk_control: Option<TcpBulkControlSenders>,
     task: JoinHandle<()>,
     bulk: bool,
+    /// A second handle on the connected destination socket, so teardown can reset it while the
+    /// relay task still owns the stream.
+    socket: Arc<Mutex<Option<OwnedFd>>>,
 }
 
 enum TcpCommand {
@@ -200,10 +205,26 @@ impl TcpSession {
     /// Tear down the TCP session.
     ///
     /// Aborts the relay task directly rather than queuing a command, so teardown
-    /// never waits behind a full command queue. Dropping the task closes the
-    /// guest socket. The host has already closed its side before asking for this,
-    /// so no terminal frame is owed back to it.
+    /// never waits behind a full command queue. The host has already closed its
+    /// side before asking for this, so no terminal frame is owed back to it.
+    ///
+    /// A stream still relaying is cut off, not ended: its destination socket is reset, so the
+    /// destination cannot mistake a truncated stream for a complete one. A relay that already
+    /// finished ended its stream in order and is left alone.
     pub fn close(&self) {
+        if !self.task.is_finished()
+            && let Some(socket) = self
+                .socket
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+            && let Err(error) = set_zero_linger(socket)
+        {
+            eprintln!(
+                "agentd: failed to reset TCP stream {}: {error}",
+                self.owner_id
+            );
+        }
         self.task.abort();
     }
 
@@ -249,8 +270,18 @@ impl TcpSession {
             (None, None)
         };
         let output_tx = session_tx.clone();
+        let socket = Arc::new(Mutex::new(None));
+        let task_socket = Arc::clone(&socket);
         let task = tokio::spawn(async move {
-            connect_and_relay(id, req, commands_rx, bulk_control_rx, output_tx).await;
+            connect_and_relay(
+                id,
+                req,
+                commands_rx,
+                bulk_control_rx,
+                output_tx,
+                task_socket,
+            )
+            .await;
         });
 
         Self {
@@ -259,6 +290,7 @@ impl TcpSession {
             bulk_control,
             task,
             bulk,
+            socket,
         }
     }
 }
@@ -279,6 +311,7 @@ async fn connect_and_relay(
     commands: mpsc::Receiver<TcpCommand>,
     bulk_control: Option<TcpBulkControlReceivers>,
     tx: SessionOutputSender,
+    socket: Arc<Mutex<Option<OwnedFd>>>,
 ) {
     let TcpConnect { host, port, bulk } = req;
     let connect = TcpStream::connect((host.as_str(), port));
@@ -313,6 +346,16 @@ async fn connect_and_relay(
             return;
         }
     };
+
+    match stream.as_fd().try_clone_to_owned() {
+        Ok(handle) => {
+            *socket
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+        }
+        // Without the handle, teardown still closes the stream, just not with a reset.
+        Err(error) => eprintln!("agentd: failed to keep TCP stream {id} for reset: {error}"),
+    }
 
     if !send_raw_tcp_message(
         id,
@@ -477,7 +520,10 @@ async fn relay_tcp_session(
 ) {
     // A single task still owns protocol state, but independent socket halves let a blocked
     // destination write make progress concurrently with guest-to-host reads.
-    let (mut reader, mut writer) = stream.into_split();
+    // Borrowed halves: unlike `into_split`, dropping them never shuts the write side down, so
+    // an aborted relay leaves `TcpSession::close` free to reset the stream instead.
+    let mut stream = stream;
+    let (mut reader, mut writer) = stream.split();
     let (mut credit_rx, mut finish_rx) = match bulk_control {
         Some(control) => (Some(control.credit), Some(control.finish)),
         None => (None, None),
@@ -693,7 +739,21 @@ async fn relay_tcp_session(
                                 .await;
                                 break;
                             };
-                            match state.receive.consume(end) {
+                            // While a finish is pending the host is waiting for this flow to
+                            // drain; report every completed write so it can tell a slow
+                            // destination from a stalled one. Credit is absolute, so an extra
+                            // report repeats the current limit with a newer consumed offset.
+                            let consumed = state.receive.consume(end).map(|credit| {
+                                credit.or_else(|| {
+                                    pending_finish.is_some().then(|| BulkCredit {
+                                        kind: BulkKind::Tcp,
+                                        flow: BulkFlow::HostToGuest,
+                                        consumed_offset: end,
+                                        credit_limit: state.receive.credit_limit(),
+                                    })
+                                })
+                            });
+                            match consumed {
                                 Ok(Some(credit)) => {
                                     if !send_raw_tcp_message(
                                         id,
@@ -856,6 +916,30 @@ async fn relay_tcp_session(
             &tx,
         )
         .await;
+    }
+}
+
+/// Make the socket's final close send a reset instead of an orderly end of stream.
+fn set_zero_linger(socket: &OwnedFd) -> std::io::Result<()> {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: `socket` is an open descriptor for the duration of the call, and `linger` outlives
+    // it with the size passed alongside.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            std::mem::size_of_val(&linger) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -1318,6 +1402,7 @@ mod tests {
                 bulk_control: Some(TcpBulkControlSenders { credit, finish }),
                 task,
                 bulk: true,
+                socket: Arc::new(Mutex::new(None)),
             };
             peer.shutdown().await.unwrap();
             assert_tcp_output_through_eof(&mut rx, true, b"").await;
@@ -1363,6 +1448,11 @@ mod tests {
             ));
             peer.read_to_end(&mut received).await.unwrap();
             assert_eq!(received, payload);
+            // The write completed while the finish was pending, so it is reported.
+            let credit = recv_message(&mut rx).await;
+            assert_eq!(credit.t, MessageType::BulkCredit);
+            let credit: BulkCredit = credit.payload().unwrap();
+            assert_eq!(credit.consumed_offset, payload.len() as u64);
             assert_one_normal_terminal(&session, &mut rx).await;
         })
         .await
@@ -1422,11 +1512,21 @@ mod tests {
             .await
             .unwrap();
 
-        let record = recv_bulk(&mut session_rx).await;
+        // The host write may complete before or after its finish arrives; only a write completed
+        // with the finish pending reports its progress.
+        let record = recv_skipping_host_credit(&mut session_rx).await;
+        let SessionOutput::Bulk(record) = record else {
+            panic!("expected the destination's record");
+        };
+        let record = record.record;
         assert_eq!(record.flow, BulkFlow::GuestToHost);
         assert_eq!(record.offset, 0);
         assert_eq!(record.payload, Bytes::from_static(b"from-destination"));
-        let finish = recv_message(&mut session_rx).await;
+        let SessionOutput::Raw(mut finish) = recv_skipping_host_credit(&mut session_rx).await
+        else {
+            panic!("expected the destination's finish");
+        };
+        let finish = decode_one_message(&mut finish.frame);
         assert_eq!(finish.t, MessageType::BulkFinish);
         let finish: BulkFinish = finish.payload().unwrap();
         assert_eq!(finish.final_offset, b"from-destination".len() as u64);
@@ -1439,6 +1539,144 @@ mod tests {
         session.close();
         wait_finished(&session).await;
         accept_task.await.unwrap();
+    }
+
+    /// Opens a raw-bulk session to a fresh loopback destination and returns it with the
+    /// accepted destination socket, past the connect and bulk acceptance replies.
+    async fn open_bulk_session(
+        id: u32,
+        tx: &SessionOutputSender,
+        rx: &mut mpsc::Receiver<SessionOutputEnvelope>,
+    ) -> (TcpSession, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let session = TcpSession::open(
+            id,
+            TcpConnect {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                bulk: Some(BulkOffer::tcp()),
+            },
+            tx,
+        );
+        let (peer, _) = listener.accept().await.unwrap();
+        assert_eq!(recv_message(rx).await.t, MessageType::TcpConnected);
+        assert_eq!(recv_message(rx).await.t, MessageType::BulkAccepted);
+        (session, peer)
+    }
+
+    fn host_record(id: u32, offset: u64, payload: Bytes) -> AdmittedBulkRecord {
+        AdmittedBulkRecord::for_test(BulkRecord {
+            id,
+            kind: BulkKind::Tcp,
+            flow: BulkFlow::HostToGuest,
+            offset,
+            payload,
+        })
+    }
+
+    #[tokio::test]
+    async fn cancel_resets_the_destination_but_a_finish_ends_it_in_order() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let payload = Bytes::from_static(b"cut off before the host finished");
+
+            let (session, mut peer) = open_bulk_session(41, &tx, &mut rx).await;
+            session
+                .write_bulk(host_record(41, 0, payload.clone()))
+                .await
+                .unwrap();
+            let mut received = vec![0; payload.len()];
+            peer.read_exact(&mut received).await.unwrap();
+            session.close();
+            drop(session);
+            let error = peer.read(&mut [0]).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+
+            let (session, mut peer) = open_bulk_session(42, &tx, &mut rx).await;
+            session
+                .write_bulk(host_record(42, 0, payload.clone()))
+                .await
+                .unwrap();
+            session
+                .finish_bulk(BulkFinish {
+                    kind: BulkKind::Tcp,
+                    flow: BulkFlow::HostToGuest,
+                    final_offset: payload.len() as u64,
+                })
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, payload);
+            drop(peer);
+            wait_finished(&session).await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_write_drained_after_the_finish_reports_progress() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            const RECORDS: u64 = 4;
+            let record_len = u64::from(DEFAULT_BULK_RECORD_PAYLOAD);
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let (session, mut peer) = open_bulk_session(43, &tx, &mut rx).await;
+            // The finish overtakes every record, so each write completes with it pending, far
+            // below the half-window point where ordinary credit would be sent.
+            session
+                .finish_bulk(BulkFinish {
+                    kind: BulkKind::Tcp,
+                    flow: BulkFlow::HostToGuest,
+                    final_offset: RECORDS * record_len,
+                })
+                .await
+                .unwrap();
+            while session.bulk_control.as_ref().unwrap().finish.capacity() == 0 {
+                tokio::task::yield_now().await;
+            }
+            for record in 0..RECORDS {
+                session
+                    .write_bulk(host_record(
+                        43,
+                        record * record_len,
+                        Bytes::from(vec![record as u8; record_len as usize]),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let destination = tokio::spawn(async move {
+                let mut received = Vec::new();
+                peer.read_to_end(&mut received).await.unwrap();
+                received.len() as u64
+            });
+            assert_eq!(destination.await.unwrap(), RECORDS * record_len);
+
+            let mut consumed = Vec::new();
+            loop {
+                let SessionOutput::Raw(mut output) = rx.recv().await.unwrap().output else {
+                    panic!("the destination sent nothing");
+                };
+                let message = decode_one_message(&mut output.frame);
+                match message.t {
+                    MessageType::BulkCredit => {
+                        let credit: BulkCredit = message.payload().unwrap();
+                        assert_eq!(credit.flow, BulkFlow::HostToGuest);
+                        consumed.push(credit.consumed_offset);
+                    }
+                    MessageType::BulkFinish => {}
+                    MessageType::TcpClosed => break,
+                    other => panic!("unexpected TCP output: {other:?}"),
+                }
+            }
+            assert_eq!(
+                consumed,
+                (1..=RECORDS).map(|n| n * record_len).collect::<Vec<_>>()
+            );
+            wait_finished(&session).await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1530,6 +1768,7 @@ mod tests {
             bulk_control: Some(TcpBulkControlSenders { credit, finish }),
             task,
             bulk: true,
+            socket: Arc::new(Mutex::new(None)),
         };
         let payload = Bytes::from(vec![0u8; MIN_BULK_RECORD_PAYLOAD as usize]);
 
@@ -1626,6 +1865,12 @@ mod tests {
                             assert_eq!(finish.final_offset, received.len() as u64);
                             break;
                         }
+                        // Progress of the opposite, host-to-guest flow after its finish.
+                        MessageType::BulkCredit => {
+                            assert!(raw);
+                            let credit = message.payload::<BulkCredit>().unwrap();
+                            assert_eq!(credit.flow, BulkFlow::HostToGuest);
+                        }
                         _ => panic!("unexpected TCP output: {:?}", message.t),
                     }
                 }
@@ -1639,7 +1884,10 @@ mod tests {
         session: &TcpSession,
         rx: &mut mpsc::Receiver<SessionOutputEnvelope>,
     ) {
-        let closed = recv_message(rx).await;
+        let SessionOutput::Raw(mut closed) = recv_skipping_host_credit(rx).await else {
+            panic!("expected the TCP terminal");
+        };
+        let closed = decode_one_message(&mut closed.frame);
         assert_eq!(closed.t, MessageType::TcpClosed);
         assert_eq!(closed.flags, FLAG_TERMINAL);
         closed.payload::<TcpClosed>().unwrap();
@@ -1670,6 +1918,24 @@ mod tests {
             panic!("expected SessionOutput::Raw frame");
         };
         decode_one_message(&mut output.frame)
+    }
+
+    /// The next output that is not a host-to-guest progress report.
+    async fn recv_skipping_host_credit(
+        rx: &mut mpsc::Receiver<SessionOutputEnvelope>,
+    ) -> SessionOutput {
+        loop {
+            let output = rx.recv().await.unwrap().output;
+            if let SessionOutput::Raw(raw) = &output {
+                let message = decode_one_message(&mut raw.frame.clone());
+                if message.t == MessageType::BulkCredit {
+                    let credit: BulkCredit = message.payload().unwrap();
+                    assert_eq!(credit.flow, BulkFlow::HostToGuest);
+                    continue;
+                }
+            }
+            return output;
+        }
     }
 
     async fn recv_bulk(rx: &mut mpsc::Receiver<SessionOutputEnvelope>) -> BulkRecord {

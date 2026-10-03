@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -244,6 +244,8 @@ enum ChannelState {
 struct TcpBulkSender {
     state: Mutex<BulkSendState>,
     credit_ready: Notify,
+    /// Bytes the guest has reported written to its destination.
+    consumed: AtomicU64,
     closed: AtomicBool,
 }
 
@@ -253,6 +255,9 @@ struct TcpRelayCloseGuard(Option<Arc<TcpBulkSender>>);
 enum SshTcpInput {
     Data(Bytes),
     Eof,
+    /// The peer closed the channel in order. A queue that closes without it means the SSH session
+    /// itself is gone, and the forward aborts.
+    Close,
 }
 
 /// A pending SSH direct-tcpip open, handed from the session loop to the channel's supervisor.
@@ -1097,6 +1102,7 @@ impl TcpBulkSender {
         Self {
             state: Mutex::new(state),
             credit_ready: Notify::new(),
+            consumed: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         }
     }
@@ -1156,15 +1162,26 @@ impl TcpBulkSender {
                 "TCP bulk stream is already closed".into(),
             ));
         }
-        self.state
+        let advanced = self
+            .state
             .lock()
             .await
             .apply_credit(credit)
             .map_err(|error| {
                 MicrosandboxError::Custom(format!("apply TCP bulk credit: {error}"))
             })?;
-        self.credit_ready.notify_waiters();
+        // A repeated or stale grant is no progress, so it must not look like one.
+        if advanced {
+            self.consumed
+                .fetch_max(credit.consumed_offset, Ordering::AcqRel);
+            self.credit_ready.notify_waiters();
+        }
         Ok(())
+    }
+
+    /// Whether the guest has not yet reported every sent byte written to its destination.
+    async fn unconsumed(&self) -> bool {
+        self.consumed.load(Ordering::Acquire) < self.state.lock().await.next_offset()
     }
 
     async fn finish(&self, client: &AgentClient, id: u32) -> MicrosandboxResult<()> {
@@ -1626,7 +1643,9 @@ impl russh::server::Handler for SshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         match self.channels.remove(&channel) {
-            Some(ChannelState::Tcp { stop, .. }) => {
+            Some(ChannelState::Tcp { input, stop }) => {
+                // The forward may already have finished its input and dropped the queue.
+                let _ = input.send(SshTcpInput::Close);
                 stop.send_replace(true);
             }
             Some(ChannelState::Exec { control, stdin }) => {
@@ -2385,13 +2404,12 @@ async fn run_tcp_forward(
             bulk_sender.as_ref().map(Arc::clone),
         ));
         let mut output = Box::pin(relay_tcp_output_to_ssh(
-            channel,
             tcp_id,
             output_rx,
             writer,
-            session.clone(),
             Arc::clone(&client),
             bulk_receiver.as_ref().map(Arc::clone),
+            stop.clone(),
         ));
         let mut guest = Box::pin(relay_tcp_to_ssh(
             tcp_rx,
@@ -2407,16 +2425,20 @@ async fn run_tcp_forward(
         loop {
             tokio::select! {
                 delivered = &mut input, if finished.is_none() => finished = Some(delivered),
-                () = &mut output, if !output_done => output_done = true,
+                () = &mut output, if !output_done => {
+                    output_done = true;
+                    // EOF closed only the SSH channel's write half. The guest's terminal event
+                    // owns the channel and emits SSH CLOSE, so Russh wakes the input half too.
+                    let _ = session.close(channel).await;
+                }
                 terminal = &mut guest, if terminated.is_none() => terminated = Some(terminal),
                 () = channel_stopped(&mut stop) => break,
             }
         }
-        // Output to a closed SSH channel has nowhere to go and may wait on its window forever.
-        drop(output);
-        // The guest pump keeps applying credit while the input drains. The deadline is idle
-        // time: every credit grant re-arms it until the finish is sent, and from then on it
-        // bounds the wait for the guest's terminal reply.
+        // The relays keep running: the guest pump applies credit and the output relay discards
+        // and credits guest output. The deadline is idle time: every credit grant re-arms it
+        // until the guest has written every byte sent to it, and from then on it bounds the wait
+        // for the guest's terminal reply.
         loop {
             if let Some(terminal) = terminated {
                 break terminal;
@@ -2424,15 +2446,19 @@ async fn run_tcp_forward(
             if finished == Some(false) {
                 break false;
             }
-            let draining = finished.is_none();
+            let awaiting_credit = match bulk_sender.as_deref() {
+                Some(bulk) => finished.is_none() || bulk.unconsumed().await,
+                None => false,
+            };
             let credited = async {
                 match bulk_sender.as_deref() {
-                    Some(bulk) if draining => bulk.credit_ready.notified().await,
+                    Some(bulk) if awaiting_credit => bulk.credit_ready.notified().await,
                     _ => std::future::pending().await,
                 }
             };
             tokio::select! {
                 delivered = &mut input, if finished.is_none() => finished = Some(delivered),
+                () = &mut output, if !output_done => output_done = true,
                 terminal = &mut guest, if terminated.is_none() => terminated = Some(terminal),
                 () = credited => {}
                 () = tokio::time::sleep(SSH_TCP_CLOSE_TIMEOUT) => break false,
@@ -2483,7 +2509,8 @@ async fn run_tcp_forward(
 ///
 /// This may wait on guest bulk credit safely: the input arrives through the manual-window queue,
 /// so the Russh session loop never waits on it and stays free to process the opposite direction's
-/// channel-window updates and outbound data. Returns whether the guest accepted the end of input.
+/// channel-window updates and outbound data. Returns whether the guest accepted the end of input;
+/// input cut off by a lost SSH session is never finished.
 async fn relay_ssh_to_tcp(
     channel: ChannelId,
     tcp_id: u32,
@@ -2493,11 +2520,14 @@ async fn relay_ssh_to_tcp(
     bulk_sender: Option<Arc<TcpBulkSender>>,
 ) -> bool {
     loop {
-        // A closed queue means the channel is gone: the peer sends nothing more, so finish the
-        // guest's input after the bytes it sent before closing.
-        let item = input.recv().await.unwrap_or(SshTcpInput::Eof);
+        // A queue closed without an orderly close means the SSH session died: the input may be
+        // truncated, so it is never finished.
+        let Some(item) = input.recv().await else {
+            return false;
+        };
         let (result, finished) = match item {
-            SshTcpInput::Eof => (
+            // An orderly close ends the input after the bytes the peer sent before it.
+            SshTcpInput::Eof | SshTcpInput::Close => (
                 match bulk_sender.as_ref() {
                     Some(sender) => sender.finish(&client, tcp_id).await,
                     None => client
@@ -2560,25 +2590,32 @@ async fn relay_ssh_to_tcp(
 }
 
 /// Drain guest TCP data into the independently writable Russh channel stream.
+///
+/// Once the SSH channel is closed its output has nowhere to go: guest data is discarded but still
+/// credited, so the guest keeps reading its destination while the forward closes.
 async fn relay_tcp_output_to_ssh<W>(
-    channel: ChannelId,
     tcp_id: u32,
     mut output: mpsc::Receiver<TcpOutput>,
     mut writer: W,
-    session: russh::server::Handle,
     client: Arc<AgentClient>,
     bulk_receiver: Option<Arc<Mutex<BulkReceiveState>>>,
+    mut stop: watch::Receiver<bool>,
 ) where
     W: AsyncWrite + Unpin,
 {
+    let mut open = true;
     while let Some(event) = output.recv().await {
         match event {
             TcpOutput::Data {
                 payload,
                 consumed_offset,
             } => {
-                if writer.write_all(&payload).await.is_err() {
-                    break;
+                if open {
+                    // A closed channel may never return the window this write waits on.
+                    open = tokio::select! {
+                        written = writer.write_all(&payload) => written.is_ok(),
+                        () = channel_stopped(&mut stop) => false,
+                    };
                 }
                 let Some(consumed_offset) = consumed_offset else {
                     continue;
@@ -2606,8 +2643,8 @@ async fn relay_tcp_output_to_ssh<W>(
                 }
             }
             TcpOutput::Eof => {
-                if writer.shutdown().await.is_err() {
-                    break;
+                if open && writer.shutdown().await.is_err() {
+                    open = false;
                 }
             }
             TcpOutput::Close => break,
@@ -2615,9 +2652,6 @@ async fn relay_tcp_output_to_ssh<W>(
     }
 
     let _ = writer.shutdown().await;
-    // EOF closes only the SSH channel's write half. The terminal guest TcpClosed/TcpFailed event
-    // owns the full channel lifecycle and must emit SSH CLOSE so Russh wakes the input half too.
-    let _ = session.close(channel).await;
 }
 
 /// Pump agent frames without waiting on the SSH channel's output window. The bounded output queue
