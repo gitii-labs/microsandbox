@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -25,7 +26,8 @@ var ErrTCPCleanupUnknown = errors.New("microsandbox: guest did not confirm the T
 //
 // Both directions are bounded: the guest admits written bytes only up to the
 // credit it granted, and returns credit for received bytes only as Read takes
-// them. Close or Abort must be called to release the connection.
+// them. Call Close or Abort to release the connection; one that becomes
+// unreachable first is aborted.
 type TCPConn struct {
 	conn   *net.UnixConn
 	native *ffi.TCPConn
@@ -57,11 +59,15 @@ func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPCo
 		_, abortErr := native.Abort(context.Background())
 		return nil, errors.Join(fmt.Errorf("microsandbox: guest TCP socket: %w", err), abortErr)
 	}
-	return &TCPConn{
+	c := &TCPConn{
 		conn:   conn.(*net.UnixConn),
 		native: native,
 		remote: tcpAddr{host: host, port: strconv.Itoa(int(port))},
-	}, nil
+	}
+	// A connection dropped without Close or Abort is aborted, never finished: an
+	// unreachable owner cannot vouch that it wrote everything it meant to.
+	runtime.SetFinalizer(c, func(c *TCPConn) { go func() { _ = c.Abort() }() })
+	return c, nil
 }
 
 // Read reads bytes the destination sent. It returns io.EOF once the destination
@@ -90,19 +96,33 @@ func (c *TCPConn) Write(p []byte) (int, error) {
 // CloseWrite half-closes the connection: the destination sees end of stream
 // after every byte written before it, and Read continues until the destination
 // ends its side.
-func (c *TCPConn) CloseWrite() error { return c.conn.CloseWrite() }
+func (c *TCPConn) CloseWrite() error {
+	// Announce the half-close first: an unannounced end of stream aborts.
+	if err := c.native.Finish(); err != nil {
+		return wrapFFI(err)
+	}
+	return c.conn.CloseWrite()
+}
 
 // Close closes the connection in order: every byte written is delivered to the
-// destination, then the guest connection is released without a reset. Bytes the
-// guest stops accepting for longer than an idle bound are discarded with an
-// error. It returns ErrTCPCleanupUnknown when the guest did not confirm the
-// release.
+// destination, the stream is finished, and the guest connection is released
+// without a reset. When the guest stops accepting bytes for longer than an idle
+// bound, the connection is aborted instead and Close returns an error, as it
+// does when any written byte did not reach the destination. It returns
+// ErrTCPCleanupUnknown when the guest did not confirm the release.
 func (c *TCPConn) Close() error {
 	return c.release(func() (bool, error) {
-		// The native side delivers what it reads up to the socket's end, so the end comes first.
-		socketErr := c.conn.Close()
+		// The native side delivers what it reads up to this end of stream, then finishes.
+		finishErr := c.native.Finish()
+		if finishErr == nil {
+			finishErr = c.conn.CloseWrite()
+		}
+		if finishErr != nil {
+			acknowledged, err := c.native.Abort(context.Background())
+			return acknowledged, errors.Join(finishErr, wrapFFI(err), c.conn.Close())
+		}
 		acknowledged, err := c.native.Close(context.Background())
-		return acknowledged, errors.Join(socketErr, wrapFFI(err))
+		return acknowledged, errors.Join(wrapFFI(err), c.conn.Close())
 	})
 }
 
@@ -110,7 +130,7 @@ func (c *TCPConn) Close() error {
 // ErrTCPCleanupUnknown when the guest did not confirm the release.
 func (c *TCPConn) Abort() error {
 	return c.release(func() (bool, error) {
-		// Abort before closing the socket: its end would read as an orderly half-close.
+		// Abort before closing the socket, whose end of stream could otherwise race it.
 		acknowledged, err := c.native.Abort(context.Background())
 		return acknowledged, errors.Join(wrapFFI(err), c.conn.Close())
 	})
@@ -118,6 +138,7 @@ func (c *TCPConn) Abort() error {
 
 func (c *TCPConn) release(release func() (bool, error)) error {
 	c.once.Do(func() {
+		runtime.SetFinalizer(c, nil)
 		acknowledged, err := release()
 		if err == nil && !acknowledged {
 			err = ErrTCPCleanupUnknown

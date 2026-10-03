@@ -2126,15 +2126,17 @@ async fn run_tcp_forward(
         let output_client = Arc::clone(&client);
         let receiver_pump = Arc::clone(&receiver);
         let output = std::pin::pin!(async move {
+            let mut writer = writer;
             tcp::relay_tcp_output(
                 tcp_id,
                 output_rx,
-                writer,
+                &mut writer,
                 output_client,
                 receiver,
                 output_stop.clone(),
             )
             .await;
+            let _ = writer.shutdown().await;
             // EOF closed only the SSH channel's write half. The guest's terminal event owns the
             // channel and emits SSH CLOSE, so Russh wakes the input half too.
             if !*output_stop.borrow() {

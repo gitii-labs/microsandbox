@@ -281,10 +281,12 @@ typedef char *(*msb_sandbox_restore_fn)(uint64_t, const char *, const char *, ui
 static msb_sandbox_restore_fn ptr_msb_sandbox_restore = NULL;
 typedef char *(*msb_sandbox_dial_tcp_fn)(uint64_t, uint64_t, const char *, uint16_t, uint8_t *, size_t);
 typedef char *(*msb_tcp_conn_status_fn)(uint64_t, uint8_t *, size_t);
+typedef char *(*msb_tcp_conn_finish_fn)(uint64_t, uint8_t *, size_t);
 typedef char *(*msb_tcp_conn_close_fn)(uint64_t, uint64_t, uint8_t *, size_t);
 typedef char *(*msb_tcp_conn_abort_fn)(uint64_t, uint64_t, uint8_t *, size_t);
 static msb_sandbox_dial_tcp_fn ptr_msb_sandbox_dial_tcp = NULL;
 static msb_tcp_conn_status_fn ptr_msb_tcp_conn_status = NULL;
+static msb_tcp_conn_finish_fn ptr_msb_tcp_conn_finish = NULL;
 static msb_tcp_conn_close_fn ptr_msb_tcp_conn_close = NULL;
 static msb_tcp_conn_abort_fn ptr_msb_tcp_conn_abort = NULL;
 typedef char *(*msb_creation_progress_open_fn)(uint8_t *, size_t);
@@ -498,6 +500,7 @@ const char *load_microsandbox(const char *path) {
 	// Absent on hosts without Unix socket pairs.
 	RESOLVE_OPTIONAL(msb_sandbox_dial_tcp);
 	RESOLVE_OPTIONAL(msb_tcp_conn_status);
+	RESOLVE_OPTIONAL(msb_tcp_conn_finish);
 	RESOLVE_OPTIONAL(msb_tcp_conn_close);
 	RESOLVE_OPTIONAL(msb_tcp_conn_abort);
 	RESOLVE_OPTIONAL(msb_creation_progress_open);
@@ -686,12 +689,15 @@ char *call_msb_sandbox_shell_path(uint64_t cancel_id, uint64_t handle, uint8_t *
     return ptr_msb_sandbox_shell_path ? ptr_msb_sandbox_shell_path(cancel_id, handle, buf, buf_len) : NULL;
 }
 bool has_sandbox_restore(void) { return ptr_msb_sandbox_restore != NULL; }
-bool has_tcp_dial(void) { return ptr_msb_sandbox_dial_tcp && ptr_msb_tcp_conn_status && ptr_msb_tcp_conn_close && ptr_msb_tcp_conn_abort; }
+bool has_tcp_dial(void) { return ptr_msb_sandbox_dial_tcp && ptr_msb_tcp_conn_status && ptr_msb_tcp_conn_finish && ptr_msb_tcp_conn_close && ptr_msb_tcp_conn_abort; }
 char *call_msb_sandbox_dial_tcp(uint64_t cancel_id, uint64_t handle, const char *host, uint16_t port, uint8_t *buf, size_t buf_len) {
     return ptr_msb_sandbox_dial_tcp(cancel_id, handle, host, port, buf, buf_len);
 }
 char *call_msb_tcp_conn_status(uint64_t conn, uint8_t *buf, size_t buf_len) {
     return ptr_msb_tcp_conn_status(conn, buf, buf_len);
+}
+char *call_msb_tcp_conn_finish(uint64_t conn, uint8_t *buf, size_t buf_len) {
+    return ptr_msb_tcp_conn_finish(conn, buf, buf_len);
 }
 char *call_msb_tcp_conn_close(uint64_t cancel_id, uint64_t conn, uint8_t *buf, size_t buf_len) {
     return ptr_msb_tcp_conn_close(cancel_id, conn, buf, buf_len);
@@ -6092,8 +6098,32 @@ func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPCo
 
 // Status reports why each direction ended, if not in order.
 func (c *TCPConn) Status() (TCPStatus, error) {
+	out, err := c.sync(func(buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_tcp_conn_status(c.handle, buf, bufLen)
+	})
+	if err != nil {
+		return TCPStatus{}, err
+	}
+	var status TCPStatus
+	if err := json.Unmarshal([]byte(out), &status); err != nil {
+		return TCPStatus{}, fmt.Errorf("parse tcp_conn_status: %w", err)
+	}
+	return status, nil
+}
+
+// Finish announces a half-close: the socket's next end of stream finishes the
+// guest stream in order. Call it before shutting the socket's write side down;
+// any other end of stream aborts the connection.
+func (c *TCPConn) Finish() error {
+	_, err := c.sync(func(buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_tcp_conn_finish(c.handle, buf, bufLen)
+	})
+	return err
+}
+
+func (c *TCPConn) sync(fn func(*C.uint8_t, C.size_t) *C.char) (string, error) {
 	buf := make([]byte, defaultBufSize)
-	errPtr := C.call_msb_tcp_conn_status(c.handle, (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	errPtr := fn((*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
 	if errPtr != nil {
 		msg := C.GoString(errPtr)
 		C.call_msb_free_string(errPtr)
@@ -6101,13 +6131,9 @@ func (c *TCPConn) Status() (TCPStatus, error) {
 		if jerr := json.Unmarshal([]byte(msg), &e); jerr != nil {
 			e = Error{Kind: KindInternal, Message: msg}
 		}
-		return TCPStatus{}, &e
+		return "", &e
 	}
-	var status TCPStatus
-	if err := json.Unmarshal([]byte(C.GoString((*C.char)(unsafe.Pointer(&buf[0])))), &status); err != nil {
-		return TCPStatus{}, fmt.Errorf("parse tcp_conn_status: %w", err)
-	}
-	return status, nil
+	return C.GoString((*C.char)(unsafe.Pointer(&buf[0]))), nil
 }
 
 // Close delivers every byte written to the socket, then releases the guest

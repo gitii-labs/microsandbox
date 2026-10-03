@@ -21,6 +21,9 @@ import (
 // Larger than the guest's 8 MiB bulk credit window in either direction.
 const tcpTransferBytes = 20 << 20
 
+// The SDK's idle bound on a closing connection.
+const microsandboxIdleBound = 2 * time.Second
+
 // startGuestServer runs a busybox nc listener inside the guest and waits until it accepts.
 func startGuestServer(t *testing.T, ctx context.Context, sb *microsandbox.Sandbox, port uint16, command string) {
 	t.Helper()
@@ -209,6 +212,94 @@ func TestDialTCP(t *testing.T) {
 		}
 		if err := conn.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
+		}
+	})
+
+	t.Run("writes fail once the guest stream ends", func(t *testing.T) {
+		startGuestServer(t, ctx, sb, 9007, "nc -l -p 9007 -e true")
+		conn, err := sb.DialTCP(ctx, "127.0.0.1", 9007)
+		if err != nil {
+			t.Fatalf("DialTCP: %v", err)
+		}
+		if got, err := io.ReadAll(conn); err != nil || len(got) != 0 {
+			t.Fatalf("read to EOF: %q %v", got, err)
+		}
+		// The destination is gone: a write reaches it as a reset, which ends the guest stream.
+		deadline := time.Now().Add(15 * time.Second)
+		var writeErr error
+		for writeErr == nil && time.Now().Before(deadline) {
+			_, writeErr = conn.Write([]byte("after the destination left"))
+			time.Sleep(50 * time.Millisecond)
+		}
+		if writeErr == nil || !strings.Contains(writeErr.Error(), "guest TCP write") {
+			t.Fatalf("write after the guest stream ended: %v", writeErr)
+		}
+		if err := conn.Close(); err == nil {
+			t.Fatal("Close reported success for undelivered bytes")
+		}
+	})
+
+	t.Run("close on a stalled destination fails within the bound", func(t *testing.T) {
+		startGuestServer(t, ctx, sb, 9005, "nc -l -p 9005 -e sleep 600")
+		conn, err := sb.DialTCP(ctx, "127.0.0.1", 9005)
+		if err != nil {
+			t.Fatalf("DialTCP: %v", err)
+		}
+		if err := conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write(make([]byte, 256<<20)); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("write to a stalled destination: %v", err)
+		}
+		started := time.Now()
+		err = conn.Close()
+		elapsed := time.Since(started)
+		if err == nil || errors.Is(err, microsandbox.ErrTCPCleanupUnknown) {
+			t.Fatalf("Close on a stalled destination: %v", err)
+		}
+		if elapsed > 3*microsandboxIdleBound {
+			t.Fatalf("Close took %v", elapsed)
+		}
+		t.Logf("Close failed after %v: %v", elapsed, err)
+	})
+
+	t.Run("abort returns promptly with unread inbound data", func(t *testing.T) {
+		startGuestServer(t, ctx, sb, 9006, "nc -l -p 9006 -e cat /dev/zero")
+		conn, err := sb.DialTCP(ctx, "127.0.0.1", 9006)
+		if err != nil {
+			t.Fatalf("DialTCP: %v", err)
+		}
+		// Let the destination fill the socket pair, the credit window and the guest's buffers.
+		time.Sleep(time.Second)
+		started := time.Now()
+		if err := conn.Abort(); err != nil {
+			t.Fatalf("Abort: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > microsandboxIdleBound {
+			t.Fatalf("Abort took %v", elapsed)
+		}
+	})
+
+	t.Run("a slow but steady destination receives every byte", func(t *testing.T) {
+		startGuestServer(t, ctx, sb, 9008,
+			"nc -l -p 9008 -e sh -c 'while dd bs=1048576 count=1 2>/dev/null | cat >> /tmp/slow.out; "+
+				"[ $(wc -c < /tmp/slow.out) -lt 25165824 ]; do sleep 0.2; done'")
+		conn, err := sb.DialTCP(ctx, "127.0.0.1", 9008)
+		if err != nil {
+			t.Fatalf("DialTCP: %v", err)
+		}
+		payload := randomBytes(t, 24<<20)
+		started := time.Now()
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		t.Logf("write and close took %v", time.Since(started))
+		got, err := sb.FS().Read(ctx, "/tmp/slow.out")
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("guest received %d of %d bytes (%v)", len(got), len(payload), err)
 		}
 	})
 

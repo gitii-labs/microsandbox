@@ -677,11 +677,11 @@ pub(crate) async fn cancel_tcp(client: &AgentClient, id: u32, sender: &TcpBulkSe
 ///
 /// Once `stop` fires the output has nowhere to go: guest data is discarded but still credited,
 /// so the guest keeps reading its destination while the connection closes. Returns whether the
-/// guest's output ended in order.
+/// guest's output ended in order; the caller shuts the writer down once it has recorded that.
 pub(crate) async fn relay_tcp_output<W>(
     tcp_id: u32,
     mut output: mpsc::Receiver<TcpOutput>,
-    mut writer: W,
+    writer: &mut W,
     client: Arc<AgentClient>,
     receiver: Arc<Mutex<BulkReceiveState>>,
     mut stop: watch::Receiver<bool>,
@@ -727,8 +727,6 @@ where
             TcpOutput::Close => break,
         }
     }
-
-    let _ = writer.shutdown().await;
     eof
 }
 
@@ -893,10 +891,11 @@ async fn run_relay<R, W>(
     let output_client = Arc::clone(&client);
     let output_receiver = Arc::clone(&receiver);
     let mut output = Box::pin(async move {
+        let mut writer = writer;
         let eof = relay_tcp_output(
             id,
             output_rx,
-            writer,
+            &mut writer,
             output_client,
             output_receiver,
             output_stop,
@@ -910,6 +909,8 @@ async fn run_relay<R, W>(
                 "guest TCP stream ended before the destination finished",
             );
         }
+        // The owner sees the end only now, with its cause already recorded.
+        let _ = writer.shutdown().await;
         // Both directions are over: start the close sequence, as a closed SSH channel does.
         output_state.stop.send_replace(true);
     });
@@ -922,6 +923,14 @@ async fn run_relay<R, W>(
         &mut stop,
     )
     .await;
+    // Record why before the reader and writer close: the owner asks once it sees them end.
+    let delivered = end.finished == Some(true) && sender.consumed().await.1;
+    if !delivered && *state.intent.borrow() != Intent::Abort {
+        RelayState::record(
+            &state.write_error,
+            "guest TCP stream ended before every byte reached the destination",
+        );
+    }
     // The pump must reach the terminal reply below without waiting on an output nobody drains.
     drop(output);
     drop(input);
@@ -934,16 +943,6 @@ async fn run_relay<R, W>(
             .await
             .unwrap_or(false)
     };
-    let delivered = end.finished == Some(true) && sender.consumed().await.1;
-    if !delivered
-        && *state.intent.borrow() >= Intent::Finish
-        && *state.intent.borrow() != Intent::Abort
-    {
-        RelayState::record(
-            &state.write_error,
-            "guest TCP stream ended before every byte reached the destination",
-        );
-    }
     state.outcome.send_replace(Some(RelayOutcome {
         delivered,
         cleanup: if terminated {
