@@ -44,3 +44,7 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 typed-path.workspace = true
+
+[dev-dependencies]
+# Paused time drives the TCP drain bounds in tests.
+tokio = { workspace = true, features = ["test-util"] }

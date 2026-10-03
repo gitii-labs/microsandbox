@@ -5405,6 +5405,7 @@ mod tests {
         while !draining.finished_in_order() {
             tokio::task::yield_now().await;
         }
+        let draining_relay = draining.relay_probe();
         cancel_tcp_session(&mut state, draining);
         assert_eq!(state.draining_tcp.len(), 1);
 
@@ -5457,8 +5458,13 @@ mod tests {
             guest_closed_before_return(owned),
             "acknowledged before the socket closed"
         );
-        // The draining stream was ended and awaited before the acknowledgement too.
+        // The draining stream was ended and awaited before the acknowledgement too: its relay
+        // task, which owns the socket, is gone, not merely dropped from the table.
         assert!(state.draining_tcp.is_empty());
+        assert!(
+            draining_relay.relay_gone(),
+            "acknowledged while the draining relay still held its socket"
+        );
         drop(other);
     }
 
