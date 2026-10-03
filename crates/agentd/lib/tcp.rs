@@ -53,6 +53,11 @@ const TCP_COMMAND_CAPACITY: usize = DEFAULT_BULK_WINDOW as usize / MIN_BULK_RECO
 /// the agent's serial loop.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a torn-down stream whose host-to-guest side already ended in order keeps reading
+/// its destination, so the guest kernel can still deliver the queued tail and FIN. A destination
+/// that has not closed by then is closed regardless.
+const TCP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -64,15 +69,31 @@ pub struct TcpSession {
     bulk_control: Option<TcpBulkControlSenders>,
     task: JoinHandle<()>,
     bulk: bool,
-    /// A second handle on the connected destination socket, so teardown can reset it while the
-    /// relay task still owns the stream. Held only while the relay runs and the host-to-guest
-    /// side has not been shut down in order.
-    socket: Arc<Mutex<Option<OwnedFd>>>,
+    /// What a teardown does to the running relay; the relay keeps it current.
+    teardown: Arc<Mutex<Teardown>>,
+    /// Asks a relay whose host-to-guest side ended in order to drain its destination and exit.
+    drain: watch::Sender<bool>,
+    /// Set when a teardown left the relay draining on its own, so nothing waits for it.
+    detached: std::sync::atomic::AtomicBool,
 }
 
-/// The relay's side of [`TcpSession::socket`]: it gives the handle up once the host-to-guest
-/// side is shut down in order, and whenever the relay ends.
-struct ResetHandle(Arc<Mutex<Option<OwnedFd>>>);
+/// How [`TcpSession::close`] ends the relay.
+enum Teardown {
+    /// Abort the task. Before a connection, and after the relay ended.
+    Abort,
+    /// The host-to-guest side is still open: reset the destination through this second handle
+    /// on its socket, so it cannot mistake a cut-off stream for a complete one.
+    Reset(OwnedFd),
+    /// The host-to-guest side ended in order: let the relay drain the destination, so the
+    /// guest kernel still delivers the queued tail and FIN.
+    Drain,
+}
+
+/// The relay's side of [`TcpSession::teardown`]. Dropping it marks the relay ended.
+struct TeardownHandle {
+    state: Arc<Mutex<Teardown>>,
+    drain: watch::Receiver<bool>,
+}
 
 enum TcpCommand {
     Data(Vec<u8>, Option<InputCharge>),
@@ -209,31 +230,45 @@ impl TcpSession {
 
     /// Tear down the TCP session.
     ///
-    /// Aborts the relay task directly rather than queuing a command, so teardown
-    /// never waits behind a full command queue. The host has already closed its
-    /// side before asking for this, so no terminal frame is owed back to it.
+    /// Never waits behind a full command queue. The host has already closed its side before
+    /// asking for this, so no terminal frame is owed back to it.
     ///
     /// A stream whose host-to-guest side is still open is cut off, not ended: its destination
-    /// socket is reset, so the destination cannot mistake a truncated stream for a complete one.
-    /// Once that side was shut down in order, the queued data and FIN are left to drain.
+    /// socket is reset and the relay aborted, so the destination cannot mistake a truncated
+    /// stream for a complete one. Once that side ended in order, the relay instead stops sending
+    /// to the host and reads the destination until it closes, for at most
+    /// [`TCP_DRAIN_TIMEOUT`], so the queued tail and FIN still arrive.
     pub fn close(&self) {
-        if let Some(socket) = self
-            .socket
+        let teardown = self
+            .teardown
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            && let Err(error) = set_zero_linger(socket)
-        {
-            eprintln!(
-                "agentd: failed to reset TCP stream {}: {error}",
-                self.owner_id
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*teardown {
+            Teardown::Drain => {
+                self.drain.send_replace(true);
+                self.detached
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            Teardown::Reset(socket) => {
+                if let Err(error) = set_zero_linger(socket) {
+                    eprintln!(
+                        "agentd: failed to reset TCP stream {}: {error}",
+                        self.owner_id
+                    );
+                }
+            }
+            Teardown::Abort => {}
         }
         self.task.abort();
     }
 
-    /// Waits until a closed session's task, and with it the guest socket, is gone.
+    /// Waits until a closed session's task, and with it the guest socket, is gone. A relay left
+    /// draining its destination owes the host nothing and is not waited for.
     pub async fn finish(self) -> Result<(), String> {
+        if self.detached.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         match self.task.await {
             Ok(()) => Ok(()),
             Err(error) if error.is_cancelled() => Ok(()),
@@ -274,18 +309,14 @@ impl TcpSession {
             (None, None)
         };
         let output_tx = session_tx.clone();
-        let socket = Arc::new(Mutex::new(None));
-        let task_socket = Arc::clone(&socket);
+        let teardown = Arc::new(Mutex::new(Teardown::Abort));
+        let (drain, drain_rx) = watch::channel(false);
+        let handle = TeardownHandle {
+            state: Arc::clone(&teardown),
+            drain: drain_rx,
+        };
         let task = tokio::spawn(async move {
-            connect_and_relay(
-                id,
-                req,
-                commands_rx,
-                bulk_control_rx,
-                output_tx,
-                task_socket,
-            )
-            .await;
+            connect_and_relay(id, req, commands_rx, bulk_control_rx, output_tx, handle).await;
         });
 
         Self {
@@ -294,7 +325,9 @@ impl TcpSession {
             bulk_control,
             task,
             bulk,
-            socket,
+            teardown,
+            drain,
+            detached: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -315,7 +348,7 @@ async fn connect_and_relay(
     commands: mpsc::Receiver<TcpCommand>,
     bulk_control: Option<TcpBulkControlReceivers>,
     tx: SessionOutputSender,
-    socket: Arc<Mutex<Option<OwnedFd>>>,
+    teardown: TeardownHandle,
 ) {
     let TcpConnect { host, port, bulk } = req;
     let connect = TcpStream::connect((host.as_str(), port));
@@ -352,16 +385,10 @@ async fn connect_and_relay(
     };
 
     match stream.as_fd().try_clone_to_owned() {
-        Ok(handle) => {
-            *socket
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
-        }
+        Ok(socket) => teardown.set(Teardown::Reset(socket)),
         // Without the handle, teardown still closes the stream, just not with a reset.
         Err(error) => eprintln!("agentd: failed to keep TCP stream {id} for reset: {error}"),
     }
-    // Every return below ends the relay, so the stream closes as soon as the task does.
-    let reset = ResetHandle(socket);
 
     if !send_raw_tcp_message(
         id,
@@ -435,7 +462,7 @@ async fn connect_and_relay(
         None => None,
     };
 
-    relay_tcp_session(id, stream, commands, bulk_control, tx, bulk, reset).await;
+    relay_tcp_session(id, stream, commands, bulk_control, tx, bulk, teardown).await;
 }
 
 fn accept_tcp_offer(offer: BulkOffer) -> Result<BulkAccepted, String> {
@@ -523,7 +550,7 @@ async fn relay_tcp_session(
     bulk_control: Option<TcpBulkControlReceivers>,
     tx: SessionOutputSender,
     mut bulk: Option<TcpBulkState>,
-    reset: ResetHandle,
+    mut teardown: TeardownHandle,
 ) {
     // A single task still owns protocol state, but independent socket halves let a blocked
     // destination write make progress concurrently with guest-to-host reads.
@@ -546,12 +573,14 @@ async fn relay_tcp_session(
     // The destination half-closed its write side. We stop reading but keep the
     // loop alive so host->destination data still flows until the host closes.
     let mut read_eof = false;
+    // A teardown after the host-to-guest side ended in order.
+    let mut draining = false;
 
     loop {
         // An in-order shutdown has queued every host byte and the FIN; a later teardown must
         // let them drain rather than reset them away.
         if write_shutdown {
-            reset.release();
+            teardown.set(Teardown::Drain);
         }
         // One EOF leaves the opposite half usable. Once both halves finish, all ordered
         // writes have completed and the peer's final output/EOF is already queued. Exit so
@@ -566,6 +595,10 @@ async fn relay_tcp_session(
                 .min(state.send.max_record_payload() as u64) as usize
         });
         tokio::select! {
+            Ok(()) = teardown.drain.changed() => {
+                draining = true;
+                break;
+            }
             Some(finish) = recv_optional_mpsc(&mut finish_rx) => {
                 if pending_finish.replace(finish).is_some() {
                     terminal_sent = send_tcp_failure(
@@ -601,7 +634,7 @@ async fn relay_tcp_session(
                     }
                     write_shutdown = pending_finish.is_none();
                     if write_shutdown {
-                        reset.release();
+                        teardown.set(Teardown::Drain);
                         // Every byte before the finish was already written; tell the host so
                         // it stops waiting for progress.
                         let drained = BulkCredit {
@@ -806,7 +839,7 @@ async fn relay_tcp_session(
                                 write_shutdown = true;
                                 // Before the report below: once the host sees every byte
                                 // written, a teardown it asks for must not reset the stream.
-                                reset.release();
+                                teardown.set(Teardown::Drain);
                             }
                             match consumed {
                                 Ok(Some(credit)) => {
@@ -944,6 +977,13 @@ async fn relay_tcp_session(
         }
     }
 
+    if draining {
+        // The host already closed its side; it is owed no further output or terminal.
+        if !read_eof {
+            drain_destination(&mut reader, &mut read_buf).await;
+        }
+        return;
+    }
     if !terminal_sent {
         send_raw_tcp_message(
             id,
@@ -957,18 +997,39 @@ async fn relay_tcp_session(
     }
 }
 
-impl ResetHandle {
-    fn release(&self) {
-        self.0
+impl TeardownHandle {
+    fn set(&self, teardown: Teardown) {
+        *self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = teardown;
     }
 }
 
-impl Drop for ResetHandle {
+impl Drop for TeardownHandle {
     fn drop(&mut self) {
-        self.release();
+        // The relay is gone, and with it any reason to keep the socket open.
+        self.set(Teardown::Abort);
+    }
+}
+
+/// Read and discard what a torn-down destination still sends until it closes, so the guest
+/// kernel neither resets the stream for unread data nor drops its queued tail and FIN.
+async fn drain_destination<R>(reader: &mut R, buffer: &mut [u8])
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let drained = tokio::time::timeout(TCP_DRAIN_TIMEOUT, async {
+        loop {
+            match reader.read(buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        eprintln!("agentd: TCP destination did not close within the drain bound; closing it");
     }
 }
 
@@ -1167,6 +1228,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(bytes.len(), payload_len);
                 assert!(bytes.iter().all(|byte| *byte == 0x5c));
+                // A teardown after an in-order EOF drains the destination until it closes.
+                drop(peer);
                 session.close();
                 wait_finished(&session).await;
             }
@@ -1448,7 +1511,10 @@ mod tests {
                     )
                     .unwrap(),
                 }),
-                ResetHandle(Arc::new(Mutex::new(None))),
+                TeardownHandle {
+                    state: Arc::new(Mutex::new(Teardown::Abort)),
+                    drain: watch::channel(false).1,
+                },
             ));
             let session = TcpSession {
                 owner_id: 37,
@@ -1456,7 +1522,9 @@ mod tests {
                 bulk_control: Some(TcpBulkControlSenders { credit, finish }),
                 task,
                 bulk: true,
-                socket: Arc::new(Mutex::new(None)),
+                teardown: Arc::new(Mutex::new(Teardown::Abort)),
+                drain: watch::channel(false).0,
+                detached: std::sync::atomic::AtomicBool::new(false),
             };
             peer.shutdown().await.unwrap();
             assert_tcp_output_through_eof(&mut rx, true, b"").await;
@@ -1665,13 +1733,13 @@ mod tests {
             drop(peer);
             wait_finished(&session).await;
             // The relay that ended gave up its handle, so the socket closed with it.
-            assert!(
-                session
-                    .socket
+            assert!(matches!(
+                *session
+                    .teardown
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .is_none()
-            );
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                Teardown::Abort
+            ));
         })
         .await
         .unwrap();
@@ -1692,78 +1760,156 @@ mod tests {
         );
     }
 
+    fn socket_buffer(fd: std::os::fd::RawFd, option: libc::c_int) -> usize {
+        let mut bytes: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&bytes) as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&mut bytes as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            },
+            0
+        );
+        bytes as usize
+    }
+
+    /// Bytes still queued in a socket's send buffer, not yet taken by the peer.
+    fn unsent(fd: std::os::fd::RawFd) -> usize {
+        let mut bytes: libc::c_int = 0;
+        assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut bytes) }, 0);
+        bytes as usize
+    }
+
+    /// A finished upload most of which still sits in the guest kernel's send buffer, with its
+    /// FIN queued behind it, while the destination has not read a byte.
+    struct UnsentTail {
+        session: TcpSession,
+        peer: TcpStream,
+        payload: Vec<u8>,
+        _rx: mpsc::Receiver<SessionOutputEnvelope>,
+    }
+
+    async fn finish_with_unsent_tail(id: u32) -> UnsentTail {
+        /// Guest send buffer asked for; the kernel grants at most twice `net.core.wmem_max`.
+        const SEND_BUFFER: libc::c_int = 4 * 1024 * 1024;
+        /// Upload size ceiling, so a generous host still runs a short test.
+        const MAX_PAYLOAD: usize = 2 * 1024 * 1024;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        set_socket_buffer(listener.as_raw_fd(), libc::SO_RCVBUF, 16 * 1024);
+        let (tx, mut rx) = SessionOutputSender::channel();
+        let session = TcpSession::open(
+            id,
+            TcpConnect {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                bulk: Some(BulkOffer::tcp()),
+            },
+            &tx,
+        );
+        let (peer, _) = listener.accept().await.unwrap();
+        assert_eq!(recv_message(&mut rx).await.t, MessageType::TcpConnected);
+        assert_eq!(recv_message(&mut rx).await.t, MessageType::BulkAccepted);
+        // A probe on the guest socket; dropped before teardown so it cannot keep it open.
+        let probe = match &*session
+            .teardown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            Teardown::Reset(socket) => socket.try_clone().unwrap(),
+            _ => panic!("a connected relay keeps a reset handle"),
+        };
+        set_socket_buffer(probe.as_raw_fd(), libc::SO_SNDBUF, SEND_BUFFER);
+        // The granted buffer counts kernel overhead too, so fill only half of it.
+        let payload_len = (socket_buffer(probe.as_raw_fd(), libc::SO_SNDBUF) / 2).min(MAX_PAYLOAD);
+        let record_len = DEFAULT_BULK_RECORD_PAYLOAD as usize;
+        let payload = (0..payload_len)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        session
+            .finish_bulk(BulkFinish {
+                kind: BulkKind::Tcp,
+                flow: BulkFlow::HostToGuest,
+                final_offset: payload.len() as u64,
+            })
+            .await
+            .unwrap();
+        while session.bulk_control.as_ref().unwrap().finish.capacity() == 0 {
+            tokio::task::yield_now().await;
+        }
+        for (index, record) in payload.chunks(record_len).enumerate() {
+            session
+                .write_bulk(host_record(
+                    id,
+                    (index * record_len) as u64,
+                    Bytes::copy_from_slice(record),
+                ))
+                .await
+                .unwrap();
+        }
+        // The guest reports every byte written once its side is shut down in order.
+        loop {
+            let SessionOutput::Raw(mut output) = rx.recv().await.unwrap().output else {
+                panic!("the destination sent nothing");
+            };
+            let message = decode_one_message(&mut output.frame);
+            assert_eq!(message.t, MessageType::BulkCredit);
+            let credit: BulkCredit = message.payload().unwrap();
+            if credit.consumed_offset == payload.len() as u64 {
+                break;
+            }
+        }
+        assert!(
+            unsent(probe.as_raw_fd()) > payload.len() / 2,
+            "most of the upload must still be queued in the guest when teardown comes"
+        );
+        drop(probe);
+        UnsentTail {
+            session,
+            peer,
+            payload,
+            _rx: rx,
+        }
+    }
+
     #[tokio::test]
     async fn close_after_an_in_order_finish_lets_the_destination_drain() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            // A tiny destination receive buffer and a roomy guest send buffer leave most of the
-            // finished stream, and its FIN, queued in the guest kernel when teardown comes.
-            set_socket_buffer(listener.as_raw_fd(), libc::SO_RCVBUF, 64 * 1024);
-            let (tx, mut rx) = SessionOutputSender::channel();
-            let session = TcpSession::open(
-                44,
-                TcpConnect {
-                    host: "127.0.0.1".into(),
-                    port: listener.local_addr().unwrap().port(),
-                    bulk: Some(BulkOffer::tcp()),
-                },
-                &tx,
-            );
-            let (mut peer, _) = listener.accept().await.unwrap();
-            assert_eq!(recv_message(&mut rx).await.t, MessageType::TcpConnected);
-            assert_eq!(recv_message(&mut rx).await.t, MessageType::BulkAccepted);
-            set_socket_buffer(
-                session
-                    .socket
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .as_ref()
-                    .unwrap()
-                    .as_raw_fd(),
-                libc::SO_SNDBUF,
-                4 * 1024 * 1024,
-            );
-            const RECORDS: usize = 8;
-            let record_len = DEFAULT_BULK_RECORD_PAYLOAD as usize;
-            let payload = (0..RECORDS * record_len)
-                .map(|i| (i % 251) as u8)
-                .collect::<Vec<_>>();
-            session
-                .finish_bulk(BulkFinish {
-                    kind: BulkKind::Tcp,
-                    flow: BulkFlow::HostToGuest,
-                    final_offset: payload.len() as u64,
-                })
-                .await
-                .unwrap();
-            while session.bulk_control.as_ref().unwrap().finish.capacity() == 0 {
-                tokio::task::yield_now().await;
-            }
-            for (index, record) in payload.chunks(record_len).enumerate() {
-                session
-                    .write_bulk(host_record(
-                        44,
-                        (index * record_len) as u64,
-                        Bytes::copy_from_slice(record),
-                    ))
-                    .await
-                    .unwrap();
-            }
-            // The destination has not read a byte when the guest reports every byte written. By
-            // then its side is shut down in order, so the host's teardown must not reset it.
-            loop {
-                let SessionOutput::Raw(mut output) = rx.recv().await.unwrap().output else {
-                    panic!("the destination sent nothing");
-                };
-                let message = decode_one_message(&mut output.frame);
-                assert_eq!(message.t, MessageType::BulkCredit);
-                let credit: BulkCredit = message.payload().unwrap();
-                if credit.consumed_offset == payload.len() as u64 {
-                    break;
-                }
-            }
+            let UnsentTail {
+                session,
+                mut peer,
+                payload,
+                _rx,
+            } = finish_with_unsent_tail(44).await;
             session.close();
             drop(session);
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received.len(), payload.len());
+            assert!(received == payload);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_after_an_in_order_finish_survives_a_destination_that_writes() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let UnsentTail {
+                session,
+                mut peer,
+                payload,
+                _rx,
+            } = finish_with_unsent_tail(45).await;
+            session.close();
+            drop(session);
+            // Data reaching a guest socket nobody reads would make the kernel reset it.
+            peer.write_all(&[7; 4096]).await.unwrap();
             let mut received = Vec::new();
             peer.read_to_end(&mut received).await.unwrap();
             assert_eq!(received.len(), payload.len());
@@ -1926,7 +2072,9 @@ mod tests {
             bulk_control: Some(TcpBulkControlSenders { credit, finish }),
             task,
             bulk: true,
-            socket: Arc::new(Mutex::new(None)),
+            teardown: Arc::new(Mutex::new(Teardown::Abort)),
+            drain: watch::channel(false).0,
+            detached: std::sync::atomic::AtomicBool::new(false),
         };
         let payload = Bytes::from(vec![0u8; MIN_BULK_RECORD_PAYLOAD as usize]);
 

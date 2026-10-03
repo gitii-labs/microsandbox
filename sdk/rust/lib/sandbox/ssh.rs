@@ -2351,11 +2351,14 @@ fn reject_ssh_open(reply: ChannelOpenHandle, session: &Session) {
 /// this channel. Every per-channel future runs inside it rather than in a task of its own.
 ///
 /// Closing the SSH channel ends only the guest-to-SSH output, which has nowhere left to go.
-/// SSH input the peer sent before its close is still forwarded and finished, and the guest's own
-/// terminal reply closes the stream, so the destination receives every byte. That close phase is
-/// bounded by [`SSH_TCP_CLOSE_TIMEOUT`] of idleness: a guest that stops granting credit for the
-/// input, or never answers the finish, is cancelled instead, which discards what it has not
-/// delivered.
+/// SSH input the peer sent before its close is still forwarded and finished, and the stream then
+/// waits for the guest's terminal reply. That close phase is bounded by [`SSH_TCP_CLOSE_TIMEOUT`]
+/// of idleness, after which the forward cancels:
+///
+/// - Input the guest has not written yet when the bound passes is discarded, and the
+///   destination sees a reset.
+/// - Input the guest has written and finished in order is not: agentd lets the destination drain
+///   it and the FIN, within its own bound, even after the cancel.
 async fn run_tcp_forward(
     open: TcpChannelOpen,
     client: Arc<AgentClient>,
@@ -2449,13 +2452,23 @@ async fn run_tcp_forward(
             if finished == Some(false) {
                 break false;
             }
+            // Register for the next grant before reading the state it changes: `notify_waiters`
+            // wakes only registered waiters, so a grant in between would otherwise be missed.
+            let mut credit_ready = std::pin::pin!(
+                bulk_sender
+                    .as_deref()
+                    .map(|bulk| bulk.credit_ready.notified())
+            );
+            if let Some(notified) = credit_ready.as_mut().as_pin_mut() {
+                notified.enable();
+            }
             let awaiting_credit = match bulk_sender.as_deref() {
                 Some(bulk) => finished.is_none() || !bulk.consumed().await.1,
                 None => false,
             };
             let credited = async {
-                match bulk_sender.as_deref() {
-                    Some(bulk) if awaiting_credit => bulk.credit_ready.notified().await,
+                match credit_ready.as_mut().as_pin_mut() {
+                    Some(notified) if awaiting_credit => notified.await,
                     _ => std::future::pending().await,
                 }
             };
