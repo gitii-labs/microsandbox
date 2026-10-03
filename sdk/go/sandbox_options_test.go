@@ -97,6 +97,43 @@ func TestRestoreStringRemainsUnresolved(t *testing.T) {
 	}
 }
 
+func TestCreateFromSnapshotCarriesTheFullCreationConfig(t *testing.T) {
+	payload := marshalCreateOptions(t,
+		WithFromSnapshot(&SnapshotHandle{reference: "topic-snapshot", referenceKind: "id"}),
+		WithEnv(map[string]string{"MODE": "resumed"}),
+		WithLabels(map[string]string{"topic": "t1"}),
+	)
+
+	if got := mustField(t, payload, "from_snapshot"); got != "topic-snapshot" {
+		t.Fatalf("from_snapshot = %v, want topic-snapshot", got)
+	}
+	if got := mustField(t, payload, "from_snapshot_reference_kind"); got != "id" {
+		t.Fatalf("from_snapshot_reference_kind = %v, want id", got)
+	}
+	if env := mustField(t, payload, "env").(map[string]any); env["MODE"] != "resumed" {
+		t.Fatalf("env = %v", env)
+	}
+	if labels := mustField(t, payload, "labels").(map[string]any); labels["topic"] != "t1" {
+		t.Fatalf("labels = %v", labels)
+	}
+	for _, field := range []string{"image", "root_disk", "snapshot"} {
+		if _, ok := payload[field]; ok {
+			t.Fatalf("%s must be absent from a snapshot creation: %v", field, payload)
+		}
+	}
+}
+
+func TestCreateFromSnapshotStringIsResolvedBySpelling(t *testing.T) {
+	payload := marshalCreateOptions(t, WithFromSnapshot("baseline:ready"))
+
+	if got := mustField(t, payload, "from_snapshot"); got != "baseline:ready" {
+		t.Fatalf("from_snapshot = %v, want baseline:ready", got)
+	}
+	if _, ok := payload["from_snapshot_reference_kind"]; ok {
+		t.Fatalf("from_snapshot_reference_kind should be omitted for strings: %v", payload)
+	}
+}
+
 func TestSandboxConfigUnmarshalPersistedRootfsSource(t *testing.T) {
 	raw := []byte(`{
 		"name": "go-sdk-example-main",

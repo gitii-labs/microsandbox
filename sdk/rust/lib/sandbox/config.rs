@@ -1602,6 +1602,7 @@ mod tests {
         let config = SandboxConfig {
             restore_boot_overrides: super::super::restore_builder::RestoreBootOverrides {
                 security: true,
+                ..Default::default()
             },
             ..Default::default()
         };

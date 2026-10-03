@@ -1753,6 +1753,8 @@ type CreateOptions struct {
 	Image                string               `json:"image,omitempty"`
 	ImageFstype          string               `json:"image_fstype,omitempty"`
 	ImageBind            string               `json:"image_bind,omitempty"`
+	FromSnapshot         string               `json:"from_snapshot,omitempty"`
+	FromSnapshotRefKind  string               `json:"from_snapshot_reference_kind,omitempty"`
 	RootDisk             *RootDiskSpec        `json:"root_disk,omitempty"`
 	MemoryMiB            uint32               `json:"memory_mib,omitempty"`
 	CPUs                 uint8                `json:"cpus,omitempty"`

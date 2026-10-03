@@ -33,6 +33,9 @@ pub struct RestoreBuilder {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RestoreBootOverrides {
     pub(crate) security: bool,
+    /// The source came through a creation builder, whose environment, secrets, init and scripts
+    /// only a cold boot applies.
+    pub(crate) cold_boot: bool,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -48,6 +51,14 @@ impl RestoreBootOverrides {
     ) -> MicrosandboxResult<()> {
         if scope != crate::snapshot::SnapshotScope::Full || mode == SnapshotRestoreMode::DiskOnly {
             return Ok(());
+        }
+        if self.cold_boot {
+            return Err(MicrosandboxError::unsupported(
+                Operation::SnapshotOps,
+                UnsupportedReason::NotAvailable(
+                    "creating from a full snapshot would resume captured execution and ignore the creation configuration; create from a disk snapshot, or restore the full snapshot with Sandbox::restore".into(),
+                ),
+            ));
         }
         if self.security {
             return Err(MicrosandboxError::unsupported(
@@ -410,11 +421,14 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_guest_security_changes_are_refused_for_full_execution() {
+    fn only_explicit_boot_intent_is_refused_for_full_execution() {
         use crate::snapshot::SnapshotScope;
 
-        for security in [false, true] {
-            let overrides = RestoreBootOverrides { security };
+        for (security, cold_boot) in [(false, false), (true, false), (false, true), (true, true)] {
+            let overrides = RestoreBootOverrides {
+                security,
+                cold_boot,
+            };
             assert!(
                 overrides
                     .validate_scope(SnapshotScope::Disk, SnapshotRestoreMode::Full)
@@ -429,7 +443,7 @@ mod tests {
                 overrides
                     .validate_scope(SnapshotScope::Full, SnapshotRestoreMode::Full)
                     .is_err(),
-                security
+                security || cold_boot
             );
         }
     }

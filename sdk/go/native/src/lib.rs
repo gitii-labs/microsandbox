@@ -1125,6 +1125,11 @@ struct SandboxCreateOpts {
     /// Deprecated flat spelling of a managed root disk size. Still
     /// accepted so older Go SDK versions keep working against this dylib.
     oci_upper_size_mib: Option<u32>,
+    /// Disk snapshot to cold-boot from with this full creation config.
+    /// Mutually exclusive with every rootfs field above.
+    from_snapshot: Option<String>,
+    /// How `from_snapshot` is resolved: "", "auto", "id" or "path".
+    from_snapshot_reference_kind: Option<String>,
     memory_mib: Option<u32>,
     cpus: Option<u8>,
     max_memory_mib: Option<u32>,
@@ -2472,6 +2477,12 @@ pub unsafe extern "C" fn msb_sandbox_create(
             if let Some(size_mib) = opts.oci_upper_size_mib {
                 // Deprecated flat spelling: managed root disk of that size.
                 builder = builder.root_disk(size_mib);
+            }
+            if let Some(snapshot) = opts.from_snapshot {
+                builder = builder.from_disk_snapshot(parse_snapshot_reference(
+                    snapshot,
+                    opts.from_snapshot_reference_kind.as_deref().unwrap_or(""),
+                )?);
             }
 
             if let Some(m) = opts.memory_mib {
@@ -7983,6 +7994,19 @@ mod tests {
             serde_json::from_str(r#"{"image":"python:3.12","oci_upper_size_mib":0}"#).unwrap();
 
         assert_eq!(opts.oci_upper_size_mib, Some(0));
+    }
+
+    #[test]
+    fn sandbox_create_opts_parses_a_creation_snapshot_source() {
+        let opts: SandboxCreateOpts = serde_json::from_str(
+            r#"{"from_snapshot":"/snapshots/topic","from_snapshot_reference_kind":"path","env":{"A":"1"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(opts.from_snapshot.as_deref(), Some("/snapshots/topic"));
+        assert_eq!(opts.from_snapshot_reference_kind.as_deref(), Some("path"));
+        assert!(opts.image.is_none());
+        assert!(parse_snapshot_reference("saved".into(), "volume").is_err());
     }
 
     #[test]
