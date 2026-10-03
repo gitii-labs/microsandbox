@@ -130,9 +130,11 @@ func (c *TCPConn) Close() error {
 // ErrTCPCleanupUnknown when the guest did not confirm the release.
 func (c *TCPConn) Abort() error {
 	return c.release(func() (bool, error) {
-		// Abort before closing the socket, whose end of stream could otherwise race it.
+		// Close the socket first so blocked calls end with net.ErrClosed. Its unannounced end
+		// of stream aborts the native side too; Abort then waits for the guest's release.
+		socketErr := c.conn.Close()
 		acknowledged, err := c.native.Abort(context.Background())
-		return acknowledged, errors.Join(wrapFFI(err), c.conn.Close())
+		return acknowledged, errors.Join(socketErr, wrapFFI(err))
 	})
 }
 

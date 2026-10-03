@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -239,6 +241,60 @@ func TestDialTCP(t *testing.T) {
 		}
 	})
 
+	t.Run("a stalled connection leaves other connections and controls working", func(t *testing.T) {
+		// Distributed's smoke sequence: fill a stalled destination, then use and close an
+		// unrelated connection and run a control on the same sandbox, twice.
+		startGuestServer(t, ctx, sb, 9009, "nc -l -p 9009 -e sleep 600")
+		stalled, err := sb.DialTCP(ctx, "127.0.0.1", 9009)
+		if err != nil {
+			t.Fatalf("DialTCP: %v", err)
+		}
+		if err := stalled.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			if _, err := stalled.Write(make([]byte, 16<<10)); err != nil {
+				if !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("filling a stalled destination: %v", err)
+				}
+				break
+			}
+		}
+		for round := range 2 {
+			probe, err := sb.DialTCP(ctx, "127.0.0.1", 9001)
+			if err != nil {
+				t.Fatalf("round %d: dial a probe: %v", round, err)
+			}
+			if _, err := probe.Write([]byte("unrelated stream")); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len("unrelated stream"))
+			if _, err := io.ReadFull(probe, got); err != nil || string(got) != "unrelated stream" {
+				t.Fatalf("round %d: probe echo %q %v", round, got, err)
+			}
+			if err := probe.Close(); err != nil {
+				t.Fatalf("round %d: probe Close: %v", round, err)
+			}
+			if out, err := sb.Shell(ctx, "true"); err != nil || out.ExitCode() != 0 {
+				t.Fatalf("round %d: a guest control after the probe: %v", round, err)
+			}
+		}
+		pending := make(chan error, 1)
+		go func() { _, err := stalled.Write(make([]byte, 16<<10)); pending <- err }()
+		if err := stalled.SetWriteDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := stalled.Abort(); err != nil {
+			t.Fatalf("Abort: %v", err)
+		}
+		if err := <-pending; !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("aborting did not end the blocked writer: %v", err)
+		}
+		if out, err := sb.Shell(ctx, "true"); err != nil || out.ExitCode() != 0 {
+			t.Fatalf("a guest control after the abort: %v", err)
+		}
+	})
+
 	t.Run("close on a stalled destination fails within the bound", func(t *testing.T) {
 		startGuestServer(t, ctx, sb, 9005, "nc -l -p 9005 -e sleep 600")
 		conn, err := sb.DialTCP(ctx, "127.0.0.1", 9005)
@@ -297,9 +353,19 @@ func TestDialTCP(t *testing.T) {
 			t.Fatalf("Close: %v", err)
 		}
 		t.Logf("write and close took %v", time.Since(started))
-		got, err := sb.FS().Read(ctx, "/tmp/slow.out")
-		if err != nil || !bytes.Equal(got, payload) {
-			t.Fatalf("guest received %d of %d bytes (%v)", len(got), len(payload), err)
+		// Close returns once the guest wrote every byte into the destination's socket; the
+		// slow reader takes the tail from there.
+		want := fmt.Sprintf("25165824\n%x", sha256.Sum256(payload))
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			out, err := sb.Shell(ctx, "wc -c < /tmp/slow.out; sha256sum /tmp/slow.out")
+			if err == nil && strings.HasPrefix(out.Stdout(), want) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("guest received %q, want %s (%v)", out.Stdout(), want, err)
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
 	})
 
