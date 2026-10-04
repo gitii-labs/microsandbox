@@ -1508,6 +1508,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destination_reset_with_queued_bulk_input_emits_failed_terminal_without_eof() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (tx, mut rx) = SessionOutputSender::channel();
+        let session = TcpSession::open(
+            41,
+            TcpConnect {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                bulk: Some(BulkOffer::tcp()),
+            },
+            &tx,
+        );
+        let (peer, _) = listener.accept().await.unwrap();
+        assert_eq!(recv_message(&mut rx).await.t, MessageType::TcpConnected);
+        let accepted: BulkAccepted = recv_message(&mut rx).await.payload().unwrap();
+        let payload = Bytes::from(vec![0; accepted.max_record_payload as usize]);
+        let mut offset = 0;
+        while offset < accepted.host_to_guest_credit_limit {
+            session
+                .write_bulk(host_record(41, offset, payload.clone()))
+                .await
+                .unwrap();
+            offset += payload.len() as u64;
+        }
+        // The real guest producer's socket-error path emits TcpFailed directly, not BulkCancel.
+        // The runtime must not wait for the orderly guest-output finish this reset cannot send.
+        peer.set_zero_linger().unwrap();
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message = recv_message(&mut rx).await;
+                match message.t {
+                    MessageType::BulkCredit => {}
+                    MessageType::TcpFailed => {
+                        assert_eq!(message.flags, FLAG_TERMINAL);
+                        assert!(!message.payload::<TcpFailed>().unwrap().error.is_empty());
+                        break;
+                    }
+                    other => panic!("reset emitted {other:?} instead of a failed terminal"),
+                }
+            }
+            session.finish().await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "guest reset emitted a second terminal"
+        );
+    }
+
+    #[tokio::test]
     async fn both_half_close_orders_preserve_data_and_emit_one_terminal() {
         for raw in [false, true] {
             for peer_first in [false, true] {

@@ -1288,7 +1288,8 @@ impl russh::server::Handler for SshSession {
         }
 
         let client = self.agent_client().await?;
-        if !client.supports(MessageType::TcpConnect) {
+        // Forwarding shares the bulk relay; generation-7 agents cannot carry its byte stream.
+        if !client.supports(MessageType::BulkAccepted) {
             tracing::warn!(
                 negotiated_version = client.negotiated_version(),
                 "ssh direct-tcpip needs a newer sandbox runtime; restart the sandbox to enable forwarding"
@@ -2149,9 +2150,16 @@ async fn run_tcp_forward(
             Arc::clone(&sender),
             receiver_pump,
         ));
-        tcp::supervise_tcp(&sender, input, output, guest, &mut stop)
-            .await
-            .terminated
+        tcp::supervise_tcp(
+            &sender,
+            input,
+            output,
+            guest,
+            &mut stop,
+            std::future::pending(),
+        )
+        .await
+        .terminated
     } else {
         false
     };

@@ -11,8 +11,8 @@ use bytes::Bytes;
 use microsandbox_protocol::{
     bulk::{
         BULK_FLOW_MASK_GUEST_TO_HOST, BULK_FLOW_MASK_HOST_TO_GUEST, BulkAccepted, BulkCancel,
-        BulkCredit, BulkFinish, BulkFlow, BulkKind, BulkReceiveState, BulkRecord, BulkSendState,
-        DEFAULT_BULK_RECORD_PAYLOAD, MAX_BULK_RECORD_PAYLOAD,
+        BulkCancelReason, BulkCredit, BulkFinish, BulkFlow, BulkKind, BulkReceiveState, BulkRecord,
+        BulkSendState, DEFAULT_BULK_RECORD_PAYLOAD, MAX_BULK_RECORD_PAYLOAD,
     },
     codec,
     core::Ready,
@@ -80,6 +80,26 @@ pub(crate) struct GuestTerminal {
 }
 
 impl GuestTerminal {
+    fn guest_failed(&self) {
+        if !self.sent.swap(true, Ordering::SeqCst) {
+            let _ = self.out.send(control(
+                MessageType::BulkCancel,
+                self.id,
+                &BulkCancel {
+                    kind: BulkKind::Tcp,
+                    reason: BulkCancelReason::CallerCancelled,
+                    message: "destination reset".into(),
+                },
+            ));
+            let _ = self.out.send(control(
+                MessageType::TcpFailed,
+                self.id,
+                &TcpFailed {
+                    error: "destination reset".into(),
+                },
+            ));
+        }
+    }
     fn direction_ended(&self) {
         if self.open_directions.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.send();
@@ -220,6 +240,18 @@ pub(crate) async fn run_agent(listener: TcpListener, ports: GuestPorts) {
                 // Like agentd: a stream whose host side ended in order drains to an orderly close;
                 // any other is reset. Either way the cancel is answered with a terminal reply.
                 if let Some(connection) = connections.remove(&message.id) {
+                    // A valid grant queued before cancellation may arrive before the terminal.
+                    out.send(control(
+                        MessageType::BulkCredit,
+                        message.id,
+                        &BulkCredit {
+                            kind: BulkKind::Tcp,
+                            flow: BulkFlow::HostToGuest,
+                            consumed_offset: 0,
+                            credit_limit: PACED_CREDIT,
+                        },
+                    ))
+                    .unwrap();
                     if connection.terminal.host_finished.load(Ordering::SeqCst) {
                         clear_linger(connection.socket);
                     }
@@ -387,7 +419,7 @@ pub(crate) async fn relay_socket_to_host(
                 }));
             }
             Err(_) => {
-                terminal.send();
+                terminal.guest_failed();
                 return;
             }
         }

@@ -26,5 +26,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/setup.rs");
     println!("cargo:rerun-if-changed=src/storage.rs");
     println!("cargo:rerun-if-changed=src/tcp.rs");
+    println!("cargo:rerun-if-changed=src/tcp/test_fixture.rs");
     println!("cargo:rerun-if-changed=src/volume_fs.rs");
 }

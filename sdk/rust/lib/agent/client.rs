@@ -51,6 +51,21 @@ impl AgentClient {
         .map(Self)
     }
 
+    /// Establish the agent protocol on an already-connected Unix socket with signal-safe writes.
+    /// Transfers the exact supplied connection, retaining any peer authentication performed by
+    /// its caller. `timeout` bounds the handshake.
+    #[cfg(unix)]
+    pub async fn connect_unix_stream_with_timeout(
+        stream: tokio::net::UnixStream,
+        timeout: Duration,
+    ) -> AgentClientResult<Self> {
+        microsandbox_agent_client::OptimizedAgentClient::connect_unix_stream_with_timeout(
+            stream, timeout,
+        )
+        .await
+        .map(Self)
+    }
+
     /// Connect to an arbitrary agent relay socket path with an explicit
     /// handshake timeout.
     pub async fn connect_with_timeout(

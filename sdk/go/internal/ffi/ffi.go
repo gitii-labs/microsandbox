@@ -282,11 +282,13 @@ static msb_sandbox_restore_fn ptr_msb_sandbox_restore = NULL;
 typedef char *(*msb_sandbox_dial_tcp_fn)(uint64_t, uint64_t, const char *, uint16_t, uint8_t *, size_t);
 typedef char *(*msb_tcp_conn_status_fn)(uint64_t, uint8_t *, size_t);
 typedef char *(*msb_tcp_conn_finish_fn)(uint64_t, uint8_t *, size_t);
+typedef char *(*msb_tcp_conn_request_abort_fn)(uint64_t, uint8_t *, size_t);
 typedef char *(*msb_tcp_conn_close_fn)(uint64_t, uint64_t, uint8_t *, size_t);
 typedef char *(*msb_tcp_conn_abort_fn)(uint64_t, uint64_t, uint8_t *, size_t);
 static msb_sandbox_dial_tcp_fn ptr_msb_sandbox_dial_tcp = NULL;
 static msb_tcp_conn_status_fn ptr_msb_tcp_conn_status = NULL;
 static msb_tcp_conn_finish_fn ptr_msb_tcp_conn_finish = NULL;
+static msb_tcp_conn_request_abort_fn ptr_msb_tcp_conn_request_abort = NULL;
 static msb_tcp_conn_close_fn ptr_msb_tcp_conn_close = NULL;
 static msb_tcp_conn_abort_fn ptr_msb_tcp_conn_abort = NULL;
 typedef char *(*msb_creation_progress_open_fn)(uint8_t *, size_t);
@@ -501,6 +503,7 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE_OPTIONAL(msb_sandbox_dial_tcp);
 	RESOLVE_OPTIONAL(msb_tcp_conn_status);
 	RESOLVE_OPTIONAL(msb_tcp_conn_finish);
+	RESOLVE_OPTIONAL(msb_tcp_conn_request_abort);
 	RESOLVE_OPTIONAL(msb_tcp_conn_close);
 	RESOLVE_OPTIONAL(msb_tcp_conn_abort);
 	RESOLVE_OPTIONAL(msb_creation_progress_open);
@@ -689,7 +692,7 @@ char *call_msb_sandbox_shell_path(uint64_t cancel_id, uint64_t handle, uint8_t *
     return ptr_msb_sandbox_shell_path ? ptr_msb_sandbox_shell_path(cancel_id, handle, buf, buf_len) : NULL;
 }
 bool has_sandbox_restore(void) { return ptr_msb_sandbox_restore != NULL; }
-bool has_tcp_dial(void) { return ptr_msb_sandbox_dial_tcp && ptr_msb_tcp_conn_status && ptr_msb_tcp_conn_finish && ptr_msb_tcp_conn_close && ptr_msb_tcp_conn_abort; }
+bool has_tcp_dial(void) { return ptr_msb_sandbox_dial_tcp && ptr_msb_tcp_conn_status && ptr_msb_tcp_conn_finish && ptr_msb_tcp_conn_request_abort && ptr_msb_tcp_conn_close && ptr_msb_tcp_conn_abort; }
 char *call_msb_sandbox_dial_tcp(uint64_t cancel_id, uint64_t handle, const char *host, uint16_t port, uint8_t *buf, size_t buf_len) {
     return ptr_msb_sandbox_dial_tcp(cancel_id, handle, host, port, buf, buf_len);
 }
@@ -698,6 +701,9 @@ char *call_msb_tcp_conn_status(uint64_t conn, uint8_t *buf, size_t buf_len) {
 }
 char *call_msb_tcp_conn_finish(uint64_t conn, uint8_t *buf, size_t buf_len) {
     return ptr_msb_tcp_conn_finish(conn, buf, buf_len);
+}
+char *call_msb_tcp_conn_request_abort(uint64_t conn, uint8_t *buf, size_t buf_len) {
+    return ptr_msb_tcp_conn_request_abort(conn, buf, buf_len);
 }
 char *call_msb_tcp_conn_close(uint64_t cancel_id, uint64_t conn, uint8_t *buf, size_t buf_len) {
     return ptr_msb_tcp_conn_close(cancel_id, conn, buf, buf_len);
@@ -1191,6 +1197,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1447,11 +1454,17 @@ func call(ctx context.Context, fn func(cancelID C.uint64_t, buf *C.uint8_t, bufL
 // whose response can exceed defaultBufSize — chiefly streaming Recv paths
 // that relay protocol chunks larger than 1 MiB.
 func callBuf(ctx context.Context, bufSize int, fn func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char) (string, error) {
-	type res struct {
-		out string
-		err error
-	}
-	done := make(chan res, 1)
+	return callBufCleanup(ctx, bufSize, fn, nil)
+}
+
+type callResult struct {
+	out string
+	err error
+}
+
+// Resource-producing operations reclaim a successful result if cancellation wins ownership.
+func callBufCleanup(ctx context.Context, bufSize int, fn func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char, cleanup func(string) error) (string, error) {
+	done := make(chan callResult, 1)
 	buf := make([]byte, bufSize)
 	cancelID := C.call_msb_cancel_alloc()
 
@@ -1464,24 +1477,37 @@ func callBuf(ctx context.Context, bufSize int, fn func(cancelID C.uint64_t, buf 
 			if jerr := json.Unmarshal([]byte(msg), &e); jerr != nil {
 				e = Error{Kind: KindInternal, Message: msg}
 			}
-			done <- res{err: &e}
+			done <- callResult{err: &e}
 			return
 		}
 		end := 0
 		for end < len(buf) && buf[end] != 0 {
 			end++
 		}
-		done <- res{out: string(buf[:end])}
+		done <- callResult{out: string(buf[:end])}
 	}()
 
+	return awaitCall(ctx, done, func() { C.call_msb_cancel_trigger(cancelID) }, cleanup)
+}
+
+func awaitCall(ctx context.Context, done <-chan callResult, cancel func(), cleanup func(string) error) (string, error) {
+	var r callResult
 	select {
-	case r := <-done:
-		return r.out, r.err
+	case r = <-done:
+		if cleanup == nil {
+			return r.out, r.err
+		}
 	case <-ctx.Done():
-		C.call_msb_cancel_trigger(cancelID)
-		<-done // wait so caller's deferred C.free doesn't race Rust
-		return "", ctx.Err()
+		cancel()
+		r = <-done // wait so caller's deferred C.free doesn't race Rust
 	}
+	if err := ctx.Err(); err != nil {
+		if r.err == nil && cleanup != nil {
+			return "", errors.Join(err, cleanup(r.out))
+		}
+		return "", err
+	}
+	return r.out, r.err
 }
 
 func callRaw(ctx context.Context, fn func(cancelID C.uint64_t) *C.char) error {
@@ -6080,12 +6106,16 @@ func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPCo
 	}
 	cHost := C.CString(host)
 	defer C.free(unsafe.Pointer(cHost))
-	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+	out, err := callBufCleanup(ctx, defaultBufSize, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
 		return C.call_msb_sandbox_dial_tcp(cancelID, s.h(), cHost, C.uint16_t(port), buf, bufLen)
-	})
+	}, cleanupTCPDial)
 	if err != nil {
 		return nil, -1, err
 	}
+	return parseTCPDial(out)
+}
+
+func parseTCPDial(out string) (*TCPConn, int, error) {
 	var resp struct {
 		Conn uint64 `json:"conn"`
 		FD   int    `json:"fd"`
@@ -6094,6 +6124,19 @@ func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPCo
 		return nil, -1, fmt.Errorf("parse dial_tcp response: %w", err)
 	}
 	return &TCPConn{handle: C.uint64_t(resp.Conn)}, resp.FD, nil
+}
+
+func cleanupTCPDial(out string) error {
+	conn, fd, err := parseTCPDial(out)
+	if err != nil {
+		return err
+	}
+	closeErr := os.NewFile(uintptr(fd), "cancelled-guest-tcp").Close()
+	acknowledged, abortErr := conn.Abort(context.Background())
+	if abortErr == nil && !acknowledged {
+		abortErr = errors.New("cancelled guest TCP dial: cleanup unacknowledged")
+	}
+	return errors.Join(closeErr, abortErr)
 }
 
 // Status reports why each direction ended, if not in order.
@@ -6117,6 +6160,14 @@ func (c *TCPConn) Status() (TCPStatus, error) {
 func (c *TCPConn) Finish() error {
 	_, err := c.sync(func(buf *C.uint8_t, bufLen C.size_t) *C.char {
 		return C.call_msb_tcp_conn_finish(c.handle, buf, bufLen)
+	})
+	return err
+}
+
+// RequestAbort interrupts a pending Close without joining its cleanup wait.
+func (c *TCPConn) RequestAbort() error {
+	_, err := c.sync(func(buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_tcp_conn_request_abort(c.handle, buf, bufLen)
 	})
 	return err
 }
@@ -6158,9 +6209,14 @@ func (c *TCPConn) release(ctx context.Context, fn func(C.uint64_t, *C.uint8_t, C
 	}
 	var resp struct {
 		Cleanup string `json:"cleanup"`
+		Error   *Error `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
 		return false, fmt.Errorf("parse tcp release response: %w", err)
 	}
-	return resp.Cleanup == "acknowledged", nil
+	acknowledged := resp.Cleanup == "acknowledged"
+	if resp.Error != nil {
+		return acknowledged, resp.Error
+	}
+	return acknowledged, nil
 }

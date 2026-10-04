@@ -4016,6 +4016,7 @@ dependencies = [
  "libc",
  "microsandbox",
  "microsandbox-network",
+ "microsandbox-protocol",
  "serde",
  "serde_json",
  "tokio",

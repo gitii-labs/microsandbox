@@ -869,6 +869,11 @@ impl GuestFrameMerger {
                 Ok(vec![lane_frame])
             }
             _ if lane_frame.frame.flags & FLAG_TERMINAL != 0 => {
+                if message.t == MessageType::TcpFailed {
+                    // A failed guest socket cannot produce ordered EOF. Waiting for its finish
+                    // strands the SDK route even though agentd has already released the socket.
+                    self.drop_flow(incarnation, message.id);
+                }
                 let Some(flow) = self.flows.get_mut(&key) else {
                     return if self.is_retired(incarnation, message.id) {
                         Ok(Vec::new())
@@ -6458,6 +6463,72 @@ mod tests {
         assert_eq!(terminal.len(), 1);
         assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
         assert!(merger.register(TEST_INCARNATION, id).is_err());
+    }
+
+    #[test]
+    fn guest_tcp_failure_without_cancel_or_finish_releases_the_route_and_held_output() {
+        let id = 67;
+        let tcp_raw = |offset, payload: &'static [u8]| {
+            let mut wire = Vec::new();
+            codec::encode_bulk_to_buf(
+                &BulkRecord {
+                    id,
+                    kind: BulkKind::Tcp,
+                    flow: BulkFlow::GuestToHost,
+                    offset,
+                    payload: Bytes::from_static(payload),
+                },
+                &mut wire,
+            )
+            .unwrap();
+            wire
+        };
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let full_budget = budget.available_permits();
+        let mut merger = GuestFrameMerger::default();
+        merger.register(TEST_INCARNATION, id).unwrap();
+        let mut accepted = bulk_accepted();
+        accepted.kind = BulkKind::Tcp;
+        merger
+            .push(lane_frame(
+                encoded_message_id(MessageType::BulkAccepted, id, &accepted),
+                &budget,
+            ))
+            .unwrap();
+        // A tail on the independent bulk lane may not yet be eligible for forwarding.
+        assert!(
+            merger
+                .push(lane_frame(tcp_raw(10, b"held"), &budget))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(budget.available_permits() < full_budget);
+        // This is agentd's socket-I/O failure path: a terminal TcpFailed, no BulkCancel or EOF.
+        let ready = merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::TcpFailed,
+                    id,
+                    &microsandbox_protocol::tcp::TcpFailed {
+                        error: "read TCP stream: connection reset".into(),
+                    },
+                ),
+                &budget,
+            ))
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        let reply = decode_frame(ready[0].frame.data.as_ref()).unwrap();
+        assert_eq!((reply.id, reply.t), (id, MessageType::TcpFailed));
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
+        assert!(merger.is_retired(TEST_INCARNATION, id));
+        drop(ready);
+        assert_eq!(budget.available_permits(), full_budget);
+        assert!(
+            merger
+                .push(lane_frame(tcp_raw(0, b"late"), &budget))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

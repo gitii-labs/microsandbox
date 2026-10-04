@@ -65,6 +65,8 @@ use super::local_shm::{
     encode_local_bulk_ref, encode_local_bulk_release, local_upgrade_request_frame,
     receive_local_shm_upgrade,
 };
+#[cfg(all(feature = "uds", unix))]
+use super::socket_writer::SignalSafeUnixStream;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -352,6 +354,17 @@ impl AgentClient {
         Self::connect_stream_with_deadline(stream, deadline).await
     }
 
+    /// Establish the agent protocol on an already-connected Unix socket using signal-safe
+    /// scalar and vectored writes. Ownership stays with this exact connection, so callers may
+    /// authenticate its peer before transferring it. The handshake uses the supplied timeout.
+    #[cfg(all(feature = "uds", unix))]
+    pub async fn connect_unix_stream_with_timeout(
+        stream: UnixStream,
+        timeout: Duration,
+    ) -> AgentClientResult<Self> {
+        Self::connect_stream_with_timeout(SignalSafeUnixStream::new(stream), timeout).await
+    }
+
     /// Connect over an arbitrary byte-stream transport with an explicit
     /// handshake deadline.
     ///
@@ -379,10 +392,11 @@ impl AgentClient {
 
     #[cfg(all(feature = "uds", unix))]
     async fn connect_uds_stream_with_deadline(
-        mut stream: UnixStream,
+        stream: UnixStream,
         deadline: Instant,
         allow_local: bool,
     ) -> AgentClientResult<Self> {
+        let mut stream = SignalSafeUnixStream::new(stream);
         let handshake = perform_handshake(&mut stream, deadline).await?;
         let selected = allow_local
             && handshake
@@ -401,7 +415,7 @@ impl AgentClient {
                 AgentClientError::LocalTransport("upgrade request write timed out".into())
             })?
             .map_err(|error| AgentClientError::LocalTransport(error.to_string()))?;
-            match tokio::time::timeout_at(deadline, receive_local_shm_upgrade(&stream))
+            match tokio::time::timeout_at(deadline, receive_local_shm_upgrade(stream.socket()))
                 .await
                 .map_err(|_| {
                     AgentClientError::LocalTransport("descriptor acknowledgement timed out".into())
@@ -420,10 +434,10 @@ impl AgentClient {
 
         // Two descriptors for the same SOCK_STREAM allow independent Tokio read and write tasks
         // while SCM_RIGHTS remains confined to the completed pre-task upgrade above.
-        let std_reader = stream.into_std()?;
+        let std_reader = stream.into_inner().into_std()?;
         let std_writer = std_reader.try_clone()?;
         let reader = UnixStream::from_std(std_reader)?;
-        let writer = UnixStream::from_std(std_writer)?;
+        let writer = SignalSafeUnixStream::new(UnixStream::from_std(std_writer)?);
         finish_connection(reader, writer, handshake, local).await
     }
 
@@ -1433,6 +1447,126 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[cfg(all(feature = "uds", target_os = "linux"))]
+    #[test]
+    fn closed_runtime_socket_writer_reports_epipe_without_sigpipe() {
+        const CHILD_MODE: &str = "MSB_AGENT_WRITER_SIGPIPE_CHILD";
+        const TEST_NAME: &str =
+            "optimized::tests::closed_runtime_socket_writer_reports_epipe_without_sigpipe";
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            for mode in ["control", "bulk", "scalar", "authenticated-shutdown"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .env(CHILD_MODE, mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        // Rust startup ignores SIGPIPE, masking this defect in ordinary Rust tests. In this
+        // isolated child only, require the default fatal action that an embedding host can use.
+        // The production adapter never changes process-wide signal disposition.
+        assert_ne!(
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) },
+            libc::SIG_ERR
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                if mode == "scalar" {
+                    let (socket, peer) = UnixStream::pair().unwrap();
+                    nix::sys::socket::shutdown(
+                        std::os::fd::AsRawFd::as_raw_fd(&peer),
+                        nix::sys::socket::Shutdown::Read,
+                    )
+                    .unwrap();
+                    let error = SignalSafeUnixStream::new(socket)
+                        .write_all(b"scalar release")
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+                    return;
+                }
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("runtime.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                let (closed_tx, closed_rx) = oneshot::channel();
+                let (done_tx, done_rx) = oneshot::channel();
+                let runtime = tokio::spawn(async move {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    peer.write_all(&1u32.to_be_bytes()).await.unwrap();
+                    peer.write_all(&1024u32.to_be_bytes()).await.unwrap();
+                    codec::write_message(
+                        &mut peer,
+                        &Message::with_payload(MessageType::Ready, 0, &Ready::default()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    // Keep the reply direction alive so the background reader cannot pre-empt the
+                    // actual production writer before its deterministic EPIPE.
+                    nix::sys::socket::shutdown(
+                        std::os::fd::AsRawFd::as_raw_fd(&peer),
+                        nix::sys::socket::Shutdown::Read,
+                    )
+                    .unwrap();
+                    closed_tx.send(()).unwrap();
+                    done_rx.await.unwrap();
+                });
+                let client = if mode == "authenticated-shutdown" {
+                    let stream = UnixStream::connect(&path).await.unwrap();
+                    assert_eq!(
+                        stream.peer_cred().unwrap().pid(),
+                        Some(std::process::id() as i32)
+                    );
+                    AgentClient::connect_unix_stream_with_timeout(stream, Duration::from_secs(5))
+                        .await
+                        .unwrap()
+                } else {
+                    AgentClient::connect(&path).await.unwrap()
+                };
+                closed_rx.await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    match mode.as_str() {
+                        "control" => client.send_raw(1, 0, &[0]).await,
+                        "authenticated-shutdown" => {
+                            client.send(0, MessageType::Shutdown, &()).await
+                        }
+                        "bulk" => {
+                            client
+                                .send_bulk(BulkRecord {
+                                    id: 1,
+                                    kind: microsandbox_protocol::bulk::BulkKind::Tcp,
+                                    flow: microsandbox_protocol::bulk::BulkFlow::HostToGuest,
+                                    offset: 0,
+                                    payload: Bytes::from_static(b"raw TCP input"),
+                                })
+                                .await
+                        }
+                        other => panic!("unexpected child mode {other}"),
+                    }
+                })
+                .await
+                .unwrap();
+                match result.unwrap_err() {
+                    AgentClientError::Protocol(microsandbox_protocol::ProtocolError::Io(error)) => {
+                        assert_eq!(error.raw_os_error(), Some(libc::EPIPE))
+                    }
+                    error => panic!("writer did not report the actual socket failure: {error}"),
+                }
+                done_tx.send(()).unwrap();
+                runtime.await.unwrap();
+            });
+    }
 
     /// A stream whose caller stops reading must not stall the reader that routes
     /// every other correlation's replies.

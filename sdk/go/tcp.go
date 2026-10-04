@@ -48,6 +48,10 @@ func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPCo
 	if err != nil {
 		return nil, wrapFFI(err)
 	}
+	return newTCPConn(native, fd, host, port)
+}
+
+func newTCPConn(native *ffi.TCPConn, fd int, host string, port uint16) (*TCPConn, error) {
 	file := os.NewFile(uintptr(fd), "guest-tcp")
 	conn, err := net.FileConn(file)
 	// FileConn holds its own descriptor; this one has served its purpose.
@@ -75,7 +79,12 @@ func (s *Sandbox) DialTCP(ctx context.Context, host string, port uint16) (*TCPCo
 func (c *TCPConn) Read(p []byte) (int, error) {
 	n, err := c.conn.Read(p)
 	if errors.Is(err, io.EOF) {
-		if status, statusErr := c.native.Status(); statusErr == nil && status.ReadError != nil {
+		status, statusErr := c.native.Status()
+		if statusErr != nil {
+			// A concurrent release removed the status handle. It cannot certify orderly EOF.
+			return n, fmt.Errorf("microsandbox: guest TCP read status: %w", wrapFFI(statusErr))
+		}
+		if status.ReadError != nil {
 			return n, fmt.Errorf("microsandbox: guest TCP read: %s", *status.ReadError)
 		}
 	}
@@ -129,6 +138,10 @@ func (c *TCPConn) Close() error {
 // Abort discards unwritten bytes and resets the destination. It returns
 // ErrTCPCleanupUnknown when the guest did not confirm the release.
 func (c *TCPConn) Abort() error {
+	// Signal before joining once.Do: an Abort must interrupt a Close that is still draining.
+	if err := c.native.RequestAbort(); err != nil {
+		return wrapFFI(err)
+	}
 	return c.release(func() (bool, error) {
 		// Close the socket first so blocked calls end with net.ErrClosed. Its unannounced end
 		// of stream aborts the native side too; Abort then waits for the guest's release.
@@ -142,8 +155,8 @@ func (c *TCPConn) release(release func() (bool, error)) error {
 	c.once.Do(func() {
 		runtime.SetFinalizer(c, nil)
 		acknowledged, err := release()
-		if err == nil && !acknowledged {
-			err = ErrTCPCleanupUnknown
+		if !acknowledged {
+			err = errors.Join(err, ErrTCPCleanupUnknown)
 		}
 		c.err = err
 	})

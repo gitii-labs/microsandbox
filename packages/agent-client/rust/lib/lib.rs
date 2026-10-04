@@ -24,6 +24,8 @@ pub mod message;
 #[doc(hidden)]
 pub mod optimized;
 pub mod protocol;
+#[cfg(all(feature = "uds", unix))]
+mod socket_writer;
 pub mod stream;
 pub mod transport;
 

@@ -337,6 +337,38 @@ async fn dropping_a_stream_aborts_instead_of_finishing() {
 }
 
 #[tokio::test]
+async fn dropping_a_half_closed_stream_releases_an_idle_destination_and_relay() {
+    let fixture = Fixture::new(Guest::Prompt).await;
+    let (mut stream, mut peer) = fixture.dial().await;
+    stream.write_all(b"finished input").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut input = Vec::new();
+    peer.read_to_end(&mut input).await.unwrap();
+    assert_eq!(input, b"finished input");
+    // Retain only a non-owning observation of the task state. The destination stays idle/open.
+    let state = Arc::downgrade(&stream.relay.state);
+    let mut outcome = stream.relay.state.outcome.subscribe();
+    drop(stream);
+    let published = tokio::time::timeout(
+        GUEST_TCP_CLOSE_IDLE_TIMEOUT,
+        outcome.wait_for(Option::is_some),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(published.unwrap().cleanup, GuestTcpCleanup::Acknowledged);
+    drop(published);
+    drop(outcome);
+    // Releasing the client joins the scripted agent, so the relay and its socket are gone.
+    fixture.finish().await;
+    assert!(
+        state.upgrade().is_none(),
+        "dropped owner left the relay state alive"
+    );
+    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn concurrent_dials_stay_independent() {
     const CONNECTIONS: usize = 16;
     let fixture = Arc::new(Fixture::new(Guest::Prompt).await);
@@ -383,4 +415,165 @@ async fn concurrent_dials_stay_independent() {
     }
     acceptor.await.unwrap();
     Arc::into_inner(fixture).unwrap().finish().await;
+}
+
+#[tokio::test]
+async fn guest_reset_ends_blocked_read_and_write_and_acknowledges_cleanup() {
+    let fixture = Fixture::new(Guest::Stalled).await;
+    let (mut stream, peer) = fixture.dial().await;
+    let upload = pattern(16 * AGENT_CREDIT as usize, 1);
+    let (mut reader, mut writer) = tokio::io::split(&mut stream);
+    let mut byte = [0];
+    let read = reader.read(&mut byte);
+    let write = writer.write_all(&upload);
+    tokio::pin!(read, write);
+    // Poll both calls into a blocked state before resetting the real destination socket.
+    assert!(tokio::time::timeout(SETTLE, &mut read).await.is_err());
+    assert!(tokio::time::timeout(SETTLE, &mut write).await.is_err());
+    peer.set_zero_linger().unwrap();
+    drop(peer);
+    let (read, write) = tokio::time::timeout(GUEST_TCP_CLOSE_IDLE_TIMEOUT, async {
+        tokio::join!(&mut read, &mut write)
+    })
+    .await
+    .unwrap();
+    assert!(read.is_err(), "reset must not become EOF: {read:?}");
+    assert!(write.is_err(), "reset must end a blocked write: {write:?}");
+    drop((read, write));
+    // The pump consumed both BulkCancel and TcpFailed, and published an outcome without panic.
+    assert_eq!(
+        tokio::time::timeout(GUEST_TCP_CLOSE_IDLE_TIMEOUT, stream.abort())
+            .await
+            .unwrap(),
+        GuestTcpCleanup::Acknowledged
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn stopped_output_reports_truncation_even_if_the_guest_later_finishes() {
+    let fixture = Fixture::new(Guest::Prompt).await;
+    let connection =
+        GuestTcpConnection::connect(Arc::clone(&fixture.client), "127.0.0.1", fixture.port())
+            .await
+            .unwrap();
+    let (mut peer, _) = fixture.destination.accept().await.unwrap();
+    let (source, reader) = tokio::io::duplex(1);
+    let (writer, mut output) = tokio::io::duplex(1);
+    let relay = connection.relay(reader, writer);
+    // Close has stopped output delivery before this guest output and ordered EOF arrive.
+    relay.state.stop.send_replace(true);
+    peer.write_all(b"truncated").await.unwrap();
+    peer.shutdown().await.unwrap();
+    let read = tokio::time::timeout(
+        3 * GUEST_TCP_CLOSE_IDLE_TIMEOUT,
+        output.read_to_end(&mut Vec::new()),
+    )
+    .await
+    .unwrap();
+    read.unwrap();
+    assert!(
+        relay.read_error().is_some(),
+        "discarded output must not certify EOF"
+    );
+    drop(source);
+    assert_eq!(relay.abort().await, GuestTcpCleanup::Acknowledged);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn discarding_guest_bytes_cannot_turn_a_later_finish_into_clean_eof() {
+    let fixture = Fixture::new(Guest::Prompt).await;
+    let mut receiver = BulkReceiveState::new(
+        BulkKind::Tcp,
+        BulkFlow::GuestToHost,
+        64 * 1024,
+        AGENT_CREDIT,
+        AGENT_CREDIT,
+    )
+    .unwrap();
+    let record = BulkRecord {
+        id: 1,
+        kind: BulkKind::Tcp,
+        flow: BulkFlow::GuestToHost,
+        offset: 0,
+        payload: Bytes::from_static(b"truncated"),
+    };
+    let end = receiver.accept_record(&record).unwrap();
+    receiver
+        .accept_finish(BulkFinish {
+            kind: BulkKind::Tcp,
+            flow: BulkFlow::GuestToHost,
+            final_offset: end,
+        })
+        .unwrap();
+    let (events, output) = mpsc::channel(3);
+    assert!(
+        events
+            .send(TcpOutput::Data {
+                payload: record.payload,
+                consumed_offset: end
+            })
+            .await
+            .is_ok()
+    );
+    assert!(events.send(TcpOutput::Eof).await.is_ok());
+    assert!(events.send(TcpOutput::Close).await.is_ok());
+    let stop = watch::Sender::new(true);
+    let (mut writer, _unread) = tokio::io::duplex(1);
+    let clean_eof = relay_tcp_output(
+        1,
+        output,
+        &mut writer,
+        Arc::clone(&fixture.client),
+        Arc::new(Mutex::new(receiver)),
+        stop.subscribe(),
+    )
+    .await;
+    assert!(!clean_eof, "discarded bytes must not become clean EOF");
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn a_closed_sender_validates_late_credit_without_reopening_input() {
+    let fixture = Fixture::new(Guest::Prompt).await;
+    let sender = TcpBulkSender::new(
+        BulkSendState::new(
+            BulkKind::Tcp,
+            BulkFlow::HostToGuest,
+            64 * 1024,
+            AGENT_CREDIT,
+        )
+        .unwrap(),
+    );
+    sender.state.lock().await.admit(64).unwrap();
+    sender.close();
+    sender
+        .apply_credit(BulkCredit {
+            kind: BulkKind::Tcp,
+            flow: BulkFlow::HostToGuest,
+            consumed_offset: 64,
+            credit_limit: AGENT_CREDIT + 64,
+        })
+        .await
+        .unwrap();
+    assert_eq!(sender.consumed().await, (64, true));
+    assert!(
+        sender
+            .apply_credit(BulkCredit {
+                kind: BulkKind::Tcp,
+                flow: BulkFlow::HostToGuest,
+                consumed_offset: 65,
+                credit_limit: AGENT_CREDIT + 65
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        sender
+            .send(&fixture.client, 1, Bytes::from_static(b"no more input"))
+            .await
+            .is_err()
+    );
+    fixture.finish().await;
 }

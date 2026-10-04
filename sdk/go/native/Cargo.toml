@@ -11,9 +11,13 @@ edition.workspace = true
 name = "microsandbox_go_ffi"
 crate-type = ["staticlib", "cdylib"]
 
+[features]
+tcp-test-fixture = ["dep:microsandbox-protocol"]
+
 [dependencies]
 microsandbox = { workspace = true, default-features = true, features = ["net", "ssh"] }
 microsandbox-network.workspace = true
+microsandbox-protocol = { workspace = true, optional = true }
 ipnetwork.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -11,6 +11,8 @@ mod process_exit;
 #[cfg(target_os = "macos")]
 #[path = "process_exit_macos.rs"]
 mod process_exit;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process_socket;
 mod stop;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -302,7 +304,13 @@ impl LocalBackend {
         let (model, _) = self
             .sandbox_handle_state_owned(name, expected_id, true)
             .await?;
-        self.request_stop_owned(name, &model).await
+        self.request_stop_owned(
+            name,
+            &model,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            None,
+        )
+        .await
     }
 
     /// Dispatch while the caller owns the name transition, preserving the selected run.
@@ -310,6 +318,9 @@ impl LocalBackend {
         &self,
         name: &str,
         model: &sandbox_entity::Model,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] process: Option<
+            &process_exit::RuntimeExit,
+        >,
     ) -> MicrosandboxResult<()> {
         if !matches!(
             model.status,
@@ -326,7 +337,13 @@ impl LocalBackend {
             )));
         }
         self.invalidate_control_session(model.id);
-        self.request_agent_shutdown(name, model.id).await?;
+        self.request_agent_shutdown(
+            name,
+            model.id,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            process,
+        )
+        .await?;
         if model.status == SandboxStatus::Running {
             Self::mark_sandbox_draining_if_running(self.db().await?.write(), model.id).await?;
         }
@@ -558,7 +575,14 @@ impl LocalBackend {
     }
 
     /// Connect to the named sandbox's agent endpoint and send `core.shutdown`.
-    async fn request_agent_shutdown(&self, name: &str, expected_id: i32) -> MicrosandboxResult<()> {
+    async fn request_agent_shutdown(
+        &self,
+        name: &str,
+        expected_id: i32,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] process: Option<
+            &process_exit::RuntimeExit,
+        >,
+    ) -> MicrosandboxResult<()> {
         #[cfg(windows)]
         let owner = Self::load_latest_run(self.db().await?.read(), expected_id)
             .await?
@@ -588,7 +612,48 @@ impl LocalBackend {
             )
             .await?
         };
-        #[cfg(not(windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let selected;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let process = if let Some(process) = process {
+            process
+        } else {
+            let run = Self::load_latest_run(self.db().await?.read(), expected_id).await?;
+            selected = process_exit::RuntimeExit::capture_pid(run.and_then(|run| run.pid))?
+                .ok_or_else(|| {
+                    crate::MicrosandboxError::Runtime(
+                        "cannot prove runtime ownership before shutdown".into(),
+                    )
+                })?;
+            &selected
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let client = {
+            let stream = tokio::time::timeout(
+                AGENT_SHUTDOWN_CONNECT_TIMEOUT,
+                process.connect_verified(crate::runtime::sandbox_agent_socket_path_candidates_for(
+                    self, name,
+                )),
+            )
+            .await
+            .map_err(|_| {
+                crate::MicrosandboxError::Runtime("runtime shutdown connection timed out".into())
+            })??
+            .ok_or_else(|| {
+                crate::MicrosandboxError::Runtime(
+                    "no owned runtime agent endpoint for shutdown".into(),
+                )
+            })?;
+            let client = crate::agent::AgentClient::connect_unix_stream_with_timeout(
+                stream,
+                AGENT_SHUTDOWN_CONNECT_TIMEOUT,
+            )
+            .await?;
+            // Handshake waits may outlive the original process. Never send to a new PID owner.
+            process.verify_peer(process.pid())?;
+            client
+        };
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let client = crate::sandbox::fs::agent::connect_agent_with_timeout(
             self,
             name,
@@ -791,6 +856,24 @@ impl LocalBackend {
             SandboxStatus::Starting | SandboxStatus::Running | SandboxStatus::Draining
         ) {
             return Ok(sandbox);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some((run_dir, sandboxes_dir)) = socket_roots {
+            // Legacy runtimes never acquire the lifecycle lock and may terminate their run
+            // row before releasing files. Authenticate endpoints under transition ownership
+            // before reconciling the row or deleting a still-live server's sockets.
+            let latest = Self::load_latest_run(pools.read(), sandbox.id).await?;
+            if let Some(owner) = process_exit::RuntimeExit::capture_socket(
+                latest.and_then(|run| run.pid),
+                run_dir,
+                sandboxes_dir,
+                &sandbox.name,
+            )
+            .await?
+                && !owner.has_exited()?
+            {
+                return Ok(sandbox);
+            }
         }
         // Old Windows runtimes can publish Terminated before the process releases resources.
         #[cfg(windows)]
@@ -1613,6 +1696,136 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticated_shutdown_stream_is_signal_safe_without_reopening() {
+        const CHILD_MODE: &str = "MSB_AUTHENTICATED_SHUTDOWN_SIGPIPE_CHILD";
+        const TEST_NAME: &str = "backend::local::sandbox::tests::authenticated_shutdown_stream_is_signal_safe_without_reopening";
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            for mode in ["delivered", "closed-read"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .env(CHILD_MODE, mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {}\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        // Fatal SIGPIPE is a test precondition in this isolated child only. Production never
+        // changes an embedding process's signal disposition to protect its Unix writer.
+        assert_ne!(
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) },
+            libc::SIG_ERR
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let home = tempfile::tempdir().unwrap();
+                let backend = crate::test_support::local_backend_builder(home.path())
+                    .build()
+                    .await
+                    .unwrap();
+                let pools = backend.db().await.unwrap();
+                let name = "authenticated-stop";
+                let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config(name))
+                    .await
+                    .unwrap();
+                LocalBackend::update_sandbox_status(pools.write(), id, SandboxStatus::Running)
+                    .await
+                    .unwrap();
+                run_entity::Entity::insert(run_entity::ActiveModel {
+                    sandbox_id: Set(id),
+                    pid: Set(Some(std::process::id() as i32)),
+                    status: Set(run_entity::RunStatus::Running),
+                    ..Default::default()
+                })
+                .exec(pools.write())
+                .await
+                .unwrap();
+                let path = crate::runtime::sandbox_agent_socket_path_candidates_for(&backend, name)
+                    .remove(0);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let listener = tokio::net::UnixListener::bind(&path).unwrap();
+                let process =
+                    super::process_exit::RuntimeExit::capture_pid(Some(std::process::id() as i32))
+                        .unwrap()
+                        .unwrap();
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                let fail_write = mode == "closed-read";
+                let runtime = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    // The pathname is now a different endpoint. Shutdown must still use the
+                    // connection that connect_verified authenticated, not dial this replacement.
+                    fs::remove_file(&path).unwrap();
+                    let _replacement = tokio::net::UnixListener::bind(path).unwrap();
+                    socket.write_all(&1u32.to_be_bytes()).await.unwrap();
+                    socket.write_all(&1024u32.to_be_bytes()).await.unwrap();
+                    microsandbox_protocol::codec::write_message(
+                        &mut socket,
+                        &microsandbox_protocol::message::Message::with_payload(
+                            microsandbox_protocol::message::MessageType::Ready,
+                            0,
+                            &microsandbox_protocol::core::Ready::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    if fail_write {
+                        use std::os::fd::AsRawFd;
+                        // Keep the reply direction alive, preventing reader EOF from masking the
+                        // actual shutdown write's EPIPE after the valid handshake.
+                        assert_eq!(
+                            unsafe { libc::shutdown(socket.as_raw_fd(), libc::SHUT_RD) },
+                            0
+                        );
+                        done_rx.await.unwrap();
+                    } else {
+                        let shutdown = microsandbox_protocol::codec::read_message(&mut socket)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            (shutdown.id, shutdown.t),
+                            (0, microsandbox_protocol::message::MessageType::Shutdown)
+                        );
+                        done_rx.await.unwrap();
+                    }
+                });
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    backend.request_agent_shutdown(name, id, Some(&process)),
+                )
+                .await
+                .unwrap();
+                if fail_write {
+                    match result.unwrap_err() {
+                        crate::MicrosandboxError::AgentClient(
+                            crate::agent::AgentClientError::Protocol(
+                                microsandbox_protocol::ProtocolError::Io(error),
+                            ),
+                        ) => assert_eq!(error.raw_os_error(), Some(libc::EPIPE)),
+                        error => {
+                            panic!("shutdown did not report its actual socket failure: {error}")
+                        }
+                    }
+                } else {
+                    result.unwrap();
+                }
+                done_tx.send(()).unwrap();
+                runtime.await.unwrap();
+            });
     }
 
     fn dead_pid() -> i32 {

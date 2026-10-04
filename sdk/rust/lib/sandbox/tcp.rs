@@ -87,6 +87,9 @@ pub(crate) struct TcpRelayEnd {
     pub(crate) finished: Option<bool>,
     /// Whether the guest ended the stream with its terminal reply.
     pub(crate) terminated: bool,
+    /// The guest future completed, even if it did not acknowledge cleanup. Never poll it again.
+    pub(crate) guest_done: bool,
+    pub(crate) output_done: bool,
 }
 
 /// Whether the guest confirmed that a closed connection released its socket.
@@ -222,11 +225,7 @@ impl TcpBulkSender {
     }
 
     async fn apply_credit(&self, credit: BulkCredit) -> MicrosandboxResult<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(MicrosandboxError::Custom(
-                "TCP bulk stream is already closed".into(),
-            ));
-        }
+        // Closing forbids new input, not validated credit already in flight before cancellation.
         let advanced = self
             .state
             .lock()
@@ -389,9 +388,15 @@ impl GuestTcpRelay {
     /// Abort: discard unwritten bytes and cancel the connection now. The destination sees a reset
     /// unless the guest had already written every byte and the finish.
     pub async fn abort(&self) -> GuestTcpCleanup {
+        self.request_abort();
+        self.state.wait().await.cleanup
+    }
+
+    /// Interrupt an orderly close without waiting for cleanup. [`abort`](Self::abort) waits for
+    /// the same outcome; this lets synchronous owners signal abort before joining a closer.
+    pub fn request_abort(&self) {
         self.state.raise(Intent::Abort);
         self.state.stop.send_replace(true);
-        self.state.wait().await.cleanup
     }
 
     /// Why the destination's bytes stopped before the destination ended its side, if they did.
@@ -471,6 +476,14 @@ impl AsyncWrite for GuestTcpStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.relay.finish_write();
         Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+impl Drop for GuestTcpStream {
+    fn drop(&mut self) {
+        // The relay task retains its state senders. Pipe EOF alone cannot release an owner that
+        // already half-closed, because the input future has finished and no longer reads the pipe.
+        self.relay.request_abort();
     }
 }
 
@@ -599,18 +612,21 @@ pub(crate) async fn open_tcp(
 /// all of them. From then on it bounds the wait for the guest's terminal reply. A stream whose
 /// input was fully written is never cancelled for that alone; only its terminal reply or the
 /// deadline ends the wait.
-pub(crate) async fn supervise_tcp<I, O, G>(
+pub(crate) async fn supervise_tcp<I, O, G, A>(
     sender: &TcpBulkSender,
     mut input: Pin<&mut I>,
     mut output: Pin<&mut O>,
     mut guest: Pin<&mut G>,
     stop: &mut watch::Receiver<bool>,
+    abort: A,
 ) -> TcpRelayEnd
 where
     I: Future<Output = bool>,
     O: Future<Output = ()>,
     G: Future<Output = bool>,
+    A: Future<Output = ()>,
 {
+    tokio::pin!(abort);
     let mut finished = None;
     let mut terminated = None;
     let mut output_done = false;
@@ -624,7 +640,7 @@ where
     }
     let mut deadline = tokio::time::Instant::now() + GUEST_TCP_CLOSE_IDLE_TIMEOUT;
     let mut last_consumed = 0;
-    let terminated = loop {
+    let acknowledged = loop {
         if let Some(terminal) = terminated {
             break terminal;
         }
@@ -643,6 +659,7 @@ where
             }
         };
         tokio::select! {
+            () = &mut abort => break false,
             delivered = &mut input, if finished.is_none() => {
                 finished = Some(delivered);
                 deadline = tokio::time::Instant::now() + GUEST_TCP_CLOSE_IDLE_TIMEOUT;
@@ -661,7 +678,9 @@ where
     };
     TcpRelayEnd {
         finished,
-        terminated,
+        terminated: acknowledged,
+        guest_done: terminated.is_some(),
+        output_done,
     }
 }
 
@@ -727,7 +746,7 @@ where
             TcpOutput::Close => break,
         }
     }
-    eof
+    eof && open
 }
 
 /// Pump agent frames without waiting on the output's consumer. The bounded output queue can
@@ -744,21 +763,22 @@ pub(crate) async fn pump_tcp(
     receiver: Arc<Mutex<BulkReceiveState>>,
 ) -> bool {
     let _close_guard = TcpRelayCloseGuard(Arc::clone(&sender));
-    // Only the guest's own end of the stream releases its route; a protocol failure leaves the
-    // stream open for the caller to cancel.
+    // A protocol failure ends byte I/O, but keeps the route open for the caller's cancellation
+    // and the guest's terminal reply. Otherwise even acknowledged cleanup would be lost.
     let mut terminal = false;
     loop {
         let Some(frame) = tcp_rx.recv().await else {
-            terminal = true;
             break;
         };
         match frame {
             AgentFrame::Bulk(record) => {
-                let end = match receiver.lock().await.accept_record(&record) {
+                let accepted = receiver.lock().await.accept_record(&record);
+                let end = match accepted {
                     Ok(end) => end,
                     Err(error) => {
                         tracing::warn!("guest TCP: invalid raw record: {error}");
-                        break;
+                        stop_tcp_output(&output, &sender).await;
+                        continue;
                     }
                 };
                 forward(
@@ -776,12 +796,13 @@ pub(crate) async fn pump_tcp(
                         Ok(credit) => credit,
                         Err(error) => {
                             tracing::warn!("guest TCP: failed to decode bulk credit: {error}");
-                            break;
+                            stop_tcp_output(&output, &sender).await;
+                            continue;
                         }
                     };
                     if let Err(error) = sender.apply_credit(credit).await {
                         tracing::warn!("guest TCP: invalid bulk credit: {error}");
-                        break;
+                        stop_tcp_output(&output, &sender).await;
                     }
                 }
                 MessageType::BulkFinish => {
@@ -789,12 +810,15 @@ pub(crate) async fn pump_tcp(
                         Ok(finish) => finish,
                         Err(error) => {
                             tracing::warn!("guest TCP: failed to decode bulk finish: {error}");
-                            break;
+                            stop_tcp_output(&output, &sender).await;
+                            continue;
                         }
                     };
-                    if let Err(error) = receiver.lock().await.accept_finish(finish) {
+                    let accepted = receiver.lock().await.accept_finish(finish);
+                    if let Err(error) = accepted {
                         tracing::warn!("guest TCP: invalid bulk finish: {error}");
-                        break;
+                        stop_tcp_output(&output, &sender).await;
+                        continue;
                     }
                     forward(&output, TcpOutput::Eof).await;
                 }
@@ -809,25 +833,30 @@ pub(crate) async fn pump_tcp(
                             tracing::warn!("guest TCP: failed to decode bulk cancellation: {error}")
                         }
                     }
-                    break;
+                    // agentd sends the cancel before TcpFailed. End both byte directions now,
+                    // but keep the route alive to receive its terminal cleanup acknowledgement.
+                    stop_tcp_output(&output, &sender).await;
                 }
                 MessageType::TcpClosed => {
-                    if let Err(error) = msg.payload::<TcpClosed>() {
-                        tracing::warn!("guest TCP: failed to decode tcp closed: {error}");
-                    }
-                    terminal = true;
+                    terminal = match msg.payload::<TcpClosed>() {
+                        Ok(_) => true,
+                        Err(error) => {
+                            tracing::warn!("guest TCP: failed to decode tcp closed: {error}");
+                            false
+                        }
+                    };
                     break;
                 }
                 MessageType::TcpFailed => {
                     match msg.payload::<TcpFailed>() {
                         Ok(failed) => {
-                            tracing::debug!(error = failed.error, "guest TCP stream failed")
+                            tracing::debug!(error = failed.error, "guest TCP stream failed");
+                            terminal = true;
                         }
                         Err(error) => {
                             tracing::warn!("guest TCP: failed to decode tcp failed: {error}")
                         }
                     }
-                    terminal = true;
                     break;
                 }
                 other => {
@@ -835,7 +864,7 @@ pub(crate) async fn pump_tcp(
                         message_type = other.as_str(),
                         "guest TCP: unexpected message after bulk acceptance"
                     );
-                    break;
+                    stop_tcp_output(&output, &sender).await;
                 }
             },
         }
@@ -849,6 +878,12 @@ pub(crate) async fn pump_tcp(
 /// nowhere to go.
 async fn forward(output: &mpsc::Sender<TcpOutput>, event: TcpOutput) {
     let _ = output.send(event).await;
+}
+
+/// End byte delivery without ending the guest-frame consumer that owns cleanup acknowledgement.
+async fn stop_tcp_output(output: &mpsc::Sender<TcpOutput>, sender: &TcpBulkSender) {
+    sender.close();
+    forward(output, TcpOutput::Close).await;
 }
 
 /// Wait until `stop` fires. A dropped sender is a dropped owner.
@@ -901,9 +936,8 @@ async fn run_relay<R, W>(
             output_stop,
         )
         .await;
-        // Output that ended without the destination's end of stream did not end in order. Once
-        // the owner stopped reading, nobody is owed that report.
-        if !eof && !*output_state.stop.borrow() {
+        // Concurrent reads still need the truncation cause when Close stopped output delivery.
+        if !eof {
             RelayState::record(
                 &output_state.read_error,
                 "guest TCP stream ended before the destination finished",
@@ -915,12 +949,16 @@ async fn run_relay<R, W>(
         output_state.stop.send_replace(true);
     });
     let mut guest = Box::pin(pump_tcp(frames, output_tx, Arc::clone(&sender), receiver));
+    let mut intent = state.intent.subscribe();
     let end = supervise_tcp(
         &sender,
         input.as_mut(),
         output.as_mut(),
         guest.as_mut(),
         &mut stop,
+        async {
+            let _ = intent.wait_for(|intent| *intent == Intent::Abort).await;
+        },
     )
     .await;
     // Record why before the reader and writer close: the owner asks once it sees them end.
@@ -932,12 +970,18 @@ async fn run_relay<R, W>(
         );
     }
     // The pump must reach the terminal reply below without waiting on an output nobody drains.
+    if !end.output_done {
+        RelayState::record(
+            &state.read_error,
+            "guest TCP output was closed before delivery finished",
+        );
+    }
     drop(output);
     drop(input);
     let terminated = end.terminated || {
         let released = async {
             cancel_tcp(&client, id, &sender, "guest TCP connection released").await;
-            guest.await
+            if end.guest_done { false } else { guest.await }
         };
         tokio::time::timeout(GUEST_TCP_CLOSE_IDLE_TIMEOUT, released)
             .await
