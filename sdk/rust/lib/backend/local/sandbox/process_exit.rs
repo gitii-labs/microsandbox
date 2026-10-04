@@ -9,7 +9,10 @@ use std::path::Path;
 //--------------------------------------------------------------------------------------------------
 
 /// Pins the departing runtime, not a shared disk which another sandbox may acquire next.
-pub(super) struct RuntimeExit(OwnedFd);
+pub(super) struct RuntimeExit {
+    handle: OwnedFd,
+    pid: i32,
+}
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -18,21 +21,10 @@ pub(super) struct RuntimeExit(OwnedFd);
 impl RuntimeExit {
     /// The caller holds the sandbox transition guard across selection and dispatch.
     pub(super) fn capture(pid: Option<i32>, lifecycle: &Path) -> std::io::Result<Option<Self>> {
-        let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        let Some(process) = Self::capture_pid(pid)? else {
             return Ok(None);
         };
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            return if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(None)
-            } else {
-                Err(error)
-            };
-        }
-        // pidfd_open sets CLOEXEC. Neither this handle nor disk descriptors are retained
-        // after the stop future finishes, and observing exit never steals Child's wait status.
-        let process = Self(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+        let pid = process.pid;
         let inherited = format!(
             "/proc/{pid}/fd/{}",
             microsandbox_runtime::vm::LIFECYCLE_LOCK_FD
@@ -48,12 +40,51 @@ impl RuntimeExit {
         if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
             return Ok(None);
         }
+        if process.has_exited()? {
+            return Ok(None);
+        }
         Ok(Some(process))
+    }
+
+    /// Pin first; the caller must authenticate a connected endpoint before using this owner.
+    pub(super) fn capture_pid(pid: Option<i32>) -> std::io::Result<Option<Self>> {
+        let Some(pid) = pid.filter(|pid| *pid > 0) else {
+            return Ok(None);
+        };
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // pidfd_open sets CLOEXEC. Neither this handle nor disk descriptors are retained
+        // after the stop future finishes, and observing exit never steals Child's wait status.
+        let process = Self {
+            handle: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+            pid,
+        };
+        Ok(Some(process))
+    }
+
+    pub(super) fn verify_peer(&self, pid: i32) -> std::io::Result<()> {
+        if self.pid != pid || self.has_exited()? {
+            return Err(std::io::Error::other(
+                "runtime socket process identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn pid(&self) -> i32 {
+        self.pid
     }
 
     pub(super) fn has_exited(&self) -> std::io::Result<bool> {
         let mut poll = libc::pollfd {
-            fd: self.0.as_raw_fd(),
+            fd: self.handle.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -222,6 +253,10 @@ mod tests {
         assert!(
             child.wait().unwrap().success(),
             "exit observation must not reap Child"
+        );
+        assert!(
+            barrier.verify_peer(child.id() as i32).is_err(),
+            "the departing process handle must not authenticate later PID users"
         );
         // Completion is independent of this new owner's continuing exclusive attachment.
         assert!(lock_disk(disk.path()).is_err());

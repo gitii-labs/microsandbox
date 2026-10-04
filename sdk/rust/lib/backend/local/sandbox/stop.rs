@@ -89,17 +89,28 @@ impl LocalBackend {
             Err(MicrosandboxError::SandboxNotFound(_)) if ephemeral => {
                 // Ephemeral teardown can remove the row before dropping runtime ownership.
                 // A same-name replacement is still rejected by the identity-aware lookup.
-                drop(transition);
-                return self
-                    .wait_stop_complete(
-                        name,
-                        id,
-                        None,
-                        true,
-                        #[cfg(windows)]
-                        None,
-                    )
-                    .await;
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    // Legacy teardown unlinks sockets and deletes rows before process exit.
+                    // With no preselected owner, neither absence proves resources are released.
+                    return Err(MicrosandboxError::Runtime(
+                        "cannot prove ephemeral runtime exit after catalog row disappeared: no retained process owner".into(),
+                    ));
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    drop(transition);
+                    return self
+                        .wait_stop_complete(
+                            name,
+                            id,
+                            None,
+                            true,
+                            #[cfg(windows)]
+                            None,
+                        )
+                        .await;
+                }
             }
             Err(error) => return Err(error),
         };
@@ -135,17 +146,46 @@ impl LocalBackend {
             }
             _ => false,
         };
-        #[cfg(not(windows))]
-        let legacy_alive = false;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let departing = super::process_exit::RuntimeExit::capture(
-            run.as_ref().and_then(|run| run.pid),
-            &microsandbox_runtime::ipc::lifecycle_lock_path(&run_dir, name),
-        )?;
+        let departing = {
+            let pid = run.as_ref().and_then(|run| run.pid);
+            match super::process_exit::RuntimeExit::capture(
+                pid,
+                &microsandbox_runtime::ipc::lifecycle_lock_path(&run_dir, name),
+            )? {
+                Some(process) => Some(process),
+                None => {
+                    super::process_exit::RuntimeExit::capture_socket(
+                        pid,
+                        &run_dir,
+                        &self.sandboxes_dir(),
+                        name,
+                    )
+                    .await?
+                }
+            }
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let legacy_alive = departing
+            .as_ref()
+            .map(|process| process.has_exited())
+            .transpose()?
+            .is_some_and(|exited| !exited);
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        let legacy_alive = false;
         // Ownership, not a potentially recycled PID, decides whether there is a
-        // runtime to signal. A stale Running row must still converge successfully.
+        // runtime to signal. An unauthenticated live catalog PID must be refused.
         let dispatched = lock_owned || legacy_alive;
-        if dispatched && let Err(error) = self.request_stop_owned(name, &model).await {
+        if dispatched
+            && let Err(error) = self
+                .request_stop_owned(
+                    name,
+                    &model,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    departing.as_ref(),
+                )
+                .await
+        {
             // The runtime can finish between the ownership probe and dispatch.
             // Preserve a real unreachable-owner failure; reconcile only after
             // proving that this run has released its runtime resources.
@@ -157,6 +197,12 @@ impl LocalBackend {
                 .map(|process| process.alive())
                 .transpose()?
                 .unwrap_or(false);
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let legacy_alive = departing
+                .as_ref()
+                .map(|process| process.has_exited())
+                .transpose()?
+                .is_some_and(|exited| !exited);
             if try_acquire_lifecycle_guard(&run_dir, name)?.is_none() || legacy_alive {
                 return Err(error);
             }
@@ -164,7 +210,7 @@ impl LocalBackend {
         // Exit cleanup also needs transition ownership. Never retain this guard while waiting.
         drop(transition);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(departing) = departing {
+        if let Some(departing) = departing.as_ref() {
             // Do not poll the external upper's lock: a different sandbox may legitimately
             // own it by now. Wait only for the process selected before shutdown dispatch.
             while !departing.has_exited()? {
@@ -176,6 +222,8 @@ impl LocalBackend {
             id,
             run_id,
             model.ephemeral,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            departing.as_ref(),
             #[cfg(windows)]
             owner,
         )
@@ -218,6 +266,9 @@ impl LocalBackend {
         id: i32,
         run_id: Option<i32>,
         ephemeral: bool,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] departing: Option<
+            &super::process_exit::RuntimeExit,
+        >,
         #[cfg(windows)] owner: Option<crate::runtime::ownership::RecordedOwner>,
     ) -> MicrosandboxResult<()> {
         let run_dir = self.config().run_dir();
@@ -231,6 +282,14 @@ impl LocalBackend {
                 Err(MicrosandboxError::SandboxNotFound(_)) if ephemeral => None,
                 Err(error) => return Err(error),
             };
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if model.is_none() && departing.is_none() {
+                // Row/socket absence cannot replace the exact exit observer selected before
+                // an ephemeral runtime started unlinking its endpoints and catalog state.
+                return Err(MicrosandboxError::Runtime(
+                    "cannot prove ephemeral runtime exit after catalog row disappeared: no retained process owner".into(),
+                ));
+            }
             let latest = self.latest_stop_run(id).await?;
             if model.is_some() && latest.as_ref().map(|run| run.id) != run_id {
                 return Err(MicrosandboxError::Runtime(format!(
@@ -246,13 +305,18 @@ impl LocalBackend {
                 .map(|process| process.alive())
                 .transpose()?
                 .unwrap_or(false);
-            #[cfg(not(windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let process_released = departing
+                .map(|process| process.has_exited())
+                .transpose()?
+                .unwrap_or(true);
+            #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             let process_released = true;
             if process_released
                 && let Some(_ownership) = try_acquire_lifecycle_guard(&run_dir, name)?
             {
-                // Both guards fence cooperative restart/removal. Legacy Windows additionally
-                // requires the retained process object to exit; its unused lock proves nothing.
+                // Both guards fence cooperative restart/removal. Retained process observers
+                // additionally prove exit; a legacy runtime's unused lock proves nothing.
                 let _disk_guards = if let Some(model) = model.as_ref() {
                     let config: crate::sandbox::SandboxConfig =
                         serde_json::from_str::<SandboxConfig>(&model.config)?;
@@ -852,8 +916,12 @@ mod tests {
             .unwrap();
         let run_id = run::Entity::insert(run::ActiveModel {
             sandbox_id: Set(id),
-            // A visible PID cannot substitute for the runtime's ownership lock.
+            // These terminal fixtures have no departing Unix process. Tests modelling a
+            // real/recycled PID set it explicitly; Windows keeps its existing owner record.
+            #[cfg(windows)]
             pid: Set(Some(std::process::id() as i32)),
+            #[cfg(not(windows))]
+            pid: Set(None),
             status: Set(run::RunStatus::Terminated),
             ..Default::default()
         })
@@ -874,6 +942,562 @@ mod tests {
                 .unwrap();
         }
         (home, backend, id, run_id)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn legacy_runtime_child() {
+        use microsandbox_protocol::{
+            codec,
+            core::Ready,
+            message::{Message, MessageType},
+        };
+        use std::io::{Read, Write};
+        use tokio::io::AsyncWriteExt;
+
+        let Some(path) = std::env::var_os("MSB_LEGACY_STOP_SOCKET") else {
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let disk = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(std::env::var_os("MSB_LEGACY_STOP_DISK").unwrap())
+                    .unwrap();
+                assert!(microsandbox_utils::process_lock::try_lock_exclusive(&disk).unwrap());
+                let control = microsandbox_runtime::control::control_socket_path_for(
+                    std::path::Path::new(&path),
+                );
+                let control = tokio::net::UnixListener::bind(control).unwrap();
+                tokio::spawn(async move {
+                    loop {
+                        let (stream, _) = control.accept().await.unwrap();
+                        drop(stream);
+                    }
+                });
+                let listener = tokio::net::UnixListener::bind(path).unwrap();
+                println!("ready");
+                std::io::stdout().flush().unwrap();
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    // Ownership probes connect without sending a request. Serve the released
+                    // generation-one agent handshake only when the connection stays open.
+                    if stream
+                        .write_all(&0x0200_0000u32.to_be_bytes())
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let mut ready =
+                        Message::with_payload(MessageType::Ready, 0, &Ready::default()).unwrap();
+                    ready.v = 1;
+                    if codec::write_message(&mut stream, &ready).await.is_err() {
+                        continue;
+                    }
+                    let Ok(shutdown) = codec::read_raw_frame(&mut stream).await else {
+                        continue;
+                    };
+                    let mut actual = Vec::new();
+                    codec::encode_raw_to_buf(&shutdown, &mut actual).unwrap();
+                    let mut expected = vec![0, 0, 0, 29, 0, 0, 0, 0, 4, 0xa3, 0x61, b'v', 1];
+                    expected.extend_from_slice(b"\x61t\x6dcore.shutdown\x61p\x41\xf6");
+                    assert_eq!(actual, expected);
+                    println!("shutdown");
+                    std::io::stdout().flush().unwrap();
+                    // Model a runtime that publishes terminal state before actual process exit.
+                    let mut byte = [0];
+                    std::io::stdin().read_exact(&mut byte).unwrap();
+                    std::process::exit(0);
+                }
+            });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn legacy_child(
+        backend: &LocalBackend,
+        name: &str,
+        run_id: i32,
+    ) -> (
+        tokio::process::Child,
+        tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    ) {
+        use std::process::Stdio;
+        use tokio::io::AsyncBufReadExt;
+
+        // The flat path is the released runtime's endpoint; it has no lifecycle descriptor.
+        let socket =
+            microsandbox_runtime::ipc::sandbox_socket_paths(&backend.config().run_dir(), name)
+                .legacy_agent;
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let disk = backend.sandboxes_dir().join(name).join("legacy-test.disk");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        std::fs::write(&disk, b"legacy disk").unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backend::local::sandbox::stop::tests::legacy_runtime_child",
+                "--nocapture",
+            ])
+            .env("MSB_LEGACY_STOP_SOCKET", socket)
+            .env("MSB_LEGACY_STOP_DISK", disk)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        wait_child_line(&mut output, "ready").await;
+        run::Entity::update_many()
+            .col_expr(
+                run::Column::Pid,
+                sea_orm::sea_query::Expr::value(child.id().unwrap() as i32),
+            )
+            .filter(run::Column::Id.eq(run_id))
+            .exec(backend.db().await.unwrap().write())
+            .await
+            .unwrap();
+        (child, output)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn wait_child_line(
+        output: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+        expected: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = output
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("child exited before synchronization");
+                if line == expected {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn legacy_stop_sends_shutdown_and_waits_for_pinned_process_exit() {
+        use tokio::io::AsyncWriteExt;
+        for ephemeral in [false, true] {
+            let (_home, backend, id, run_id) = fixture("legacy-unix").await;
+            let backend = Arc::new(backend);
+            let (mut child, mut output) = legacy_child(&backend, "legacy-unix", run_id).await;
+            let db = backend.db().await.unwrap().write();
+            run::Entity::update_many()
+                .col_expr(
+                    run::Column::Status,
+                    sea_orm::sea_query::Expr::value(run::RunStatus::Running),
+                )
+                .filter(run::Column::Id.eq(run_id))
+                .exec(db)
+                .await
+                .unwrap();
+            LocalBackend::update_sandbox_status(db, id, SandboxStatus::Running)
+                .await
+                .unwrap();
+            sandbox::Entity::update_many()
+                .col_expr(
+                    sandbox::Column::Ephemeral,
+                    sea_orm::sea_query::Expr::value(ephemeral),
+                )
+                .filter(sandbox::Column::Id.eq(id))
+                .exec(db)
+                .await
+                .unwrap();
+            assert!(
+                try_acquire_lifecycle_guard(&backend.config().run_dir(), "legacy-unix")
+                    .unwrap()
+                    .is_some()
+            );
+
+            let mut stop = tokio::spawn({
+                let backend = Arc::clone(&backend);
+                async move { backend.stop_complete("legacy-unix", id, ephemeral).await }
+            });
+            // Stop must send the historical shutdown packet, despite the unused lifecycle lock.
+            tokio::select! {
+                result = &mut stop => panic!("stop returned before runtime exit: {result:?}"),
+                () = wait_child_line(&mut output, "shutdown") => {}
+            }
+            unlink_legacy_endpoints(&backend, "legacy-unix");
+            if ephemeral {
+                sandbox::Entity::delete_by_id(id).exec(db).await.unwrap();
+            } else {
+                run::Entity::update_many()
+                    .col_expr(
+                        run::Column::Status,
+                        sea_orm::sea_query::Expr::value(run::RunStatus::Terminated),
+                    )
+                    .col_expr(run::Column::ExitCode, sea_orm::sea_query::Expr::value(0))
+                    .col_expr(
+                        run::Column::TerminationReason,
+                        sea_orm::sea_query::Expr::value(run::TerminationReason::ShutdownRequested),
+                    )
+                    .filter(run::Column::Id.eq(run_id))
+                    .exec(db)
+                    .await
+                    .unwrap();
+                LocalBackend::update_sandbox_status(db, id, SandboxStatus::Stopped)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut stop)
+                    .await
+                    .is_err(),
+                "terminal catalog state and a free lock do not prove legacy exit"
+            );
+            assert!(child.try_wait().unwrap().is_none());
+            assert_legacy_disk_held(&backend, "legacy-unix");
+            child.stdin.take().unwrap().write_all(b"x").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), &mut stop)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                child.wait().await.unwrap().success(),
+                "stop must not reap the child"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unlink_legacy_endpoints(backend: &LocalBackend, name: &str) {
+        let agent =
+            microsandbox_runtime::ipc::sandbox_socket_paths(&backend.config().run_dir(), name)
+                .legacy_agent;
+        let control = microsandbox_runtime::control::control_socket_path_for(&agent);
+        // Synchronization on the child's Ready output proves both listeners already exist.
+        std::fs::remove_file(agent).unwrap();
+        std::fs::remove_file(control).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_legacy_disk_held(backend: &LocalBackend, name: &str) {
+        let disk = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(backend.sandboxes_dir().join(name).join("legacy-test.disk"))
+            .unwrap();
+        assert!(
+            !microsandbox_utils::process_lock::try_lock_exclusive(&disk).unwrap(),
+            "legacy child must still own its disk descriptor"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn unlinked_legacy_endpoints_do_not_certify_exit_for_active_or_terminal_rows() {
+        for (name, status, run_status) in [
+            (
+                "unlink-active",
+                SandboxStatus::Running,
+                run::RunStatus::Running,
+            ),
+            (
+                "unlink-terminal",
+                SandboxStatus::Stopped,
+                run::RunStatus::Terminated,
+            ),
+            (
+                "unlink-draining",
+                SandboxStatus::Draining,
+                run::RunStatus::Terminated,
+            ),
+        ] {
+            let (_home, backend, id, run_id) = fixture(name).await;
+            let (mut child, _output) = legacy_child(&backend, name, run_id).await;
+            let db = backend.db().await.unwrap().write();
+            run::Entity::update_many()
+                .col_expr(
+                    run::Column::Status,
+                    sea_orm::sea_query::Expr::value(run_status),
+                )
+                .col_expr(run::Column::ExitCode, sea_orm::sea_query::Expr::value(0))
+                .col_expr(
+                    run::Column::TerminationReason,
+                    sea_orm::sea_query::Expr::value(run::TerminationReason::ShutdownRequested),
+                )
+                .filter(run::Column::Id.eq(run_id))
+                .exec(db)
+                .await
+                .unwrap();
+            LocalBackend::update_sandbox_status(db, id, status)
+                .await
+                .unwrap();
+            assert!(child.try_wait().unwrap().is_none());
+            assert_legacy_disk_held(&backend, name);
+            unlink_legacy_endpoints(&backend, name);
+            assert!(
+                try_acquire_lifecycle_guard(&backend.config().run_dir(), name)
+                    .unwrap()
+                    .is_some()
+            );
+
+            let error = backend.stop_complete(name, id, false).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot authenticate live catalog process"),
+                "{error}"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "refusal must not signal the unverified PID"
+            );
+            assert_legacy_disk_held(&backend, name);
+            assert_eq!(
+                sandbox::Entity::find_by_id(id)
+                    .one(backend.db().await.unwrap().read())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                status
+            );
+            assert_eq!(
+                backend.latest_stop_run(id).await.unwrap().unwrap().status,
+                run_status
+            );
+
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+            backend.stop_complete(name, id, false).await.unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn unauthenticated_live_catalog_pid_without_endpoints_is_not_signalled_or_reconciled() {
+        use crate::backend::Backend;
+        let (_home, backend, id, run_id) = fixture("recycled-pid").await;
+        let db = backend.db().await.unwrap().write();
+        run::Entity::update_many()
+            .col_expr(
+                run::Column::Pid,
+                sea_orm::sea_query::Expr::value(std::process::id() as i32),
+            )
+            .col_expr(
+                run::Column::Status,
+                sea_orm::sea_query::Expr::value(run::RunStatus::Running),
+            )
+            .filter(run::Column::Id.eq(run_id))
+            .exec(db)
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(db, id, SandboxStatus::Running)
+            .await
+            .unwrap();
+        let backend: Arc<dyn Backend> = Arc::new(backend);
+        let handle = backend
+            .sandboxes()
+            .get(backend.clone(), "recycled-pid")
+            .await
+            .unwrap();
+        let error = handle.stop().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot authenticate live catalog process"),
+            "{error}"
+        );
+        assert_eq!(
+            backend
+                .as_local()
+                .unwrap()
+                .latest_stop_run(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            run::RunStatus::Running
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn legacy_terminal_run_is_not_reconciled_while_socket_owner_lives() {
+        let (_home, backend, id, run_id) = fixture("legacy-reconcile").await;
+        let (mut child, _output) = legacy_child(&backend, "legacy-reconcile", run_id).await;
+        let db = backend.db().await.unwrap().write();
+        // Legacy teardown may terminate the run row before releasing the process's files.
+        LocalBackend::update_sandbox_status(db, id, SandboxStatus::Draining)
+            .await
+            .unwrap();
+        let (model, _) = backend
+            .sandbox_handle_state("legacy-reconcile", Some(id))
+            .await
+            .unwrap();
+        assert_eq!(model.status, SandboxStatus::Draining);
+        assert_eq!(
+            backend
+                .latest_stop_run(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .termination_reason,
+            None
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                backend.stop_complete("legacy-reconcile", id, false)
+            )
+            .await
+            .is_err()
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn stale_pid_socket_mismatch_is_never_sent_shutdown() {
+        let (_home, backend, id, run_id) = fixture("stale-endpoint").await;
+        let (mut child, _output) = legacy_child(&backend, "stale-endpoint", run_id).await;
+        let db = backend.db().await.unwrap().write();
+        // The persisted PID is a different live process from this endpoint's actual server.
+        run::Entity::update_many()
+            .col_expr(
+                run::Column::Pid,
+                sea_orm::sea_query::Expr::value(std::process::id() as i32),
+            )
+            .col_expr(
+                run::Column::Status,
+                sea_orm::sea_query::Expr::value(run::RunStatus::Running),
+            )
+            .filter(run::Column::Id.eq(run_id))
+            .exec(db)
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(db, id, SandboxStatus::Running)
+            .await
+            .unwrap();
+        let error = backend
+            .stop_complete("stale-endpoint", id, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("process identity changed"),
+            "{error}"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(
+            backend.latest_stop_run(id).await.unwrap().unwrap().status,
+            run::RunStatus::Running
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn legacy_control_owner_with_unreachable_agent_returns_error() {
+        let (_home, backend, id, run_id) = fixture("legacy-unreachable").await;
+        let agent = microsandbox_runtime::ipc::sandbox_socket_paths(
+            &backend.config().run_dir(),
+            "legacy-unreachable",
+        )
+        .legacy_agent;
+        let control = microsandbox_runtime::control::control_socket_path_for(&agent);
+        std::fs::create_dir_all(control.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&control).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                // A real socket supplies ownership, but this fixture has no agent listener.
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream);
+            }
+        });
+        let db = backend.db().await.unwrap().write();
+        run::Entity::update_many()
+            .col_expr(
+                run::Column::Pid,
+                sea_orm::sea_query::Expr::value(std::process::id() as i32),
+            )
+            .col_expr(
+                run::Column::Status,
+                sea_orm::sea_query::Expr::value(run::RunStatus::Running),
+            )
+            .filter(run::Column::Id.eq(run_id))
+            .exec(db)
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(db, id, SandboxStatus::Running)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.stop_complete("legacy-unreachable", id, false),
+        )
+        .await;
+        server.abort();
+        let error = result.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no owned runtime agent endpoint"),
+            "{error}"
+        );
+        assert_eq!(
+            backend.latest_stop_run(id).await.unwrap().unwrap().status,
+            run::RunStatus::Running
+        );
+        assert!(
+            control.exists(),
+            "an unreachable owner must not be reconciled away"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn legacy_ephemeral_missing_row_refuses_even_after_endpoints_disappear() {
+        let (_home, backend, id, run_id) = fixture("legacy-ephemeral").await;
+        let (mut child, _output) = legacy_child(&backend, "legacy-ephemeral", run_id).await;
+        sandbox::Entity::delete_by_id(id)
+            .exec(backend.db().await.unwrap().write())
+            .await
+            .unwrap();
+        let error = backend
+            .stop_complete("legacy-ephemeral", id, true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no retained process owner"),
+            "{error}"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        unlink_legacy_endpoints(&backend, "legacy-ephemeral");
+        assert_legacy_disk_held(&backend, "legacy-ephemeral");
+        let error = backend
+            .stop_complete("legacy-ephemeral", id, true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no retained process owner"),
+            "{error}"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        assert_legacy_disk_held(&backend, "legacy-ephemeral");
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        backend
+            .stop_complete("legacy-ephemeral", id, true)
+            .await
+            .unwrap_err();
     }
 
     async fn owned_disk_fixture(
@@ -1003,6 +1627,8 @@ mod tests {
                     id,
                     Some(run_id),
                     false,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    None,
                     #[cfg(windows)]
                     None,
                 )
@@ -1029,6 +1655,8 @@ mod tests {
                 id,
                 Some(run_id),
                 false,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                None,
                 #[cfg(windows)]
                 None,
             )
@@ -1092,6 +1720,8 @@ mod tests {
                 id,
                 Some(run_id),
                 false,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                None,
                 #[cfg(windows)]
                 None,
             )
@@ -1101,7 +1731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ownership_release_reconciles_a_stale_run_despite_a_visible_pid() {
+    async fn ownership_release_reconciles_an_unowned_stale_run() {
         let (_home, backend, id, run_id) = fixture("stale-run").await;
         run::Entity::update_many()
             .col_expr(
@@ -1197,6 +1827,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[tokio::test]
     async fn ephemeral_row_disappearance_still_waits_for_ownership_release() {
         let (_home, backend, id, _) = fixture("ephemeral-stop").await;

@@ -17,6 +17,12 @@ type SandboxConfig struct {
 	Image       string
 	ImageFstype string
 	ImageBind   string
+	// FromSnapshot cold-boots a disk snapshot instead of an image, with the rest
+	// of this config. Set it with WithFromSnapshot.
+	FromSnapshot string
+	// FromSnapshotReferenceKind is "id" or "path" when FromSnapshot names a
+	// SnapshotArtifact or SnapshotHandle, and empty when it is resolved by spelling.
+	FromSnapshotReferenceKind string
 	// RootDisk configures root storage for an OCI image.
 	// Construct via the RootDisk factory and set with WithRootDisk.
 	RootDisk *RootDiskConfig
@@ -691,6 +697,20 @@ func WithImageDisk(path string, fstype string) SandboxOption {
 // WithImageDisk.
 func WithBindRootfs(path string) SandboxOption {
 	return func(o *SandboxConfig) { o.ImageBind = path }
+}
+
+// WithFromSnapshot creates the sandbox by cold-booting a disk snapshot, with
+// every other creation option applied as on an image boot: environment,
+// secrets, init, scripts, labels, volumes and network. The snapshot pins the
+// image and root disk, so it is mutually exclusive with WithImage, WithImageDisk,
+// WithBindRootfs, WithRootDisk and patches. A full snapshot is refused before
+// anything is created, because resuming its captured execution would ignore
+// those options; restore it with RestoreSandbox instead.
+func WithFromSnapshot[T SnapshotSeed](snapshot T) SandboxOption {
+	reference, kind := snapshotReference(snapshot)
+	return func(o *SandboxConfig) {
+		o.FromSnapshot, o.FromSnapshotReferenceKind = reference, kind
+	}
 }
 
 // WithSnapshotDiskOnly cold-boots only the disk state carried by a full snapshot.

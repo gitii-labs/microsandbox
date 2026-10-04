@@ -2205,7 +2205,7 @@ pub(crate) fn sandbox_agent_socket_path_candidates_for(
     )
 }
 
-fn sandbox_agent_socket_path_candidates_with_roots(
+pub(crate) fn sandbox_agent_socket_path_candidates_with_roots(
     run_dir: &Path,
     sandboxes_dir: &Path,
     name: &str,

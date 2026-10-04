@@ -188,6 +188,8 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 		Vsock:             buildFFIVsockRoutes(o.Vsock),
 		RegistryInsecure:  o.RegistryInsecure,
 	}
+	// Keep an ID versus a path as the caller's snapshot handle recorded it.
+	ffiOpts.FromSnapshot, ffiOpts.FromSnapshotRefKind = o.FromSnapshot, o.FromSnapshotReferenceKind
 	if o.Entrypoint != nil {
 		entrypoint := append([]string{}, o.Entrypoint...)
 		ffiOpts.Entrypoint = &entrypoint

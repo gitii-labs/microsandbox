@@ -55,29 +55,11 @@ struct VnodeFdInfo {
 impl RuntimeExit {
     /// Select under the sandbox transition guard, before requesting shutdown.
     pub(super) fn capture(pid: Option<i32>, lifecycle: &Path) -> io::Result<Option<Self>> {
-        let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        let Some(observer) = Self::capture_pid(pid)? else {
             return Ok(None);
         };
-        let Some(identity) = process_state(pid)? else {
-            return Ok(None);
-        };
-        if identity.status == libc::SZOMB as u8 {
-            return Ok(None);
-        }
-        let queue = register_exit(pid)?;
-        let observer = Self {
-            queue,
-            pid,
-            identity,
-        };
-        // The PID may have disappeared/recycled between the identity read and registration.
-        // Never wait for a new occupant, even if it later opens the same lifecycle file.
-        let Some(current) = process_state(pid)? else {
-            return Ok(None);
-        };
-        if current.birth != identity.birth || current.status == libc::SZOMB as u8 {
-            return Ok(None);
-        }
+        let pid = observer.pid;
+        let identity = observer.identity;
         let matches = lifecycle_matches(pid, lifecycle)?;
         let Some(current) = process_state(pid)? else {
             return Ok(None);
@@ -101,6 +83,58 @@ impl RuntimeExit {
             }));
         }
         Ok(None)
+    }
+
+    /// Pin first; the caller must authenticate a connected endpoint before using this owner.
+    pub(super) fn capture_pid(pid: Option<i32>) -> io::Result<Option<Self>> {
+        let Some(pid) = pid.filter(|pid| *pid > 0) else {
+            return Ok(None);
+        };
+        let Some(identity) = process_state(pid)? else {
+            return Ok(None);
+        };
+        if identity.status == libc::SZOMB as u8 {
+            return Ok(None);
+        }
+        let queue = register_exit(pid)?;
+        let observer = Self {
+            queue,
+            pid,
+            identity,
+        };
+        // The PID may have disappeared/recycled between the identity read and registration.
+        // Never wait for a new occupant, even if it later opens the same lifecycle file.
+        let Some(current) = process_state(pid)? else {
+            return Ok(None);
+        };
+        if current.birth != identity.birth || current.status == libc::SZOMB as u8 {
+            return Ok(None);
+        }
+        // Registration can miss an exit edge when the process is already exiting.
+        Ok(Some(if current.flags & P_WEXIT != 0 {
+            Self {
+                queue: None,
+                ..observer
+            }
+        } else {
+            observer
+        }))
+    }
+
+    pub(super) fn verify_peer(&self, pid: i32) -> io::Result<()> {
+        // A kqueue pins exit observation, not signal delivery. Recheck birth identity
+        // too, so a recycled PID cannot authenticate a replacement socket server.
+        if self.pid != pid
+            || self.has_exited()?
+            || process_state(pid)?.is_none_or(|state| state.birth != self.identity.birth)
+        {
+            return Err(io::Error::other("runtime socket process identity changed"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn pid(&self) -> i32 {
+        self.pid
     }
 
     pub(super) fn has_exited(&self) -> io::Result<bool> {
@@ -431,6 +465,10 @@ mod tests {
         assert!(
             child.wait().unwrap().success(),
             "observer must not reap Child"
+        );
+        assert!(
+            barrier.verify_peer(child.id() as i32).is_err(),
+            "the departing process observer must not authenticate later PID users"
         );
         assert!(
             lock_disk(disk.path()).is_err(),

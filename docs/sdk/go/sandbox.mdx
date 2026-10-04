@@ -1146,7 +1146,7 @@ Require every supplied label. Repeated selectors are AND-matched.
 func WithImage(image string) SandboxOption
 ```
 
-Set the root filesystem source: an OCI image name, local directory path, or disk image path (e.g. `"python:3.12"`, `"docker.io/library/alpine"`). Required for creation; use `RestoreSandbox` for snapshots. Use [`WithImageDisk`](#withimagedisk) when a disk-image root needs an explicit filesystem type.
+Set the root filesystem source: an OCI image name, local directory path, or disk image path (e.g. `"python:3.12"`, `"docker.io/library/alpine"`). Required for creation unless [`WithFromSnapshot`](#withfromsnapshot) boots a disk snapshot; use `RestoreSandbox` to resume a full snapshot. Use [`WithImageDisk`](#withimagedisk) when a disk-image root needs an explicit filesystem type.
 
 <p className="msb-label">Parameters</p>
 
@@ -1154,6 +1154,37 @@ Set the root filesystem source: an OCI image name, local directory path, or disk
   <div className="msb-param">
     <div className="msb-param-key"><code>image</code><span className="msb-type">string</span></div>
     <div className="msb-param-desc">OCI image, local path, or disk image.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv"></span><span className="msb-hn">WithFromSnapshot()</span>
+
+<Tooltip tip="Creating from a snapshot is not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```go
+func WithFromSnapshot[T SnapshotSeed](snapshot T) SandboxOption
+```
+
+Cold-boot a disk snapshot instead of an image, with every other creation option applied as on an image boot: environment, secrets, init, scripts, labels, volumes and network. The snapshot pins the image and root disk, so `WithImage`, `WithImageDisk`, `WithBindRootfs`, `WithRootDisk` and patches are rejected. A full snapshot is rejected before anything is created, because resuming its captured execution would ignore these options; resume it with [`RestoreSandbox`](/sdk/go/snapshots#restore).
+
+<Accordion title="Example">
+
+```go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithFromSnapshot("baseline:after-install"),
+    m.WithEnv(map[string]string{"MODE": "resumed"}),
+    m.WithDetached(),
+)
+```
+
+</Accordion>
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>snapshot</code><span className="msb-type">string | *SnapshotArtifact | *SnapshotHandle</span></div>
+    <div className="msb-param-desc">Snapshot name, path, or handle. A handle keeps its ID or path interpretation.</div>
   </div>
 </div>
 
