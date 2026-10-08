@@ -60,7 +60,7 @@ pub(crate) fn do_setattr(
     if fs.is_virtual_init_inode(ino) {
         return Err(platform::eacces());
     }
-    if fs.cfg.readonly() && setattr_mutates(valid) {
+    if fs.readonly() && setattr_mutates(valid) {
         return Err(platform::erofs());
     }
 
@@ -280,6 +280,11 @@ pub(crate) fn do_access(fs: &PassthroughFs, ctx: Context, ino: u64, mask: u32) -
     // F_OK: just check existence.
     if mask == platform::ACCESS_F_OK {
         return Ok(());
+    }
+
+    // A read-only backend refuses write access the way a read-only mount does.
+    if fs.readonly() && mask & platform::ACCESS_W_OK != 0 {
+        return Err(platform::erofs());
     }
 
     let st_mode = platform::mode_u32(st.st_mode);

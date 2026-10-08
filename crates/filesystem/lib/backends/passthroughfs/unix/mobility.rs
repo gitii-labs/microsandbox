@@ -612,7 +612,7 @@ fn validate_semantics(
         quota.validate_state(quota_state)?;
     }
 
-    validate_shape(state, fs.cfg.readonly(), invalid_root)
+    validate_shape(state, fs.readonly(), invalid_root)
 }
 
 fn validate_shape(state: &PassthroughState, readonly: bool, invalid_root: bool) -> io::Result<()> {

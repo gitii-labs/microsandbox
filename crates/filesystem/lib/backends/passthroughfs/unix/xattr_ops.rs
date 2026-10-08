@@ -43,7 +43,7 @@ pub(crate) fn do_setxattr(
     if fs.is_virtual_init_inode(ino) {
         return Err(platform::eacces());
     }
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 
@@ -302,7 +302,7 @@ pub(crate) fn do_removexattr(
     if fs.is_virtual_init_inode(ino) {
         return Err(platform::eacces());
     }
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 

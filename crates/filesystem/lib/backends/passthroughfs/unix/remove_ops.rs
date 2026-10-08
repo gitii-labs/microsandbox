@@ -34,7 +34,7 @@ pub(crate) fn do_unlink(
     name: &CStr,
 ) -> io::Result<()> {
     name_validation::validate_name(name)?;
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 
@@ -160,7 +160,7 @@ pub(crate) fn do_rmdir(
     name: &CStr,
 ) -> io::Result<()> {
     name_validation::validate_name(name)?;
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 
@@ -237,7 +237,7 @@ pub(crate) fn do_rename(
 ) -> io::Result<()> {
     name_validation::validate_name(oldname)?;
     name_validation::validate_name(newname)?;
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 

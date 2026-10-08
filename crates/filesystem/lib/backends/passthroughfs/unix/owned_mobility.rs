@@ -305,7 +305,7 @@ fn validate(
                 || handle.handle >= state.linked.next_handle
                 || !handles.insert(handle.handle)
                 || handle.flags & 0b11 == 0b11
-                || (fs.cfg.readonly() && handle.flags & 0b11 != 0)
+                || (fs.readonly() && handle.flags & 0b11 != 0)
             {
                 return Err(invalid_state("invalid owned detached handle"));
             }

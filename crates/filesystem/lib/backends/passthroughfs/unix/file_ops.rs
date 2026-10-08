@@ -46,7 +46,7 @@ pub(crate) fn do_open(
     }
 
     let mut open_flags = inode::translate_open_flags(flags as i32);
-    if fs.cfg.readonly() && open_flags_mutate(open_flags) {
+    if fs.readonly() && open_flags_mutate(open_flags) {
         return Err(platform::erofs());
     }
 
@@ -148,7 +148,7 @@ pub(crate) fn do_write(
     if fs.is_virtual_init_inode(inode) {
         return Err(platform::eacces());
     }
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 
