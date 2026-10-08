@@ -28,6 +28,8 @@ pub(crate) mod metrics;
 #[cfg(feature = "local")]
 mod modify;
 #[cfg(feature = "local")]
+mod mount_table;
+#[cfg(feature = "local")]
 mod patch;
 #[cfg(all(feature = "local", windows))]
 pub(crate) use patch::{
@@ -178,6 +180,8 @@ pub use microsandbox_network::policy::{
 #[cfg(feature = "net")]
 pub use microsandbox_network::{OutboundProxy, Socks5Credentials};
 #[cfg(feature = "local")]
+pub use microsandbox_protocol::control::MountChange;
+#[cfg(feature = "local")]
 pub use microsandbox_runtime::control::PauseControlState as SandboxPauseState;
 pub use microsandbox_types::SandboxLogLevel as LogLevel;
 pub use microsandbox_types::{CpuPlacement, PullPolicy};
@@ -197,6 +201,7 @@ pub use microsandbox_types::{
 pub use microsandbox_types::{ExternalMountRestorePolicy, ExternalMountWarning};
 #[cfg(feature = "net")]
 pub use microsandbox_types::{MintEndpoint, OAuthSecret};
+pub use microsandbox_types::{MountTableCache, MountTableChild, MountTableSpec};
 #[cfg(feature = "local")]
 pub(crate) use restore_builder::RestoreBootOverrides;
 pub use restore_builder::RestoreBuilder;

@@ -221,6 +221,20 @@ pub enum MicrosandboxError {
         error: microsandbox_protocol::control::ControlError,
     },
 
+    /// A mount-table batch stopped at a failed change.
+    #[error(
+        "mount update stopped after {applied_count} applied changes; change {failed_index} failed: {}",
+        error.message
+    )]
+    ControlMountBatch {
+        /// Number of changes applied before the failure.
+        applied_count: u32,
+        /// The failed change; later changes were not attempted.
+        failed_index: u32,
+        /// Structured runtime failure; earlier changes remain applied.
+        error: microsandbox_protocol::control::ControlError,
+    },
+
     /// A nix/errno error occurred.
     #[cfg(all(feature = "local", unix))]
     #[error("nix error: {0}")]
@@ -412,6 +426,8 @@ pub enum Operation {
     SandboxMetricsStream,
     /// `Sandbox::modify`.
     SandboxModify,
+    /// `Sandbox::update_mounts`.
+    SandboxUpdateMounts,
     /// `Sandbox::fs`.
     SandboxFs,
     /// The free function `all_sandbox_metrics`.
@@ -569,6 +585,7 @@ impl Operation {
             Operation::SandboxMetrics => "Sandbox::metrics",
             Operation::SandboxMetricsStream => "Sandbox::metrics_stream",
             Operation::SandboxModify => "Sandbox::modify",
+            Operation::SandboxUpdateMounts => "Sandbox::update_mounts",
             Operation::SandboxFs => "Sandbox::fs",
             Operation::AllSandboxMetrics => "all_sandbox_metrics",
             Operation::AgentConnect => "agent connections",
