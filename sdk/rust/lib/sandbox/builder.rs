@@ -5211,7 +5211,10 @@ mod tests {
             (table("mnt", vec![]), "absolute, normalized"),
             (table("/", vec![]), "absolute, normalized"),
             (table("/mnt/../etc", vec![]), "absolute, normalized"),
-            (table("/mnt/x", vec![child("a/b", "/srv")]), "one path component"),
+            (
+                table("/mnt/x", vec![child("a/b", "/srv")]),
+                "one path component",
+            ),
             (
                 table("/mnt/x", vec![child("a", "/srv"), child("a", "/srv")]),
                 "used twice",
@@ -5234,7 +5237,10 @@ mod tests {
             .build()
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("same guest path"), "got: {error}");
+        assert!(
+            error.to_string().contains("same guest path"),
+            "got: {error}"
+        );
     }
 
     #[tokio::test]
