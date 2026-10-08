@@ -89,6 +89,8 @@ pub(super) struct TableState {
     /// Held shared by every device operation on a child. A mode switch or
     /// detach takes it exclusively before replying, so no operation that
     /// began under the old state is still running when the caller proceeds.
+    /// The wait lasts as long as the longest operation in flight, so a slow
+    /// host filesystem under a child also delays mode switches and detaches.
     pub(super) ops: RwLock<()>,
 }
 
@@ -205,8 +207,9 @@ impl MountTable {
             children.by_id.remove(&id)
         };
         // Wait for operations that resolved the child before it was removed.
-        // Afterwards this is the last reference, so dropping it closes every
-        // descriptor before the caller is told the child is detached.
+        // Afterwards only FUSE init or destroy, which walk every child without
+        // the guard, can still hold a reference; otherwise dropping this one
+        // closes every descriptor before the caller is told it is detached.
         drop(self.state.ops.write().unwrap());
         drop(removed);
         Ok(())
