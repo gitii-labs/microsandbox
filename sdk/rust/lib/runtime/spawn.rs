@@ -2224,6 +2224,11 @@ pub(crate) fn sandbox_agent_socket_path_candidates_with_roots(
             paths.legacy_agent,
             in_sandbox_agent_socket_path(sandboxes_dir, name),
         ]
+        .into_iter()
+        // Caller validation: an overlong fallback cannot serve this socket pair,
+        // and connecting to it would turn a missing endpoint into InvalidInput.
+        .filter(|path| microsandbox_runtime::ipc::validate_socket_pair(path).is_ok())
+        .collect()
     };
     #[cfg(not(unix))]
     let candidates = {
@@ -4702,6 +4707,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_socket_candidates_follow_explicit_local_backend_paths() {
+        #[cfg(unix)]
+        let temp = tempfile::Builder::new()
+            .prefix("msb")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(not(unix))]
         let temp = tempdir().unwrap();
         let home = temp.path().join("msb-home");
         let backend = LocalBackend::builder()
@@ -4740,6 +4751,36 @@ mod tests {
                     .starts_with(r"\\.\pipe\msb-agent-")
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_agent_socket_candidates_exclude_overlong_control_fallback() {
+        let run_dir = Path::new("/tmp/msb/run");
+        let sandboxes_dir = Path::new("/tmp/msb/sandboxes");
+        let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len();
+        let base = super::in_sandbox_agent_socket_path(sandboxes_dir, "");
+        let control = microsandbox_runtime::ipc::control_socket_path_for(&base);
+        let name = "x".repeat(capacity - control.as_os_str().as_encoded_bytes().len() - 2);
+        let fallback = super::in_sandbox_agent_socket_path(sandboxes_dir, &name);
+        assert!(microsandbox_runtime::ipc::validate_socket_pair(&fallback).is_ok());
+        assert!(
+            super::sandbox_agent_socket_path_candidates_with_roots(run_dir, sandboxes_dir, &name)
+                .contains(&fallback)
+        );
+
+        let name = format!("{name}x");
+        let fallback = super::in_sandbox_agent_socket_path(sandboxes_dir, &name);
+        assert!(microsandbox_runtime::ipc::socket_path_fits(&fallback));
+        assert!(!microsandbox_runtime::ipc::socket_path_fits(
+            &microsandbox_runtime::ipc::control_socket_path_for(&fallback)
+        ));
+        let candidates =
+            super::sandbox_agent_socket_path_candidates_with_roots(run_dir, sandboxes_dir, &name);
+        let paths = microsandbox_runtime::ipc::sandbox_socket_paths(run_dir, &name);
+        assert_eq!(candidates, vec![paths.agent, paths.legacy_agent]);
     }
 
     #[tokio::test]
