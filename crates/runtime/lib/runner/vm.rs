@@ -3174,6 +3174,10 @@ pub(crate) fn mount_table_child(
             microsandbox_types::StatVirtualization::Relaxed => StatVirtualization::Relaxed,
             microsandbox_types::StatVirtualization::Off => StatVirtualization::Off,
         },
+        host_permissions: match child.host_permissions {
+            microsandbox_types::HostPermissions::Private => HostPermissions::Private,
+            microsandbox_types::HostPermissions::Mirror => HostPermissions::Mirror,
+        },
         cache_policy: match child.cache {
             microsandbox_types::MountTableCache::Auto => microsandbox_filesystem::CachePolicy::Auto,
             microsandbox_types::MountTableCache::Never => {

@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use microsandbox::Sandbox;
 use microsandbox::sandbox::{
-    MountChange, MountTableCache, MountTableChild, MountTableSpec, StatVirtualization,
+    HostPermissions, MountChange, MountTableCache, MountTableChild, MountTableSpec,
+    StatVirtualization,
 };
 use test_utils::msb_test;
 
@@ -32,7 +33,8 @@ exec 3>>/mnt/distributed/disk/held
 exec 4>>/mnt/distributed/shm/held
 exec 5</mnt/distributed/disk/marker
 printf abcd > /tmp/payload
-wait_for() { while [ ! -f "$1" ]; do sleep 0.05; done; }
+# Give up after 60 s so a stuck step fails the test instead of hanging it.
+wait_for() { i=0; while [ ! -f "$1" ]; do i=$((i+1)); [ "$i" -gt 1200 ] && exit 1; sleep 0.05; done; }
 touch /tmp/ready
 
 wait_for /tmp/go-readonly
@@ -101,6 +103,16 @@ async fn mount_table_changes_apply_live_inside_the_guest() {
         std::fs::read(disk.path.join("written")).unwrap(),
         b"guest\n"
     );
+    // Mirror host permissions: a guest chmod reaches the host inode.
+    sh(&sandbox, &format!("chmod 0750 {ROOT}/disk/written")).await;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(disk.path.join("written"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750);
+    }
     assert_eq!(std::fs::read(shm.path.join("token")).unwrap(), b"secret\n");
     assert_eq!(
         sh(&sandbox, &format!("stat -c %a {ROOT}/shm/token")).await,
@@ -130,7 +142,8 @@ async fn mount_table_changes_apply_live_inside_the_guest() {
         &format!(
             "cat > /tmp/holder.sh <<'EOF'\n{HOLDER}\nEOF\n\
              setsid sh /tmp/holder.sh >/tmp/holder.log 2>&1 </dev/null &\n\
-             while [ ! -f /tmp/ready ]; do sleep 0.05; done"
+             {}",
+            bounded_wait("/tmp/ready")
         ),
     )
     .await;
@@ -153,11 +166,10 @@ async fn mount_table_changes_apply_live_inside_the_guest() {
     // the cached child and for the never-cached child alike.
     assert!(readonly.contains("disk_write=1"), "{readonly}");
     assert!(readonly.contains("shm_write=1"), "{readonly}");
-    assert!(
-        sh(&sandbox, "cat /tmp/disk-write.err /tmp/shm-write.err")
-            .await
-            .contains("Read-only file system")
-    );
+    for file in ["/tmp/disk-write.err", "/tmp/shm-write.err"] {
+        let error = sh(&sandbox, &format!("cat {file}")).await;
+        assert!(error.contains("Read-only file system"), "{file}: {error}");
+    }
     assert_eq!(std::fs::read(disk.path.join("held")).unwrap(), b"");
     assert_eq!(std::fs::read(shm.path.join("held")).unwrap(), b"");
 
@@ -172,16 +184,10 @@ async fn mount_table_changes_apply_live_inside_the_guest() {
     assert!(detach.contains("held_read=1"), "{detach}");
     assert!(detach.contains("cwd_ls=1"), "{detach}");
     assert!(detach.contains("cwd_cat=1"), "{detach}");
-    let errors = sh(
-        &sandbox,
-        "cat /tmp/held-read.err /tmp/cwd.err /tmp/cwd-cat.err",
-    )
-    .await;
-    assert_eq!(
-        errors.matches("Stale file handle").count(),
-        3,
-        "every held access must fail with ESTALE:\n{errors}"
-    );
+    for file in ["/tmp/held-read.err", "/tmp/cwd.err", "/tmp/cwd-cat.err"] {
+        let error = sh(&sandbox, &format!("cat {file}")).await;
+        assert!(error.contains("Stale file handle"), "{file}: {error}");
+    }
 
     // Re-attaching the name over new content shows the new content and never
     // the old inodes.
@@ -220,6 +226,15 @@ async fn mount_table_changes_apply_live_inside_the_guest() {
         "{error}"
     );
     assert_eq!(sh(&sandbox, &format!("ls {ROOT}")).await, "disk\nshm");
+
+    // Mount updates never touch the VM, so they apply while it is user-paused.
+    sandbox.pause().await.expect("pause");
+    sandbox
+        .set_mount_readonly("shm", false)
+        .await
+        .expect("update while paused");
+    sandbox.resume().await.expect("resume");
+    sh(&sandbox, &format!("echo again > {ROOT}/shm/after-pause")).await;
 
     // The table's children cannot be captured, so a live fork is refused up front.
     let Err(error) = sandbox.fork("mount-table-live-fork").fork().await else {
@@ -269,6 +284,7 @@ fn child(name: &str, host: &Path, readonly: bool, cache: MountTableCache) -> Mou
         readonly,
         quota_bytes: None,
         stat_virtualization: StatVirtualization::Strict,
+        host_permissions: HostPermissions::Mirror,
         cache,
     }
 }
@@ -294,8 +310,17 @@ async fn run_step(sandbox: &Sandbox, step: &str) -> String {
     sh(
         sandbox,
         &format!(
-            "touch /tmp/go-{step}; while [ ! -f /tmp/done-{step} ]; do sleep 0.05; done; cat /tmp/{step}"
+            "touch /tmp/go-{step}; {}; cat /tmp/{step}",
+            bounded_wait(&format!("/tmp/done-{step}"))
         ),
     )
     .await
+}
+
+/// A guest shell loop waiting at most 60 s for `path`, printing the holder log on timeout.
+fn bounded_wait(path: &str) -> String {
+    format!(
+        "i=0; while [ ! -f {path} ]; do i=$((i+1)); if [ \"$i\" -gt 1200 ]; then \
+         echo \"timed out waiting for {path}\"; cat /tmp/holder.log; exit 1; fi; sleep 0.05; done"
+    )
 }

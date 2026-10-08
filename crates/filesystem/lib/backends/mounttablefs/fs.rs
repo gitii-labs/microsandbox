@@ -11,7 +11,7 @@ use std::{
     ffi::CStr,
     io,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLockReadGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -61,8 +61,9 @@ pub struct MountTableFs {
     root_handles: Mutex<HashMap<u64, Vec<(String, u64)>>>,
 }
 
-/// A resolved child-local target.
-struct Target {
+/// A resolved child-local target, valid while its operation guard is held.
+struct Target<'a> {
+    _op: RwLockReadGuard<'a, ()>,
     child: Arc<Child>,
     inode: u64,
 }
@@ -85,8 +86,19 @@ impl MountTableFs {
         &self.table
     }
 
-    /// Resolve a guest inode inside a live child.
-    fn target(&self, inode: u64) -> io::Result<Target> {
+    /// Begin an operation on a guest inode inside a live child.
+    fn target(&self, inode: u64) -> io::Result<Target<'_>> {
+        let op = self.table.begin();
+        let (child, inode) = self.resolve(inode)?;
+        Ok(Target {
+            _op: op,
+            child,
+            inode,
+        })
+    }
+
+    /// Resolve a guest inode without taking the operation guard.
+    fn resolve(&self, inode: u64) -> io::Result<(Arc<Child>, u64)> {
         let (id, local) = table::decode(inode);
         if id == 0 {
             // The only id-0 inode is the synthetic root, which callers handle.
@@ -96,14 +108,11 @@ impl MountTableFs {
             .table
             .child_by_id(id)
             .ok_or_else(|| errno(LINUX_ESTALE))?;
-        Ok(Target {
-            child,
-            inode: local,
-        })
+        Ok((child, local))
     }
 
     /// Resolve a guest handle that must belong to the same child as `target`.
-    fn handle(&self, target: &Target, handle: u64) -> io::Result<u64> {
+    fn handle(&self, target: &Target<'_>, handle: u64) -> io::Result<u64> {
         let (id, local) = table::decode(handle);
         if id != target.child.id {
             return Err(errno(LINUX_EBADF));
@@ -111,14 +120,22 @@ impl MountTableFs {
         Ok(local)
     }
 
-    /// Resolve two inodes that one operation needs inside the same child.
-    fn same_child(&self, first: u64, second: u64) -> io::Result<(Target, u64)> {
-        let first = self.target(first)?;
-        let second = self.target(second)?;
-        if first.child.id != second.child.id {
+    /// Begin an operation on two inodes that must be inside the same child.
+    fn same_child(&self, first: u64, second: u64) -> io::Result<(Target<'_>, u64)> {
+        let op = self.table.begin();
+        let (child, inode) = self.resolve(first)?;
+        let (second_child, second) = self.resolve(second)?;
+        if child.id != second_child.id {
             return Err(errno(LINUX_EXDEV));
         }
-        Ok((first, second.inode))
+        Ok((
+            Target {
+                _op: op,
+                child,
+                inode,
+            },
+            second,
+        ))
     }
 
     fn guest_inode(&self, child: &Child, local: u64) -> io::Result<u64> {
@@ -131,6 +148,7 @@ impl MountTableFs {
 
     fn guest_entry(&self, child: &Child, mut entry: Entry) -> io::Result<Entry> {
         entry.inode = self.guest_inode(child, entry.inode)?;
+        entry.attr = guest_stat(child, entry.attr)?;
         Ok(entry)
     }
 
@@ -145,8 +163,8 @@ impl MountTableFs {
         let (attr, _) = child.fs.getattr(ctx, CHILD_ROOT_INODE, None)?;
         Ok(Entry {
             inode: table::encode(child.id, CHILD_ROOT_INODE)?,
+            attr: guest_stat(child, attr)?,
             generation: 0,
-            attr,
             attr_flags: 0,
             attr_timeout: Duration::ZERO,
             entry_timeout: Duration::ZERO,
@@ -178,6 +196,7 @@ impl DynFileSystem for MountTableFs {
         if id == 0 {
             return None;
         }
+        let _op = self.table.begin();
         match self.table.child_by_id(id) {
             Some(child) => child.fs.request_error(local),
             // Detached: the guest still holds this inode or handle.
@@ -213,15 +232,10 @@ impl DynFileSystem for MountTableFs {
     fn lookup(&self, ctx: Context, parent: u64, name: &CStr) -> io::Result<Entry> {
         if parent == ROOT_INODE {
             let name = name.to_str().map_err(|_| errno(LINUX_ENOENT))?;
-            let id = self
-                .table
-                .entries()
-                .into_iter()
-                .find_map(|(entry, id)| (entry == name).then_some(id))
-                .ok_or_else(|| errno(LINUX_ENOENT))?;
+            let _op = self.table.begin();
             let child = self
                 .table
-                .child_by_id(id)
+                .child_by_name(name)
                 .ok_or_else(|| errno(LINUX_ENOENT))?;
             return self.child_root_entry(ctx, &child);
         }
@@ -238,6 +252,7 @@ impl DynFileSystem for MountTableFs {
         if id == 0 || local == CHILD_ROOT_INODE {
             return;
         }
+        let _op = self.table.begin();
         if let Some(child) = self.table.child_by_id(id) {
             child.fs.forget(ctx, local, count);
         }
@@ -251,6 +266,7 @@ impl DynFileSystem for MountTableFs {
                 by_child.entry(id).or_default().push((local, count));
             }
         }
+        let _op = self.table.begin();
         for (id, requests) in by_child {
             if let Some(child) = self.table.child_by_id(id) {
                 child.fs.batch_forget(ctx, requests);
@@ -269,7 +285,8 @@ impl DynFileSystem for MountTableFs {
         }
         let target = self.target(inode)?;
         let handle = handle.map(|h| self.handle(&target, h)).transpose()?;
-        target.child.fs.getattr(ctx, target.inode, handle)
+        let (attr, timeout) = target.child.fs.getattr(ctx, target.inode, handle)?;
+        Ok((guest_stat(&target.child, attr)?, timeout))
     }
 
     fn setattr(
@@ -285,10 +302,11 @@ impl DynFileSystem for MountTableFs {
         }
         let target = self.target(inode)?;
         let handle = handle.map(|h| self.handle(&target, h)).transpose()?;
-        target
+        let (attr, timeout) = target
             .child
             .fs
-            .setattr(ctx, target.inode, attr, handle, valid)
+            .setattr(ctx, target.inode, attr, handle, valid)?;
+        Ok((guest_stat(&target.child, attr)?, timeout))
     }
 
     fn readlink(&self, ctx: Context, inode: u64) -> io::Result<Vec<u8>> {
@@ -660,7 +678,13 @@ impl DynFileSystem for MountTableFs {
         target
             .child
             .fs
-            .readdir(ctx, target.inode, handle, size, offset)
+            .readdir(ctx, target.inode, handle, size, offset)?
+            .into_iter()
+            .map(|mut entry| {
+                entry.ino = guest_ino(&target.child, entry.ino)?;
+                Ok(entry)
+            })
+            .collect()
     }
 
     fn readdir_for_each(
@@ -680,6 +704,7 @@ impl DynFileSystem for MountTableFs {
                 .get(&handle)
                 .cloned()
                 .ok_or_else(|| errno(LINUX_EBADF))?;
+            let _op = self.table.begin();
             let mut position = 0;
             for name in [".", ".."] {
                 position += 1;
@@ -707,7 +732,7 @@ impl DynFileSystem for MountTableFs {
                 // `ino` matches the `st_ino` a lookup of the name returns.
                 let (attr, _) = child.fs.getattr(ctx, CHILD_ROOT_INODE, None)?;
                 let entry = DirEntry {
-                    ino: attr.st_ino,
+                    ino: guest_ino(&child, attr.st_ino)?,
                     offset: position,
                     type_: DT_DIR,
                     name: name.as_bytes(),
@@ -720,10 +745,15 @@ impl DynFileSystem for MountTableFs {
         }
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
+        let child = Arc::clone(&target.child);
+        let mut map_entry = |mut entry: DirEntry<'_>| {
+            entry.ino = guest_ino(&child, entry.ino)?;
+            add_entry(entry)
+        };
         target
             .child
             .fs
-            .readdir_for_each(ctx, target.inode, handle, size, offset, add_entry)
+            .readdir_for_each(ctx, target.inode, handle, size, offset, &mut map_entry)
     }
 
     fn readdirplus(
@@ -745,7 +775,10 @@ impl DynFileSystem for MountTableFs {
             .fs
             .readdirplus(ctx, target.inode, handle, size, offset)?
             .into_iter()
-            .map(|(dir_entry, entry)| Ok((dir_entry, self.guest_entry(&target.child, entry)?)))
+            .map(|(mut dir_entry, entry)| {
+                dir_entry.ino = guest_ino(&target.child, dir_entry.ino)?;
+                Ok((dir_entry, self.guest_entry(&target.child, entry)?))
+            })
             .collect()
     }
 
@@ -766,6 +799,7 @@ impl DynFileSystem for MountTableFs {
                 .get(&handle)
                 .cloned()
                 .ok_or_else(|| errno(LINUX_EBADF))?;
+            let _op = self.table.begin();
             // Offsets match `readdir_for_each`: 1 and 2 are the dot entries,
             // which readdirplus omits like the passthrough backend does.
             for (index, (name, id)) in listed.iter().enumerate() {
@@ -793,7 +827,8 @@ impl DynFileSystem for MountTableFs {
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
         let child = Arc::clone(&target.child);
-        let mut map_entry = |dir_entry: DirEntry<'_>, entry: Entry| {
+        let mut map_entry = |mut dir_entry: DirEntry<'_>, entry: Entry| {
+            dir_entry.ino = guest_ino(&child, dir_entry.ino)?;
             add_entry(dir_entry, self.guest_entry(&child, entry)?)
         };
         target.child.fs.readdirplus_for_each(
@@ -897,6 +932,21 @@ fn root_stat(children: usize) -> stat64 {
     stat.st_nlink = (2 + children) as _;
     stat.st_blksize = 4096;
     stat
+}
+
+/// Present a host inode number under the child's attachment id, so two
+/// children never show the guest the same (device, inode) pair. Zero stays
+/// zero: it marks an entry without attributes.
+fn guest_ino(child: &Child, host_ino: u64) -> io::Result<u64> {
+    if host_ino == 0 {
+        return Ok(0);
+    }
+    table::encode(child.id, host_ino)
+}
+
+fn guest_stat(child: &Child, mut stat: stat64) -> io::Result<stat64> {
+    stat.st_ino = guest_ino(child, stat.st_ino)?;
+    Ok(stat)
 }
 
 fn errno(code: i32) -> io::Error {

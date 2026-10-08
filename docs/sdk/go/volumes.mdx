@@ -60,10 +60,10 @@ err = sb.DetachMount(ctx, "token")
 
 - The table directory itself is read-only, mounted `nosuid,nodev`, and lists the attached children. A sandbox has at most one table.
 - `Readonly` refuses every mutation with `EROFS`, including writes through files the guest opened before `SetMountReadonly`.
-- `DetachMount` closes the child's host descriptors; files and working directories the guest still holds inside it fail with `ESTALE`. Attaching the same name again never reaches those old files.
-- `QuotaBytes` bounds guest writes; nil is unlimited. `StatVirtualization` defaults to `Strict`, which needs writable `user.*` xattrs on the host directory (tmpfs has them since Linux 6.6). `MountTableCacheNever` uses direct I/O and zero cache timeouts.
+- `SetMountReadonly` and `DetachMount` return only after operations already in flight on the child have finished. `DetachMount` closes the child's host descriptors; files and working directories the guest still holds inside it fail with `ESTALE`. Attaching the same name again never reaches those old files.
+- `QuotaBytes` bounds guest writes; nil is unlimited. `StatVirtualization` defaults to `Strict`, which needs writable `user.*` xattrs on the host directory (tmpfs has them since Linux 6.6). `MountTableCacheNever` uses direct I/O and zero cache timeouts. `HostPermissions` defaults to `Private` (guest modes live in the metadata overlay); `HostPermissionsMirror` copies ordinary rwx bits of guest `chmod` and create modes to the host inode.
 - No component of `Host` may be a symlink; resolve a symlinked prefix such as `/var` on macOS first.
-- Live changes are not saved: a restart attaches the children given at creation. Live full snapshots and forks of a running sandbox with a mount table are refused.
+- Live changes are not saved: a restart attaches the children given at creation. Live snapshots (full or disk-only) and forks of a running sandbox with a mount table are refused. Changes also apply while the sandbox is paused.
 
 ## Functions
 

@@ -12,7 +12,8 @@ func TestFFIWireShape_MountTable(t *testing.T) {
 			MountTableChild{Name: "data", Host: "/srv/data"},
 			MountTableChild{
 				Name: "secret", Host: "/dev/shm/secret", Readonly: true, QuotaBytes: &quota,
-				StatVirtualization: StatVirtualizationOff, Cache: MountTableCacheNever,
+				StatVirtualization: StatVirtualizationOff, HostPermissions: HostPermissionsMirror,
+				Cache: MountTableCacheNever,
 			},
 		),
 		"/tmp": Mount.Tmpfs(TmpfsOptions{SizeMiB: 16}),
@@ -36,7 +37,8 @@ func TestFFIWireShape_MountTable(t *testing.T) {
 	}
 	secret := children[1].(map[string]any)
 	if secret["readonly"] != true || secret["quota_bytes"] != float64(4096) ||
-		secret["stat_virtualization"] != "off" || secret["cache"] != "never" {
+		secret["stat_virtualization"] != "off" || secret["host_permissions"] != "mirror" ||
+		secret["cache"] != "never" {
 		t.Fatalf("secret child = %v", secret)
 	}
 	// The table is not a volume.

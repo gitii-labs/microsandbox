@@ -27,7 +27,7 @@ func TestMountTableLiveChanges(t *testing.T) {
 		microsandbox.WithImage(goIntegrationImage),
 		microsandbox.WithMounts(map[string]microsandbox.MountConfig{
 			"/mnt/distributed": microsandbox.Mount.Table(microsandbox.MountTableChild{
-				Name: "launch", Host: launch,
+				Name: "launch", Host: launch, HostPermissions: microsandbox.HostPermissionsMirror,
 			}),
 		}),
 	)
@@ -56,6 +56,10 @@ func TestMountTableLiveChanges(t *testing.T) {
 	mustShell("echo from-guest > /mnt/distributed/launch/file")
 	if got, _ := os.ReadFile(filepath.Join(launch, "file")); string(got) != "from-guest\n" {
 		t.Fatalf("host file = %q", got)
+	}
+	mustShell("chmod 0750 /mnt/distributed/launch/file")
+	if info, err := os.Stat(filepath.Join(launch, "file")); err != nil || info.Mode().Perm() != 0o750 {
+		t.Fatalf("mirrored host mode: %v %v", info.Mode(), err)
 	}
 
 	if err := sb.AttachMount(ctx, microsandbox.MountTableChild{

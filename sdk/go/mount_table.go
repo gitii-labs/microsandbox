@@ -39,6 +39,9 @@ type MountTableChild struct {
 	// is Strict, which needs writable user.* xattrs on the host directory
 	// even for a read-only child.
 	StatVirtualization StatVirtualization
+	// HostPermissions selects whether guest chmod and create modes reach the
+	// host inode. The zero value is Private; Mirror copies ordinary rwx bits.
+	HostPermissions HostPermissions
 	// Cache is the guest caching policy. The zero value is Auto.
 	Cache MountTableCache
 }
@@ -133,6 +136,7 @@ func buildFFIMountTableChild(child MountTableChild) *ffi.MountTableChild {
 		Readonly:           child.Readonly,
 		QuotaBytes:         child.QuotaBytes,
 		StatVirtualization: string(stat),
+		HostPermissions:    string(child.HostPermissions),
 		Cache:              string(child.Cache),
 	}
 }

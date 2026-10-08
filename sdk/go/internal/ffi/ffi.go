@@ -1881,6 +1881,7 @@ type MountTableChild struct {
 	Readonly           bool    `json:"readonly"`
 	QuotaBytes         *uint64 `json:"quota_bytes,omitempty"`
 	StatVirtualization string  `json:"stat_virtualization"`
+	HostPermissions    string  `json:"host_permissions,omitempty"`
 	Cache              string  `json:"cache,omitempty"`
 }
 

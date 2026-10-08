@@ -520,9 +520,16 @@ pub struct MountTableChild {
     /// Guest-visible metadata policy. `strict` needs writable `user.*` xattrs
     /// on the host directory, even for a read-only child.
     pub stat_virtualization: StatVirtualization,
+    /// Whether guest `chmod` and create modes reach the host inode. Defaults to `private`.
+    #[serde(default = "private_host_permissions")]
+    pub host_permissions: HostPermissions,
     /// Guest caching policy.
     #[serde(default)]
     pub cache: MountTableCache,
+}
+
+fn private_host_permissions() -> HostPermissions {
+    HostPermissions::Private
 }
 
 /// A mount table: one virtio-fs device at a guest directory whose children

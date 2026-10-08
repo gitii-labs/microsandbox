@@ -5194,6 +5194,7 @@ mod tests {
             readonly: false,
             quota_bytes: None,
             stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+            host_permissions: microsandbox_types::HostPermissions::Private,
             cache: microsandbox_types::MountTableCache::Auto,
         };
         let table = |guest: &str, children| microsandbox_types::MountTableSpec {

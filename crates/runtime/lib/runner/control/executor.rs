@@ -268,12 +268,15 @@ impl RuntimeControlExecutor {
                     | ControlRequest::DiskCheckpointCreate { .. }
                     | ControlRequest::BranchCreate { .. }
                     | ControlRequest::BranchCreateMemfd { .. }
+                    // The mount table is host-side state; a paused VM does not touch it.
+                    | ControlRequest::MountsUpdate { .. }
             );
         // Refuse before quiescing: the mount-table device rejects state capture.
         if self.mounts_update_supported()
             && matches!(
                 request,
                 ControlRequest::CheckpointCreate { .. }
+                    | ControlRequest::DiskCheckpointCreate { .. }
                     | ControlRequest::BranchCreate { .. }
                     | ControlRequest::BranchCreateMemfd { .. }
             )
@@ -596,7 +599,7 @@ impl RuntimeControlExecutor {
                     secrets_update: self.secrets_update_supported(),
                     // A mount table's children change at runtime and cannot be captured.
                     checkpoint_create: !self.mounts_update_supported(),
-                    disk_checkpoint_create: true,
+                    disk_checkpoint_create: !self.mounts_update_supported(),
                     branch_create: cfg!(any(unix, windows)) && !self.mounts_update_supported(),
                     optional_disk_integrity: true,
                     guest_flush_policy: true,

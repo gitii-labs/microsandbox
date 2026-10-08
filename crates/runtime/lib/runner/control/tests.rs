@@ -954,6 +954,7 @@ fn mount_child(name: &str, host: &std::path::Path) -> microsandbox_types::MountT
         readonly: false,
         quota_bytes: None,
         stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+        host_permissions: microsandbox_types::HostPermissions::Private,
         cache: microsandbox_types::MountTableCache::Auto,
     }
 }

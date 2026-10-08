@@ -4,14 +4,16 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockReadGuard},
     time::Duration,
 };
 
 use super::MountTableFs;
 use crate::{
     DynFileSystem, FsOptions,
-    backends::passthroughfs::{CachePolicy, PassthroughConfig, PassthroughFs, StatVirtualization},
+    backends::passthroughfs::{
+        CachePolicy, HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,
+    },
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -63,6 +65,9 @@ pub struct MountTableChild {
     /// switched to read-write later.
     pub stat_virtualization: StatVirtualization,
 
+    /// Whether guest permission changes reach the host inode.
+    pub host_permissions: HostPermissions,
+
     /// Guest caching. [`CachePolicy::Never`] also sets zero entry and
     /// attribute timeouts, for content that must not linger in guest memory.
     pub cache_policy: CachePolicy,
@@ -81,6 +86,10 @@ pub struct MountTable {
 #[derive(Default)]
 pub(super) struct TableState {
     pub(super) children: RwLock<Children>,
+    /// Held shared by every device operation on a child. A mode switch or
+    /// detach takes it exclusively before replying, so no operation that
+    /// began under the old state is still running when the caller proceeds.
+    pub(super) ops: RwLock<()>,
 }
 
 #[derive(Default)]
@@ -138,6 +147,7 @@ impl MountTable {
             root_dir: child.host_path.clone(),
             no_symlink_root: true,
             stat_virtualization: child.stat_virtualization,
+            host_permissions: child.host_permissions,
             // Probe for the strongest access the child can later be switched to.
             readonly: false,
             entry_timeout: timeout,
@@ -194,8 +204,10 @@ impl MountTable {
                 .ok_or_else(|| name_error(LINUX_ENOENT, name, "is not attached"))?;
             children.by_id.remove(&id)
         };
-        // An operation already running on this child keeps its own reference;
-        // the descriptors close when the last reference drops.
+        // Wait for operations that resolved the child before it was removed.
+        // Afterwards this is the last reference, so dropping it closes every
+        // descriptor before the caller is told the child is detached.
+        drop(self.state.ops.write().unwrap());
         drop(removed);
         Ok(())
     }
@@ -209,6 +221,10 @@ impl MountTable {
             .child_by_name(name)
             .ok_or_else(|| name_error(LINUX_ENOENT, name, "is not attached"))?;
         child.fs.set_readonly(readonly);
+        // A write that checked the flag before the switch finishes before the
+        // caller is told the switch applies.
+        drop(child);
+        drop(self.state.ops.write().unwrap());
         Ok(())
     }
 
@@ -229,7 +245,13 @@ impl MountTable {
         self.state.children.read().unwrap().by_name.is_empty()
     }
 
-    fn child_by_name(&self, name: &str) -> Option<Arc<Child>> {
+    /// Begin one device operation; see [`TableState::ops`]. Never nest it:
+    /// a waiting writer blocks new readers.
+    pub(super) fn begin(&self) -> RwLockReadGuard<'_, ()> {
+        self.state.ops.read().unwrap()
+    }
+
+    pub(super) fn child_by_name(&self, name: &str) -> Option<Arc<Child>> {
         let children = self.state.children.read().unwrap();
         let id = children.by_name.get(name)?;
         children.by_id.get(id).cloned()

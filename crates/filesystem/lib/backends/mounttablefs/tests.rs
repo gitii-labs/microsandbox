@@ -13,8 +13,8 @@ use tempfile::TempDir;
 
 use super::{MountTable, MountTableChild, MountTableFs, table};
 use crate::{
-    CachePolicy, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions, OpenOptions,
-    SetattrValid, StatVirtualization, ZeroCopyReader, ZeroCopyWriter, stat64,
+    CachePolicy, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions, HostPermissions,
+    OpenOptions, SetattrValid, StatVirtualization, ZeroCopyReader, ZeroCopyWriter, stat64,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -199,6 +199,7 @@ fn child(name: &str, host_path: &Path, readonly: bool) -> MountTableChild {
         readonly,
         quota_bytes: None,
         stat_virtualization: StatVirtualization::Strict,
+        host_permissions: HostPermissions::Private,
         cache_policy: CachePolicy::Auto,
     }
 }
@@ -552,13 +553,11 @@ fn never_cached_children_use_direct_io_and_zero_timeouts() {
     assert!(options.contains(OpenOptions::DIRECT_IO));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_tmpfs_child_supports_strict_stat_virtualization() {
     let shm = Path::new("/dev/shm");
-    if !shm.is_dir() {
-        // Linux-only host directory; macOS uses a RAM disk instead.
-        return;
-    }
+    assert!(shm.is_dir(), "/dev/shm must exist on Linux");
     let mut fixture = Fixture::new();
     let dir = fixture.host_dir_in(shm);
     // Strict probes writable `user.*` xattrs; tmpfs has them since Linux 6.6.
@@ -588,4 +587,96 @@ fn a_cstr_name_that_is_not_utf8_is_not_found() {
     let fixture = Fixture::new();
     let name = CStr::from_bytes_with_nul(b"\xff\0").unwrap();
     assert_eq!(errno(fixture.fs.lookup(ctx(), ROOT, name)), LINUX_ENOENT);
+}
+
+#[test]
+fn children_never_share_a_guest_inode_number() {
+    let mut fixture = Fixture::new();
+    let dir = fixture.host_dir();
+    std::fs::write(dir.join("file"), b"data").unwrap();
+    // Two children over the same host directory see the same host inodes.
+    fixture.attach("a", &dir, false);
+    fixture.attach("b", &dir, false);
+    let a = fixture.lookup(ROOT, "a").unwrap();
+    let b = fixture.lookup(ROOT, "b").unwrap();
+    assert_ne!(a.attr.st_ino, b.attr.st_ino);
+    let file_a = fixture.lookup(a.inode, "file").unwrap();
+    let file_b = fixture.lookup(b.inode, "file").unwrap();
+    assert_ne!(file_a.attr.st_ino, file_b.attr.st_ino);
+    let host_ino = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir.join("file")).unwrap().ino()
+    };
+    assert_eq!(table::decode(file_a.attr.st_ino).1, host_ino);
+    let (stat, _) = fixture.fs.getattr(ctx(), file_a.inode, None).unwrap();
+    assert_eq!(stat.st_ino, file_a.attr.st_ino);
+
+    // Directory entries report the same number a lookup does.
+    let (handle, _) = fixture.fs.opendir(ctx(), a.inode, 0).unwrap();
+    let mut listed = None;
+    fixture
+        .fs
+        .readdir_for_each(ctx(), a.inode, handle.unwrap(), 4096, 0, &mut |entry| {
+            if entry.name == b"file" {
+                listed = Some(entry.ino);
+            }
+            Ok(1)
+        })
+        .unwrap();
+    assert_eq!(listed, Some(file_a.attr.st_ino));
+}
+
+/// Run `operation` on another thread while this thread holds an in-flight
+/// operation guard; return once `applied` shows the change took effect,
+/// asserting the reply is still withheld, then release the guard.
+fn assert_waits_for_in_flight_operations(
+    fixture: &Fixture,
+    operation: impl FnOnce(MountTable) + Send + 'static,
+    applied: impl Fn() -> bool,
+) {
+    let in_flight = fixture.table.begin();
+    let table = fixture.table.clone();
+    let (replied, reply) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        operation(table);
+        replied.send(()).unwrap();
+    });
+    while !applied() {
+        std::thread::yield_now();
+    }
+    assert!(
+        reply.try_recv().is_err(),
+        "the change must not reply while an operation is in flight"
+    );
+    drop(in_flight);
+    reply.recv().unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn set_readonly_replies_after_in_flight_operations() {
+    let mut fixture = Fixture::new();
+    let dir = fixture.host_dir();
+    fixture.attach("data", &dir, false);
+    let child = fixture.table.child_by_name("data").unwrap();
+    assert_waits_for_in_flight_operations(
+        &fixture,
+        |table| table.set_readonly("data", true).unwrap(),
+        || child.fs.readonly(),
+    );
+}
+
+#[test]
+fn detach_replies_after_in_flight_operations_and_drops_the_backend() {
+    let mut fixture = Fixture::new();
+    let dir = fixture.host_dir();
+    fixture.attach("data", &dir, false);
+    let child = std::sync::Arc::downgrade(&fixture.table.child_by_name("data").unwrap());
+    let table = fixture.table.clone();
+    assert_waits_for_in_flight_operations(
+        &fixture,
+        |table| table.detach("data").unwrap(),
+        move || table.names().is_empty(),
+    );
+    assert!(child.upgrade().is_none());
 }
