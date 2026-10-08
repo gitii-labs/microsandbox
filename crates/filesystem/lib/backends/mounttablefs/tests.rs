@@ -238,7 +238,7 @@ fn root_lists_children_and_never_caches_their_entries() {
     assert_eq!(table::decode(entry.inode).1, 1);
     let (root, ttl) = fixture.fs.getattr(ctx(), ROOT, None).unwrap();
     assert_eq!(ttl, Duration::ZERO);
-    assert_eq!(root.st_mode as u32 & 0o777, 0o555);
+    assert_eq!(u32::from(root.st_mode) & 0o777, 0o555);
     assert_eq!(errno(fixture.lookup(ROOT, "missing")), LINUX_ENOENT);
 
     // Readdirplus lists the same children with uncached entries.
@@ -452,24 +452,22 @@ fn detach_makes_held_inodes_and_handles_stale() {
 }
 
 #[test]
-fn detach_closes_the_child_descriptors() {
+fn detach_drops_the_child_backend() {
     let mut fixture = Fixture::new();
     let dir = fixture.host_dir();
     std::fs::write(dir.join("file"), b"data").unwrap();
     fixture.attach("data", &dir, false);
-    let open_fds = || std::fs::read_dir("/proc/self/fd").map(|dir| dir.count());
-    let Ok(before) = open_fds() else {
-        // Descriptor accounting needs procfs.
-        return;
-    };
     let root = fixture.lookup(ROOT, "data").unwrap().inode;
     let file = fixture.lookup(root, "file").unwrap();
     let (handle, _) = fixture.fs.open(ctx(), file.inode, false, 0).unwrap();
     assert!(handle.is_some());
-    assert!(open_fds().unwrap() > before);
+    let (id, _) = table::decode(root);
+    let child = std::sync::Arc::downgrade(&fixture.table.child_by_id(id).unwrap());
+
     fixture.table.detach("data").unwrap();
-    // The child's root, inode and handle descriptors are all gone.
-    assert!(open_fds().unwrap() < before);
+    // Nothing keeps the backend alive, so its root, inode and handle
+    // descriptors are closed with it.
+    assert!(child.upgrade().is_none());
 }
 
 #[test]
@@ -574,7 +572,7 @@ fn a_tmpfs_child_supports_strict_stat_virtualization() {
         .fs
         .setattr(ctx(), file.inode, attr, None, SetattrValid::MODE)
         .unwrap();
-    assert_eq!(stat.st_mode as u32 & 0o777, 0o400);
+    assert_eq!(u32::from(stat.st_mode) & 0o777, 0o400);
     assert_eq!(std::fs::read(dir.join("token")).unwrap(), b"secret");
 }
 
