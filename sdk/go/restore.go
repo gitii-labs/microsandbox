@@ -135,6 +135,11 @@ func WithRestoreIdleTimeout(duration time.Duration) RestoreOption {
 }
 
 func validateRestoreConfig(config RestoreConfig) error {
+	for guest, mount := range config.Volumes {
+		if mount.kind == MountKindTable {
+			return fmt.Errorf("microsandbox: restore cannot add a mount table at %q", guest)
+		}
+	}
 	if config.MaxConnections != nil && config.MaxTCPConnections != nil {
 		return fmt.Errorf("microsandbox: restore MaxConnections and MaxTCPConnections cannot both be specified")
 	}

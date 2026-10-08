@@ -1954,14 +1954,16 @@ impl SandboxBuilder {
                 table.guest
             ));
         }
+        // The table root is synthetic and read-only, so no volume can be
+        // mounted at or beneath it.
         if sandbox
             .spec
             .mounts
             .iter()
-            .any(|mount| mount.guest() == table.guest)
+            .any(|mount| Path::new(mount.guest()).starts_with(guest))
         {
             return invalid(format!(
-                "a volume and the mount table cannot mount the same guest path: {}",
+                "a volume cannot be mounted at or beneath the mount table path {}",
                 table.guest
             ));
         }
@@ -5237,10 +5239,16 @@ mod tests {
             .build()
             .await
             .unwrap_err();
-        assert!(
-            error.to_string().contains("same guest path"),
-            "got: {error}"
-        );
+        assert!(error.to_string().contains("at or beneath"), "got: {error}");
+
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/mnt/shared/inner", |m| m.tmpfs())
+            .mount_table(table("/mnt/shared", vec![]))
+            .build()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at or beneath"), "got: {error}");
     }
 
     #[tokio::test]

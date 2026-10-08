@@ -3146,12 +3146,6 @@ fn prepare_runtime_restore_namespace(runtime_dir: &Path, oci_root: bool) -> Runt
     }
 }
 
-/// Build the host-directory rootfs backend used for `RootfsSource::Bind`.
-///
-/// The path is caller/tenant-provided, so it gets the same default no-follow
-/// root protection as a `--mount`: a symlink at or under the rootfs path is
-/// refused rather than followed out of its intended target. `follow_root_symlinks`
-/// opts out when the host rootfs path legitimately traverses a symlink.
 /// Translate a mount-table child from the launch or control contract.
 ///
 /// The host path must be absolute: it was resolved by the caller, and a
@@ -3189,6 +3183,12 @@ pub(crate) fn mount_table_child(
     })
 }
 
+/// Build the host-directory rootfs backend used for `RootfsSource::Bind`.
+///
+/// The path is caller/tenant-provided, so it gets the same default no-follow
+/// root protection as a `--mount`: a symlink at or under the rootfs path is
+/// refused rather than followed out of its intended target. `follow_root_symlinks`
+/// opts out when the host rootfs path legitimately traverses a symlink.
 fn bind_rootfs_backend(
     rootfs_path: &Path,
     follow_root_symlinks: bool,

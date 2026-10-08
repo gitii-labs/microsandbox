@@ -1038,6 +1038,17 @@ fn mount_batches_apply_in_order_and_report_progress() {
         }],
     );
     assert_eq!(response.error_code.as_deref(), Some("mount_exists"));
+
+    let response = super::handler::apply_mount_changes(
+        Some(&table),
+        vec![MountChange::Attach {
+            child: mount_child("missing", &host.join("missing")),
+        }],
+    );
+    assert_eq!(
+        response.error_code.as_deref(),
+        Some("mount_host_unavailable")
+    );
 }
 
 #[cfg(unix)]

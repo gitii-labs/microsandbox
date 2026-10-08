@@ -283,7 +283,7 @@ fn the_root_refuses_mutation() {
         ),
         LINUX_EACCES
     );
-    assert_eq!(errno(fixture.fs.access(ctx(), ROOT, 2)), LINUX_EACCES);
+    assert_eq!(errno(fixture.fs.access(ctx(), ROOT, 2)), LINUX_EROFS);
 }
 
 #[test]

@@ -41,6 +41,7 @@ const LINUX_EACCES: i32 = 13;
 const LINUX_EXDEV: i32 = 18;
 const LINUX_EISDIR: i32 = 21;
 const LINUX_EINVAL: i32 = 22;
+const LINUX_EROFS: i32 = 30;
 const LINUX_ENOSYS: i32 = 38;
 const LINUX_ENODATA: i32 = 61;
 
@@ -833,7 +834,7 @@ impl DynFileSystem for MountTableFs {
             return if mask & ACCESS_W_OK == 0 {
                 Ok(())
             } else {
-                Err(errno(LINUX_EACCES))
+                Err(errno(LINUX_EROFS))
             };
         }
         let target = self.target(inode)?;

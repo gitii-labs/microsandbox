@@ -423,6 +423,7 @@ pub(super) fn apply_mount_changes(
     };
     let mut applied_count = 0u32;
     for change in changes {
+        let attach = matches!(change, MountChange::Attach { .. });
         let result = match change {
             MountChange::Attach { child } => {
                 crate::vm::mount_table_child(child).and_then(|child| table.attach(child))
@@ -432,9 +433,11 @@ pub(super) fn apply_mount_changes(
         };
         if let Err(error) = result {
             let code = match error.kind() {
-                std::io::ErrorKind::NotFound => "mount_not_found",
                 std::io::ErrorKind::AlreadyExists => "mount_exists",
                 std::io::ErrorKind::InvalidInput => "invalid_mount",
+                // An attach names a host directory; detach and set mode name a child.
+                _ if attach => "mount_host_unavailable",
+                std::io::ErrorKind::NotFound => "mount_not_found",
                 _ => "mount_update_failed",
             };
             let message = error.to_string();
