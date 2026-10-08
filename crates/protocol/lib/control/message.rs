@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     BranchCreate, CheckpointCreate, ControlRequest, CpuTarget, DiskCheckpointCreate, DiskCompact,
-    Empty, MemoryTarget, Pause, RootDiskGrow, SecretsResult, SecretsUpdate,
+    Empty, MemoryTarget, MountsUpdate, Pause, RootDiskGrow, SecretsResult, SecretsUpdate,
 };
 use crate::wire::{Envelope, WireError, decode_value, validate_record};
 
@@ -31,6 +31,8 @@ pub const CONTROL_GENERATION_TWO_MESSAGES: &[&str] = &[
     "control.root-disk.state",
     "control.disk.compact",
     "control.disk.compact.result",
+    "control.mounts.update",
+    "control.mounts.result",
 ];
 
 //--------------------------------------------------------------------------------------------------
@@ -109,6 +111,8 @@ pub enum ControlOperation {
     RootDiskGrow(RootDiskGrow),
     /// Compact selected owned disk chains.
     DiskCompact(DiskCompact),
+    /// Change the children of the sandbox's mount table.
+    MountsUpdate(MountsUpdate),
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -179,6 +183,31 @@ impl ControlOperation {
                     validate_record(target)?;
                 }
                 Self::DiskCompact(value.deserialized().map_err(|_| WireError::InvalidRecord)?)
+            }
+            "control.mounts.update" if generation >= 2 => {
+                // Check every change and attached child for duplicate keys
+                // before serde can collapse them into a different mutation.
+                let value = decode_value(&envelope.p)?;
+                validate_record(&value)?;
+                let Value::Map(fields) = &value else {
+                    unreachable!()
+                };
+                if let Some((_, Value::Array(changes))) = fields
+                    .iter()
+                    .find(|(key, _)| key.as_text() == Some("changes"))
+                {
+                    for change in changes {
+                        validate_record(change)?;
+                        if let Value::Map(change) = change
+                            && let Some((_, child)) = change
+                                .iter()
+                                .find(|(key, _)| key.as_text() == Some("child"))
+                        {
+                            validate_record(child)?;
+                        }
+                    }
+                }
+                Self::MountsUpdate(value.deserialized().map_err(|_| WireError::InvalidRecord)?)
             }
             _ => Self::GenerationOne(ControlRequest::from_envelope(envelope)?),
         };

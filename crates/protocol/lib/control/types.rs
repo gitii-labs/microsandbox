@@ -70,6 +70,9 @@ pub struct RuntimeCapabilities {
     /// Live disk-only capture is available.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disk_checkpoint_create: bool,
+    /// The sandbox has a mount table whose children can change while it runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mounts_update: bool,
 }
 
 /// Purpose of a full checkpoint capture.
@@ -307,6 +310,39 @@ pub struct SecretsUpdate {
     /// Apply in order and stop at the first operation failure.
     pub changes: Vec<SecretChange>,
 }
+
+/// One ordered mount-table modification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+pub enum MountChange {
+    /// Attach a child under a name that is not attached.
+    Attach {
+        /// The child to attach.
+        child: microsandbox_types::MountTableChild,
+    },
+    /// Detach a child; its open files and directories in the guest become stale.
+    Detach {
+        /// Child name.
+        name: String,
+    },
+    /// Switch a child between read-only and read-write, including open files.
+    SetMode {
+        /// Child name.
+        name: String,
+        /// Whether guest mutations are refused.
+        readonly: bool,
+    },
+}
+
+/// Sequential, non-transactional mount-table modifications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountsUpdate {
+    /// Apply in order and stop at the first operation failure.
+    pub changes: Vec<MountChange>,
+}
+
+/// Completion of a sequential mount-table batch, shaped like a secret batch.
+pub type MountsResult = SecretsResult;
 
 /// State mutation certainty reported by an operation error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -484,6 +484,66 @@ pub enum VolumeMount {
     },
 }
 
+/// Guest caching for one mount-table child.
+///
+/// Serializes as the lowercase variant name (`"auto"`, `"never"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "lowercase")]
+pub enum MountTableCache {
+    /// Let the guest kernel cache data, entries and attributes.
+    #[default]
+    Auto,
+    /// Never cache: direct I/O and zero entry and attribute timeouts, for
+    /// content that must not linger in guest memory, such as secrets.
+    Never,
+}
+
+/// One child of a mount table: a guest-visible name over a host directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MountTableChild {
+    /// Guest-visible name, one path component, unique within the table.
+    pub name: String,
+    /// Absolute host directory. No component may be a symlink.
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    #[cfg_attr(feature = "utoipa", schema(value_type = String))]
+    pub host: PathBuf,
+    /// Refuse every guest mutation, including writes through already open files.
+    #[serde(default)]
+    pub readonly: bool,
+    /// Guest-write byte budget for the directory; `None` is unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+    /// Guest-visible metadata policy. `strict` needs writable `user.*` xattrs
+    /// on the host directory, even for a read-only child.
+    pub stat_virtualization: StatVirtualization,
+    /// Guest caching policy.
+    #[serde(default)]
+    pub cache: MountTableCache,
+}
+
+/// A mount table: one virtio-fs device at a guest directory whose children
+/// are attached, detached and switched between read-only and read-write
+/// while the sandbox runs.
+///
+/// The guest directory itself is read-only and lists the attached children.
+/// `children` are attached at launch; later changes go through the running
+/// sandbox and are not written back to this spec. A sandbox with a mount
+/// table cannot be checkpointed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MountTableSpec {
+    /// Absolute guest directory where the table is mounted.
+    pub guest: String,
+    /// Children attached at launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<MountTableChild>,
+}
+
 /// Rootfs patch applied before VM startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -941,6 +1001,10 @@ pub struct SandboxSpec {
 
     /// Volume mounts.
     pub mounts: Vec<VolumeMount>,
+
+    /// Live mount table, attached and changed while the sandbox runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_table: Option<MountTableSpec>,
 
     /// Rootfs patches applied before VM start.
     pub patches: Vec<Patch>,

@@ -76,6 +76,11 @@ pub struct LaunchCapabilities {
     /// Older runtimes omit this capability.
     #[serde(default)]
     pub guest_clock: bool,
+
+    /// The launch field `mount_table` is honored by the runtime.
+    /// Older runtimes omit this capability and refuse the field.
+    #[serde(default)]
+    pub mount_table: bool,
 }
 
 /// Hidden CLI handoff describing the metrics slot the host reserved for this sandbox.
@@ -204,6 +209,11 @@ pub struct LaunchConfig {
 
     /// Disk-image volume mounts as `id:host_path:format[:ro]`.
     pub disks: Vec<String>,
+
+    /// Live mount-table device served under [`microsandbox_protocol::MOUNT_TABLE_FS_TAG`].
+    /// The guest mount itself is a bootstrap directory mount with that tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_table: Option<microsandbox_types::MountTableSpec>,
 
     /// Path to the init binary in the guest.
     pub init_path: Option<PathBuf>,

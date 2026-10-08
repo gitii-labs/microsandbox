@@ -1898,6 +1898,7 @@ mod tests {
             file_mounts: Vec::new(),
             owned_volumes: Vec::new(),
             disks: Vec::new(),
+            mount_table: None,
             vsock: Vec::new(),
             #[cfg(unix)]
             backends: Vec::new(),

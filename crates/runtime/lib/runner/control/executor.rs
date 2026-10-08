@@ -33,6 +33,9 @@ pub struct RuntimeControlExecutor {
     vm: msb_krun::VmControl,
     #[cfg(feature = "net")]
     secrets: Option<microsandbox_network::secrets::handle::SecretsHandle>,
+    /// The live table behind the sandbox's mount-table device, when it has one.
+    #[cfg(unix)]
+    mount_table: Option<microsandbox_filesystem::MountTable>,
     state: Mutex<ExecutorState>,
 }
 
@@ -77,6 +80,7 @@ impl RuntimeControlExecutor {
             String,
             microsandbox_filesystem::OwnedDirectoryCheckpoint,
         >,
+        #[cfg(unix)] mount_table: Option<microsandbox_filesystem::MountTable>,
     ) -> Result<Self, String> {
         let runtime_boot_id = new_runtime_boot_id();
         persist_runtime_boot_id(runtime_dir, &runtime_boot_id)
@@ -105,6 +109,8 @@ impl RuntimeControlExecutor {
             vm,
             #[cfg(feature = "net")]
             secrets,
+            #[cfg(unix)]
+            mount_table,
             state: Mutex::new(ExecutorState {
                 runtime_boot_id,
                 revision: 0,
@@ -242,6 +248,7 @@ impl RuntimeControlExecutor {
                 | ControlRequest::RootDiskGrow { .. }
                 | ControlRequest::CpuTarget { .. }
                 | ControlRequest::SecretsUpdate { .. }
+                | ControlRequest::MountsUpdate { .. }
                 | ControlRequest::CheckpointCreate { .. }
                 | ControlRequest::DiskCheckpointCreate { .. }
                 | ControlRequest::BranchCreate { .. }
@@ -583,6 +590,7 @@ impl RuntimeControlExecutor {
                     disk_compact_owned: true,
                     root_disk_grow: true,
                     pause_resume: self.vm.clock_sync_supported(),
+                    mounts_update: self.mounts_update_supported(),
                 }),
                 ..Default::default()
             },
@@ -601,6 +609,7 @@ impl RuntimeControlExecutor {
             }
             ControlRequest::CpuState => cpu(self.vm.cpu_state()),
             ControlRequest::SecretsUpdate { changes } => self.handle_secrets_update(changes),
+            ControlRequest::MountsUpdate { changes } => self.handle_mounts_update(changes),
             ControlRequest::CheckpointCreate { .. }
             | ControlRequest::DiskCheckpointCreate { .. }
             | ControlRequest::BranchCreate { .. }
@@ -614,6 +623,36 @@ impl RuntimeControlExecutor {
                 unreachable!("checkpoint requests are handled by the executor lifecycle path")
             }
         }
+    }
+
+    fn mounts_update_supported(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.mount_table.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    #[cfg(unix)]
+    fn handle_mounts_update(
+        &self,
+        changes: Vec<microsandbox_protocol::control::MountChange>,
+    ) -> ControlResponse {
+        super::handler::apply_mount_changes(self.mount_table.as_ref(), changes)
+    }
+
+    #[cfg(not(unix))]
+    fn handle_mounts_update(
+        &self,
+        _changes: Vec<microsandbox_protocol::control::MountChange>,
+    ) -> ControlResponse {
+        control_error(
+            "mounts_update_unavailable",
+            "mount tables are not available on this host platform",
+        )
     }
 
     fn secrets_update_supported(&self) -> bool {

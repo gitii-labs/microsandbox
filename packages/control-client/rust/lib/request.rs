@@ -4,8 +4,8 @@ use microsandbox_protocol::{
     control::{
         BranchCreate, BranchResult, Capabilities, CheckpointCreate, CheckpointResult, ControlError,
         CpuState, CpuTarget, DiskCheckpointCreate, DiskCheckpointState, DiskCompact, Empty,
-        MemoryState, MemoryTarget, Pause, PauseState, RootDiskGrow, RootDiskState,
-        RuntimeCapabilities, SecretChange, SecretsResult,
+        MemoryState, MemoryTarget, MountsResult, MountsUpdate, Pause, PauseState, RootDiskGrow,
+        RootDiskState, RuntimeCapabilities, SecretChange, SecretsResult,
     },
     wire,
 };
@@ -76,6 +76,10 @@ pub struct GrowRootDisk(pub RootDiskGrow);
 /// Compact selected owned disk chains.
 #[derive(Debug, Clone)]
 pub struct CompactDisks(pub DiskCompact);
+
+/// Apply ordered mount-table changes; earlier entries stay applied when one fails.
+#[derive(Debug, Clone)]
+pub struct UpdateMounts(pub MountsUpdate);
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -278,6 +282,34 @@ v2_request!(
     "control.disk.compact.result"
 );
 
+impl Request<ControlProtocol> for UpdateMounts {
+    type Response = MountsResult;
+    type Error = ControlClientError;
+
+    fn message(&self) -> ControlClientResult<EncodedMessage> {
+        prepared("control.mounts.update", &self.0)
+    }
+
+    fn decode(&self, response: Message) -> ControlClientResult<Self::Response> {
+        checked_with(response, 2, "control.mounts.result", |payload| {
+            let result = MountsResult::decode(payload)?;
+            // Progress must stay within the submitted batch.
+            let valid = match &result {
+                MountsResult::Complete { applied_count } => {
+                    *applied_count as usize == self.0.changes.len()
+                }
+                MountsResult::Failed { failed_index, .. } => {
+                    (*failed_index as usize) < self.0.changes.len()
+                }
+            };
+            if !valid {
+                return Err(wire::WireError::InvalidRecord);
+            }
+            Ok(result)
+        })
+    }
+}
+
 impl Request<ControlProtocol> for ResumeRuntime {
     type Response = PauseState;
     type Error = ControlClientError;
@@ -397,6 +429,32 @@ compatible_v2!(
     }),
     |reply| decode_json_field(reply, "compaction")
 );
+
+impl CompatibleControlRequest for UpdateMounts {
+    fn min_generation(&self) -> u8 {
+        2
+    }
+
+    fn compatibility_json_bytes(&self) -> ControlClientResult<Zeroizing<Vec<u8>>> {
+        let value = serde_json::json!({"op": "mounts_update", "changes": self.0.changes});
+        Ok(Zeroizing::new(serde_json::to_vec(&value).map_err(
+            |_| {
+                microsandbox_protocol_client::ClientError::new(
+                    microsandbox_protocol_client::ErrorKind::Encode,
+                )
+            },
+        )?))
+    }
+
+    fn decode_compatibility_json(&self, reply: JsonReply) -> ControlClientResult<Self::Response> {
+        // JSON replies carry success or one error, never batch progress, so
+        // success means every change applied and a failure is the reply error.
+        let applied_count = u32::try_from(self.0.changes.len()).ok();
+        reply.checked(|_| {
+            applied_count.map(|applied_count| MountsResult::Complete { applied_count })
+        })
+    }
+}
 
 impl CompatibleControlRequest for ResumeRuntime {
     fn min_generation(&self) -> u8 {

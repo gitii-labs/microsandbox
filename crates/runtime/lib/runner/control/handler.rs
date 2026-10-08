@@ -59,6 +59,7 @@ pub(crate) enum Reply {
     Memory(MemoryState),
     Cpu(CpuState),
     Secrets(SecretsResult),
+    Mounts(MountsResult),
     Checkpoint(CheckpointResult),
     DiskCheckpoint(DiskCheckpointState),
     Branch(BranchResult),
@@ -97,6 +98,7 @@ impl Reply {
             Self::Memory(value) => Envelope::new(generation, "control.memory.state", value),
             Self::Cpu(value) => Envelope::new(generation, "control.cpu.state", value),
             Self::Secrets(value) => Envelope::new(generation, "control.secrets.result", value),
+            Self::Mounts(value) => Envelope::new(generation, "control.mounts.result", value),
             Self::Checkpoint(value) => {
                 Envelope::new(generation, "control.checkpoint.result", value)
             }
@@ -164,6 +166,8 @@ impl Handler for ControlContext {
         };
         let framed = if let Some(secrets) = result.secret_result.clone() {
             Reply::Secrets(secrets)
+        } else if let Some(mounts) = result.mounts_result.clone() {
+            Reply::Mounts(mounts)
         } else if let Some(checkpoint) = result.checkpoint.clone() {
             Reply::Checkpoint(CheckpointResult {
                 checkpoint: Some(CheckpointState {
@@ -193,6 +197,7 @@ impl Handler for ControlContext {
                 secrets_update: caps.secrets_update,
                 checkpoint_create: caps.checkpoint_create,
                 disk_checkpoint_create: caps.disk_checkpoint_create,
+                mounts_update: caps.mounts_update,
             };
             if generation >= 2 {
                 Reply::RuntimeCapabilities(capabilities)
@@ -327,6 +332,9 @@ fn operation_to_legacy(
                 })?,
             dry_run: request.dry_run,
         },
+        ControlOperation::MountsUpdate(request) => Legacy::MountsUpdate {
+            changes: request.changes,
+        },
     })
 }
 
@@ -391,5 +399,63 @@ pub(super) fn apply_secret_changes(
             ..Default::default()
         },
         framed: Reply::Secrets(SecretsResult::Complete { applied_count }),
+    }
+}
+
+/// Apply a mount batch in order, stopping at the first failure.
+///
+/// Each change applies completely or not at all, so earlier changes stay
+/// applied and the failed one changed nothing.
+#[cfg(unix)]
+pub(super) fn apply_mount_changes(
+    table: Option<&microsandbox_filesystem::MountTable>,
+    changes: Vec<MountChange>,
+) -> crate::control::ControlResponse {
+    use crate::control::ControlResponse;
+
+    let Some(table) = table else {
+        return ControlResponse {
+            ok: false,
+            error: Some("this sandbox was started without a mount table".into()),
+            error_code: Some("mounts_update_unavailable".into()),
+            ..Default::default()
+        };
+    };
+    let mut applied_count = 0u32;
+    for change in changes {
+        let result = match change {
+            MountChange::Attach { child } => {
+                crate::vm::mount_table_child(child).and_then(|child| table.attach(child))
+            }
+            MountChange::Detach { name } => table.detach(&name),
+            MountChange::SetMode { name, readonly } => table.set_readonly(&name, readonly),
+        };
+        if let Err(error) = result {
+            let code = match error.kind() {
+                std::io::ErrorKind::NotFound => "mount_not_found",
+                std::io::ErrorKind::AlreadyExists => "mount_exists",
+                std::io::ErrorKind::InvalidInput => "invalid_mount",
+                _ => "mount_update_failed",
+            };
+            let message = error.to_string();
+            return ControlResponse {
+                ok: false,
+                error: Some(message.clone()),
+                error_code: Some(code.into()),
+                mounts_result: Some(MountsResult::Failed {
+                    applied_count,
+                    failed_index: applied_count,
+                    error: ControlError::rejected(code, message),
+                }),
+                ..Default::default()
+            };
+        }
+        // A bounded framed request cannot approach u32::MAX entries.
+        applied_count = applied_count.saturating_add(1);
+    }
+    ControlResponse {
+        ok: true,
+        mounts_result: Some(MountsResult::Complete { applied_count }),
+        ..Default::default()
     }
 }
