@@ -196,6 +196,7 @@ typedef char *(*msb_sandbox_owns_lifecycle_fn)(uint64_t handle, uint8_t *buf, si
 typedef char *(*msb_sandbox_ping_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_touch_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_modify_fn)(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_sandbox_update_mounts_fn)(uint64_t cancel_id, uint64_t handle, const char *changes_json, uint8_t *buf, size_t buf_len);
 
 typedef char *(*msb_sandbox_attach_fn)(uint64_t cancel_id, uint64_t handle, const char *cmd, const char *opts_json, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_attach_default_fn)(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len);
@@ -380,6 +381,7 @@ static msb_sandbox_owns_lifecycle_fn ptr_msb_sandbox_owns_lifecycle = NULL;
 static msb_sandbox_ping_fn       ptr_msb_sandbox_ping       = NULL;
 static msb_sandbox_touch_fn      ptr_msb_sandbox_touch      = NULL;
 static msb_sandbox_modify_fn     ptr_msb_sandbox_modify     = NULL;
+static msb_sandbox_update_mounts_fn ptr_msb_sandbox_update_mounts = NULL;
 static msb_exec_collect_fn         ptr_msb_exec_collect         = NULL;
 static msb_exec_wait_fn            ptr_msb_exec_wait            = NULL;
 static msb_exec_kill_fn            ptr_msb_exec_kill            = NULL;
@@ -590,6 +592,7 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE(msb_sandbox_ping);
 	RESOLVE(msb_sandbox_touch);
 	RESOLVE(msb_sandbox_modify);
+	RESOLVE_OPTIONAL(msb_sandbox_update_mounts);
 	RESOLVE(msb_exec_collect);
 	RESOLVE(msb_exec_wait);
 	RESOLVE(msb_exec_kill);
@@ -977,6 +980,10 @@ char *call_msb_sandbox_touch(uint64_t cancel_id, uint64_t handle, uint8_t *buf, 
 }
 char *call_msb_sandbox_modify(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_modify ? ptr_msb_sandbox_modify(cancel_id, handle, opts_json, buf, buf_len) : NULL;
+}
+bool has_update_mounts(void) { return ptr_msb_sandbox_update_mounts != NULL; }
+char *call_msb_sandbox_update_mounts(uint64_t cancel_id, uint64_t handle, const char *changes_json, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_sandbox_update_mounts(cancel_id, handle, changes_json, buf, buf_len);
 }
 char *call_msb_exec_collect(uint64_t cancel_id, uint64_t exec_handle, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_exec_collect ? ptr_msb_exec_collect(cancel_id, exec_handle, buf, buf_len) : NULL;
@@ -1858,6 +1865,23 @@ type CreateOptions struct {
 	OAuthSecrets    []OAuthSecretOptions  `json:"oauth_secrets,omitempty"`
 	Patches         []PatchOptions        `json:"patches,omitempty"`
 	Volumes         map[string]MountSpec  `json:"volumes,omitempty"`
+	MountTable      *MountTableSpec       `json:"mount_table,omitempty"`
+}
+
+// MountTableSpec is the JSON representation of a live mount table.
+type MountTableSpec struct {
+	Guest    string            `json:"guest"`
+	Children []MountTableChild `json:"children,omitempty"`
+}
+
+// MountTableChild is the JSON representation of one mount-table child.
+type MountTableChild struct {
+	Name               string  `json:"name"`
+	Host               string  `json:"host"`
+	Readonly           bool    `json:"readonly"`
+	QuotaBytes         *uint64 `json:"quota_bytes,omitempty"`
+	StatVirtualization string  `json:"stat_virtualization"`
+	Cache              string  `json:"cache,omitempty"`
 }
 
 // InitOptions describes a guest PID-1 init handoff.
@@ -3196,6 +3220,23 @@ func (s *Sandbox) Modify(ctx context.Context, optsJSON string) (string, error) {
 	return call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
 		return C.call_msb_sandbox_modify(cancelID, s.h(), cOpts, buf, bufLen)
 	})
+}
+
+// UpdateMounts applies ordered mount-table changes to this live sandbox.
+// changesJSON is a JSON array of change records.
+func (s *Sandbox) UpdateMounts(ctx context.Context, changesJSON string) error {
+	if err := ensureLoaded(); err != nil {
+		return err
+	}
+	if !bool(C.has_update_mounts()) {
+		return &Error{Kind: KindUnsupportedOperation, Message: "native SDK does not support mount tables; update the native SDK"}
+	}
+	cChanges := C.CString(changesJSON)
+	defer C.free(unsafe.Pointer(cChanges))
+	_, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_sandbox_update_mounts(cancelID, s.h(), cChanges, buf, bufLen)
+	})
+	return err
 }
 
 func CompactSandbox(ctx context.Context, handle uint64, name, opts string) (string, error) {

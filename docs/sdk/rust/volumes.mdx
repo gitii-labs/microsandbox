@@ -19,6 +19,31 @@ let sb = Sandbox::builder("worker").image("alpine")
 
 `.owned()` creates an empty directory. `.owned_with(...)` accepts `.directory().quota(...)` or `.disk().size(...)`; disks are raw ext4 and require a positive size. Common mount flags stay on `MountBuilder`. The backing survives stop/start, is captured by snapshots and forks, and is removed with the sandbox. Restore makes private copies automatically. Cloud rejects owned mounts.
 
+## Mount tables
+
+`.mount_table(MountTableSpec)` serves a guest directory whose children change while the sandbox runs. Each child is a name over an absolute host directory. `Sandbox::update_mounts` applies attach, detach and mode changes in order without a restart, and `attach_mount`, `detach_mount` and `set_mount_readonly` wrap single changes. Local backend on Linux and macOS only; Cloud rejects mount tables.
+
+```rust
+let sb = Sandbox::builder("worker").image("alpine")
+    .mount_table(MountTableSpec {
+        guest: "/mnt/shared".into(),
+        children: vec![MountTableChild {
+            name: "data".into(),
+            host: "/srv/data".into(),
+            readonly: false,
+            quota_bytes: None,
+            stat_virtualization: StatVirtualization::Strict,
+            cache: MountTableCache::Auto,
+        }],
+    })
+    .create().await?;
+
+sb.set_mount_readonly("data", true).await?;
+sb.detach_mount("data").await?;
+```
+
+The table directory is read-only, mounted `nosuid,nodev`, and lists the attached children. A read-only child refuses every mutation with `EROFS`, including writes through files opened before the switch. Detaching closes the child's host descriptors, so files and working directories the guest still holds fail with `ESTALE`; re-attaching the name never reaches them. A failed change stops the batch with `MicrosandboxError::ControlMountBatch` and leaves earlier changes applied. `quota_bytes: None` is unlimited, `StatVirtualization::Strict` needs writable `user.*` xattrs on the host directory, and `MountTableCache::Never` uses direct I/O with zero cache timeouts. Live changes are not saved to the configuration, and live full snapshots and forks of a running sandbox with a mount table are refused.
+
 ## Volume
 
 #### <span className="msb-recv">Volume::</span><span className="msb-hn">get_default()</span>

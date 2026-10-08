@@ -1210,6 +1210,9 @@ struct SandboxCreateOpts {
     /// Volume mounts: guest_path → MountSpec.
     #[serde(default)]
     volumes: HashMap<String, MountSpec>,
+    /// Live mount table, in the Rust SDK's `MountTableSpec` shape.
+    #[serde(default)]
+    mount_table: Option<microsandbox::sandbox::MountTableSpec>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -2694,6 +2697,9 @@ pub unsafe extern "C" fn msb_sandbox_create(
             for (guest_path, mount) in &opts.volumes {
                 builder = apply_volume(builder, guest_path, mount)?;
             }
+            if let Some(table) = opts.mount_table {
+                builder = builder.mount_table(table);
+            }
 
             let sandbox = if connect_or_create {
                 builder.detached(opts.detached).connect_or_create().await?
@@ -3935,6 +3941,31 @@ pub unsafe extern "C" fn msb_sandbox_modify(
         Ok(Box::pin(async move {
             let builder = configure_modify(sb.modify(), opts.patch, policy);
             run_modify(builder, opts.dry_run).await
+        }))
+    })
+}
+
+/// Apply ordered mount-table changes to a live sandbox handle.
+/// Input: a JSON array of `MountChange` values, such as
+/// `[{"change":"attach","child":{...}},{"change":"detach","name":"x"},
+/// {"change":"set_mode","name":"x","readonly":true}]`.
+/// Output: `{"ok":true}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_update_mounts(
+    cancel_id: u64,
+    handle: Handle,
+    changes_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let changes: Vec<microsandbox::sandbox::MountChange> =
+            serde_json::from_str(&unsafe { cstr(changes_json) }?)
+                .map_err(|e| FfiError::invalid_argument(format!("invalid mount changes: {e}")))?;
+        let sb = get(handle)?;
+        Ok(Box::pin(async move {
+            sb.update_mounts(changes).await.map_err(FfiError::from)?;
+            Ok(r#"{"ok":true}"#.into())
         }))
     })
 }

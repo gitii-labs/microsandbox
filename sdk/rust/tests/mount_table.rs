@@ -221,6 +221,16 @@ async fn mount_table_changes_apply_live_inside_the_guest() {
     );
     assert_eq!(sh(&sandbox, &format!("ls {ROOT}")).await, "disk\nshm");
 
+    // The table's children cannot be captured, so a live fork is refused up front.
+    let Err(error) = sandbox.fork("mount-table-live-fork").fork().await else {
+        panic!("a live fork of a sandbox with a mount table must be refused");
+    };
+    assert!(
+        error.to_string().contains("checkpoint") || error.to_string().contains("branch"),
+        "{error}"
+    );
+    assert_eq!(sh(&sandbox, &format!("ls {ROOT}")).await, "disk\nshm");
+
     sandbox.stop_and_wait().await.expect("stop");
     let _ = Sandbox::remove(name).await;
 }

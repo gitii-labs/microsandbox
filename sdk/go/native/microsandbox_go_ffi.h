@@ -299,6 +299,19 @@ char *msb_sandbox_modify(uint64_t cancel_id,
                          uintptr_t buf_len);
 
 /**
+ * Apply ordered mount-table changes to a live sandbox handle.
+ * Input: a JSON array of `MountChange` values, such as
+ * `[{"change":"attach","child":{...}},{"change":"detach","name":"x"},
+ * {"change":"set_mode","name":"x","readonly":true}]`.
+ * Output: `{"ok":true}`.
+ */
+char *msb_sandbox_update_mounts(uint64_t cancel_id,
+                                Handle handle,
+                                const char *changes_json,
+                                unsigned char *buf,
+                                uintptr_t buf_len);
+
+/**
  * Reports whether this handle owns the sandbox lifecycle (synchronous).
  * Returns `{"owns":true}` or `{"owns":false}`.
  */

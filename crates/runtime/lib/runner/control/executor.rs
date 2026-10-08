@@ -269,6 +269,20 @@ impl RuntimeControlExecutor {
                     | ControlRequest::BranchCreate { .. }
                     | ControlRequest::BranchCreateMemfd { .. }
             );
+        // Refuse before quiescing: the mount-table device rejects state capture.
+        if self.mounts_update_supported()
+            && matches!(
+                request,
+                ControlRequest::CheckpointCreate { .. }
+                    | ControlRequest::BranchCreate { .. }
+                    | ControlRequest::BranchCreateMemfd { .. }
+            )
+        {
+            return control_error(
+                "checkpoint_unavailable",
+                "a sandbox with a mount table cannot be checkpointed or branched",
+            );
+        }
         if mutation && state.lifecycle != RuntimeLifecycle::Running && !resident_operation {
             return control_error(
                 "runtime_busy",
@@ -580,12 +594,13 @@ impl RuntimeControlExecutor {
                     cpu_resize: self.vm.cpu_resize_supported(),
                     memory_resize: self.vm.memory_resize_supported(),
                     secrets_update: self.secrets_update_supported(),
-                    checkpoint_create: true,
+                    // A mount table's children change at runtime and cannot be captured.
+                    checkpoint_create: !self.mounts_update_supported(),
                     disk_checkpoint_create: true,
-                    branch_create: cfg!(any(unix, windows)),
+                    branch_create: cfg!(any(unix, windows)) && !self.mounts_update_supported(),
                     optional_disk_integrity: true,
                     guest_flush_policy: true,
-                    branch_memfd: cfg!(target_os = "linux"),
+                    branch_memfd: cfg!(target_os = "linux") && !self.mounts_update_supported(),
                     disk_compact: true,
                     disk_compact_owned: true,
                     root_disk_grow: true,
