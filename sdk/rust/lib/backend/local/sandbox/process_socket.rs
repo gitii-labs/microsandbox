@@ -128,3 +128,41 @@ fn socket_peer_pid(stream: &UnixStream) -> io::Result<i32> {
     }
     Ok(pid)
 }
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_socket_with_overlong_fallback_is_not_a_connection_error() {
+        let directory = tempfile::Builder::new()
+            .prefix("msb")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run_dir = directory.path().join("run");
+        let sandboxes_dir = directory.path().join("sandboxes");
+        let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len();
+        let name = "x".repeat(capacity);
+        let fallback = sandboxes_dir.join(&name).join("runtime/agent.sock");
+        assert!(!microsandbox_runtime::ipc::socket_path_fits(&fallback));
+        let agents = crate::runtime::spawn::sandbox_agent_socket_path_candidates_with_roots(
+            &run_dir,
+            &sandboxes_dir,
+            &name,
+        );
+        assert_eq!(agents.len(), 2);
+        let mut endpoints: Vec<_> = agents
+            .iter()
+            .map(|path| microsandbox_runtime::control::control_socket_path_for(path))
+            .collect();
+        endpoints.extend(agents);
+
+        assert!(connect_endpoint(endpoints).await.unwrap().is_none());
+    }
+}
