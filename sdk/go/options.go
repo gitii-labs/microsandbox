@@ -1531,7 +1531,8 @@ type OAuthSecretConfig struct {
 	GrantID        string
 	TokenEndpoint  string
 	// RequireGrantMarker requires X-Distributed-OAuth-Grant with an exact known
-	// access or refresh sentinel for exchanges without a sentinel. The runtime
+	// access or refresh sentinel at the exact token or poll endpoint for exchanges
+	// without a sentinel. The runtime
 	// strips the header before forwarding. False permits an unmarked exchange
 	// only when exactly one matching grant allows it. Refresh sentinels do not
 	// require an additional marker.

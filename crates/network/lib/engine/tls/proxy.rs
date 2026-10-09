@@ -83,8 +83,18 @@ struct EscapedPayload<'a>(&'a [u8]);
 //--------------------------------------------------------------------------------------------------
 
 impl<'a> TrafficTrace<'a> {
-    fn new(sni: &'a str, guest_dst: SocketAddr, connect_dst: SocketAddr) -> Self {
-        let enabled = tracing::enabled!(target: TRAFFIC_LOG_TARGET, tracing::Level::TRACE);
+    fn new(
+        sni: &'a str,
+        guest_dst: SocketAddr,
+        connect_dst: SocketAddr,
+        oauth_protected: bool,
+    ) -> Self {
+        // Credential confidentiality: OAuth payloads contain private guest
+        // markers, injected upstream tokens and unsanitized provider responses.
+        // Suppress payload tracing for the whole protected connection, including
+        // fragmented reads, without changing tracing of other connections.
+        let enabled = !oauth_protected
+            && tracing::enabled!(target: TRAFFIC_LOG_TARGET, tracing::Level::TRACE);
         Self {
             enabled,
             connection: if enabled { rand::random() } else { 0 },
@@ -618,7 +628,7 @@ pub(crate) async fn intercept_relay(
     // Phase 2: Bidirectional plaintext relay.
     let mut server_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut plaintext_buf = vec![0u8; RELAY_BUF_SIZE];
-    let mut traffic = TrafficTrace::new(sni_name, guest_dst, connect_dst);
+    let mut traffic = TrafficTrace::new(sni_name, guest_dst, connect_dst, !oauth.is_empty());
 
     // Drain any application data already buffered during the TLS handshake.
     // In TLS 1.3, the client sends Finished + application data in the same
@@ -780,12 +790,7 @@ async fn forward_plaintext(
             Err(e) => return Err(e),
         };
 
-        // OAuth routing headers can span reads. Raw guest tracing would record
-        // private markers before validation/removal; trace only the transformed
-        // upstream request for OAuth connections.
-        if oauth.is_empty() {
-            traffic.record("guest-request", &buf[..n]);
-        }
+        traffic.record("guest-request", &buf[..n]);
         detector.observe_request(&buf[..n]);
 
         if secrets_handler.is_empty() && oauth.is_empty() {
@@ -863,6 +868,14 @@ mod tests {
     use crate::secrets::{config::SecretsConfig, handle::SecretsHandle};
 
     async fn tls_denial_response(chunks: &[&[u8]], close_input: bool, enabled: bool) -> Vec<u8> {
+        // Select the real provider before any config builder. Concurrent fixtures
+        // may already have selected it; either way a provider must be installed.
+        assert!(
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .is_ok()
+                || rustls::crypto::CryptoProvider::get_default().is_some()
+        );
         let state = TlsState::new(
             microsandbox_types::TlsConfig::default(),
             SecretsHandle::new(SecretsConfig::default()),
@@ -1022,7 +1035,7 @@ mod tests {
         }
     }
 
-    fn record_at(level: tracing::Level) -> (TrafficTrace<'static>, String) {
+    fn record_at(level: tracing::Level, oauth_protected: bool) -> (TrafficTrace<'static>, String) {
         let buffer = Buffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -1034,10 +1047,11 @@ mod tests {
                 "api.example.com",
                 "192.0.2.1:443".parse().unwrap(),
                 "192.0.2.2:443".parse().unwrap(),
+                oauth_protected,
             );
             trace.record(
                 "guest-request",
-                b"POST /token HTTP/1.1\r\nAuthorization: Bearer sentinel\r\n\r\nbody\0",
+                b"POST /token HTTP/1.1\r\nX-Distributed-OAuth-Grant: private-marker\r\nAuthorization: Bearer sentinel\r\n\r\nbody\0",
             );
             trace.record(
                 "upstream-request",
@@ -1059,13 +1073,13 @@ mod tests {
 
     #[test]
     fn complete_intercepted_payload_is_logged_only_at_trace() {
-        let (disabled, logged) = record_at(tracing::Level::DEBUG);
+        let (disabled, logged) = record_at(tracing::Level::DEBUG, false);
         assert!(!disabled.enabled);
         assert_eq!(disabled.connection, 0);
         assert_eq!(disabled.sequence, 0);
         assert!(logged.is_empty());
 
-        let (enabled, logged) = record_at(tracing::Level::TRACE);
+        let (enabled, logged) = record_at(tracing::Level::TRACE, false);
         assert!(enabled.enabled);
         assert_eq!(enabled.sequence, 4);
         assert_eq!(
@@ -1092,5 +1106,20 @@ mod tests {
         assert!(
             logged.contains("payload=HTTP/1.1 200 OK\\r\\nContent-Length: 8\\r\\n\\r\\nsentinel")
         );
+    }
+
+    #[test]
+    fn oauth_payloads_never_enter_trace_logs() {
+        let (trace, logged) = record_at(tracing::Level::TRACE, true);
+        assert!(!trace.enabled);
+        assert_eq!(trace.sequence, 0);
+        assert!(logged.is_empty());
+        // The control uses the same marker, injected token and raw response
+        // payloads, proving capture is active for unrelated traffic at TRACE.
+        let (control, logged) = record_at(tracing::Level::TRACE, false);
+        assert!(control.enabled);
+        assert!(logged.contains("X-Distributed-OAuth-Grant: private-marker"));
+        assert!(logged.contains("Authorization: Bearer secret"));
+        assert!(logged.contains("new-secret"));
     }
 }

@@ -930,7 +930,7 @@ impl OAuthConnection {
                         Vec::new()
                     };
                     // Caller validation: explicit markers must identify one known
-                    // grant at its exact token endpoint, and agree with every
+                    // grant at its exact token or poll endpoint, and agree with every
                     // sentinel already carried by the request. Never infer identity
                     // from a grant ID, client ID, or provider-specific metadata.
                     let marker_grant = marker
@@ -949,7 +949,12 @@ impl OAuthConnection {
                                 .map(|(index, _)| index)
                                 .collect::<Vec<_>>();
                             match matches.as_slice() {
-                                [index] if self.grants[*index].token.matches(sni, port, target) => {
+                                [index]
+                                    if self.grants[*index].token.matches(sni, port, target)
+                                        || self.grants[*index].poll.as_ref().is_some_and(
+                                            |poll| poll.matches(sni, port, target),
+                                        ) =>
+                                {
                                     Ok(*index)
                                 }
                                 _ => Err(invalid_grant_routing()),
@@ -5779,6 +5784,90 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn grant_routing_distinct_poll_endpoint_requires_and_accepts_exact_marker() {
+        let broker = start_broker("real-access", "real-refresh");
+        let mut config = broker_config(&broker);
+        config.device_code_endpoint = Some("https://auth.example.com/oauth/device/code".into());
+        config.poll_endpoint = Some("https://auth.example.com/oauth/device/token".into());
+        config.require_grant_marker = true;
+        let body = r#"{"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":"device-code"}"#;
+        let poll = json_request("/oauth/device/token", body);
+        let marked = format!("X-Distributed-OAuth-Grant: {}\r\n", config.access_sentinel);
+        let marked_poll = poll.replace("Content-Type:", &format!("{marked}Content-Type:"));
+
+        for target in ["/oauth/device/code", "/oauth/other", "/oauth/device/other"] {
+            let mut connection =
+                OAuthConnection::new(&[config.clone()], "auth.example.com", 443, None)
+                    .await
+                    .unwrap();
+            let request = marked_poll.replace("/oauth/device/token", target);
+            let error = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "OAuth grant routing is invalid or ambiguous"
+            );
+            assert!(connection.grants[0].lease.is_none());
+        }
+        let mut required = OAuthConnection::new(&[config.clone()], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        let error = required
+            .transform_requests(poll.as_bytes(), "auth.example.com")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth grant routing is invalid or ambiguous"
+        );
+        assert!(required.grants[0].lease.is_none());
+
+        for require_marker in [true, false] {
+            config.require_grant_marker = require_marker;
+            let mut connection =
+                OAuthConnection::new(&[config.clone()], "auth.example.com", 443, None)
+                    .await
+                    .unwrap();
+            let request = if require_marker { &marked_poll } else { &poll };
+            let upstream = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap();
+            assert_eq!(upstream, poll.as_bytes());
+            assert!(matches!(
+                connection.exchanges.front(),
+                Some(Exchange::Token {
+                    grant: 0,
+                    poll: true
+                })
+            ));
+            let response = json_response(
+                200,
+                r#"{"access_token":"polled-access","refresh_token":"polled-refresh"}"#,
+            );
+            let sanitized = String::from_utf8(
+                connection
+                    .transform_responses(response.as_bytes())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(sanitized.contains(&config.access_sentinel));
+            assert!(!sanitized.contains("polled-access"));
+            assert!(!sanitized.contains("polled-refresh"));
+        }
+        assert_eq!(broker.commits().len(), 2);
+        assert!(
+            broker
+                .commits()
+                .iter()
+                .all(|commit| commit["grant_id"] == config.grant_id)
+        );
     }
 
     #[tokio::test]

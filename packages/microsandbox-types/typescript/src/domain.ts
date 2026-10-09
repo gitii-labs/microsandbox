@@ -156,7 +156,8 @@ export type OAuthSecret = {
   token_endpoint: string;
   /**
    * Require `X-Distributed-OAuth-Grant` with an exact known access or refresh
-   * sentinel for exchanges carrying no sentinel. The header is removed before
+   * sentinel at the exact token or poll endpoint for exchanges carrying no
+   * sentinel. The header is removed before
    * forwarding. False allows unmarked exchanges only when exactly one matching
    * grant allows them. Refresh sentinels remain authoritative without a header.
    */
