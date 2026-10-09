@@ -39,6 +39,32 @@ sb, err := m.CreateSandbox(ctx, "worker",
 
 `OwnedVolumeOptions.Kind` defaults to `VolumeKindDir`; `QuotaMiB` applies only to directories. `VolumeKindDisk` creates raw ext4 and requires positive `SizeMiB`. Common flags are `Readonly`, `Noexec`, `Nosuid`, and `Nodev`. `StatVirtualization`, `HostPermissions`, and `Owner` apply only to directories. No host path or volume name is accepted. Mounting over an existing image directory hides its contents without copying them.
 
+## Mount tables
+
+Use `Mount.Table(children...)` for a guest directory whose entries change while the sandbox runs. Each child is a name over an absolute host directory. `Sandbox.AttachMount`, `Sandbox.DetachMount` and `Sandbox.SetMountReadonly` change the table without a restart; the guest sees each change at its next path lookup. Local backend on Linux and macOS only; Cloud rejects mount tables.
+
+```go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("alpine"),
+    m.WithMounts(map[string]m.MountConfig{
+        "/mnt/shared": m.Mount.Table(m.MountTableChild{Name: "data", Host: "/srv/data"}),
+    }),
+)
+
+err = sb.AttachMount(ctx, m.MountTableChild{
+    Name: "token", Host: "/dev/shm/token", Readonly: true, Cache: m.MountTableCacheNever,
+})
+err = sb.SetMountReadonly(ctx, "data", true)
+err = sb.DetachMount(ctx, "token")
+```
+
+- The table directory itself is read-only, mounted `nosuid,nodev`, and lists the attached children. A sandbox has at most one table.
+- `Readonly` refuses every mutation with `EROFS`, including writes through files the guest opened before `SetMountReadonly`.
+- `SetMountReadonly` and `DetachMount` return only after operations already in flight on the child have finished. `DetachMount` closes the child's host descriptors; files and working directories the guest still holds inside it fail with `ESTALE`. Attaching the same name again never reaches those old files.
+- `QuotaBytes` bounds guest writes; nil is unlimited. `StatVirtualization` defaults to `Strict`, which needs writable `user.*` xattrs on the host directory (tmpfs has them since Linux 6.6). `MountTableCacheNever` uses direct I/O and zero cache timeouts. `HostPermissions` defaults to `Private` (guest modes live in the metadata overlay); `HostPermissionsMirror` copies ordinary rwx bits of guest `chmod` and create modes to the host inode.
+- No component of `Host` may be a symlink; resolve a symlinked prefix such as `/var` on macOS first.
+- Live changes are not saved: a restart attaches the children given at creation. Live snapshots (full or disk-only) and forks of a running sandbox with a mount table are refused. Changes also apply while the sandbox is paused.
+
 ## Functions
 
 #### <span className="msb-recv"></span><span className="msb-hn">GetDefaultVolume()</span>

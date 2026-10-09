@@ -352,6 +352,7 @@ pub fn run(args: MachineArgs) -> ! {
         owned_volumes: launch.owned_volumes,
         file_mounts: launch.file_mounts,
         disks,
+        mount_table: launch.mount_table,
         vsock: launch.vsock,
         #[cfg(unix)]
         backends: vec![],

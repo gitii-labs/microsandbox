@@ -369,6 +369,9 @@ pub struct VmConfig {
     /// Disk-image volume mounts attached as extra virtio-blk devices.
     pub disks: Vec<DiskMountSpec>,
 
+    /// Live mount-table device and the children attached at launch.
+    pub mount_table: Option<microsandbox_types::MountTableSpec>,
+
     /// Host Unix sockets exposed through virtio-vsock.
     pub vsock: Vec<microsandbox_types::VsockRouteSpec>,
 
@@ -449,6 +452,12 @@ type NetworkActivationHandle = microsandbox_network::network::NetworkActivationH
 #[cfg(not(feature = "net"))]
 type NetworkActivationHandle = ();
 
+/// The table shared by the mount-table device and the control executor.
+#[cfg(unix)]
+type MountTableHandle = Option<microsandbox_filesystem::MountTable>;
+#[cfg(not(unix))]
+type MountTableHandle = Option<()>;
+
 type VmBuildOutput = (
     msb_krun::Vm,
     Option<NetworkTerminationHandle>,
@@ -460,6 +469,7 @@ type VmBuildOutput = (
     BindIdentityMapRegistration,
     Option<crate::checkpoint::RestoredAgentState>,
     std::collections::BTreeMap<String, microsandbox_filesystem::OwnedDirectoryCheckpoint>,
+    MountTableHandle,
 );
 
 /// Public runtime endpoints held back until a restored guest is activated.
@@ -1174,6 +1184,7 @@ fn run(
         bind_identity_map,
         mut restored_agent,
         owned_directory_checkpoints,
+        mount_table,
     ) = match build_result {
         Ok(vm) => vm,
         Err(e) => {
@@ -1254,7 +1265,11 @@ fn run(
                 .as_mut()
                 .and_then(|agent| agent.inherited_memory.take()),
             owned_directory_checkpoints,
+            #[cfg(unix)]
+            mount_table,
         );
+        #[cfg(not(unix))]
+        let _ = mount_table;
         let context = super::control::ControlContext {
             executor: match executor {
                 Ok(executor) => Arc::new(executor),
@@ -2493,6 +2508,38 @@ fn build_vm(
         builder = builder.fs(move |fs| fs.tag(&tag).custom(Box::new(backend)));
     }
 
+    // The mount-table device comes after every captured filesystem transport, so
+    // their device order is unchanged. Its children change while the guest runs.
+    let mount_table: MountTableHandle = match &vm.mount_table {
+        None => None,
+        Some(_) if vm.checkpoint_restore.is_some() => {
+            return Err(RuntimeError::Custom(
+                "a sandbox with a mount table cannot be restored from a checkpoint".into(),
+            ));
+        }
+        #[cfg(unix)]
+        Some(spec) => {
+            let table = microsandbox_filesystem::MountTable::new();
+            for child in &spec.children {
+                mount_table_child(child.clone())
+                    .and_then(|child| table.attach(child))
+                    .map_err(|e| RuntimeError::Custom(format!("mount table: {e}")))?;
+            }
+            let backend = table.filesystem();
+            builder = builder.fs(move |fs| {
+                fs.tag(microsandbox_protocol::MOUNT_TABLE_FS_TAG)
+                    .custom(Box::new(backend))
+            });
+            Some(table)
+        }
+        #[cfg(not(unix))]
+        Some(_) => {
+            return Err(RuntimeError::Custom(
+                "mount tables are not available on this host platform".into(),
+            ));
+        }
+    };
+
     // Disk-image volume mounts. Each adds an extra virtio-blk device with
     // a stable block id so agentd can find it via /dev/disk/by-id/virtio-<id>.
     let disk_inputs = if let Some(prepared) = &prepared_restore {
@@ -2866,6 +2913,7 @@ fn build_vm(
         bind_identity_map,
         restored_agent,
         owned_directory_checkpoints,
+        mount_table,
     ))
 }
 
@@ -3096,6 +3144,47 @@ fn prepare_runtime_restore_namespace(runtime_dir: &Path, oci_root: bool) -> Runt
             heartbeat.display()
         ))),
     }
+}
+
+/// Translate a mount-table child from the launch or control contract.
+///
+/// The host path must be absolute: it was resolved by the caller, and a
+/// relative path would silently resolve against this process's directory.
+#[cfg(unix)]
+pub(crate) fn mount_table_child(
+    child: microsandbox_types::MountTableChild,
+) -> std::io::Result<microsandbox_filesystem::MountTableChild> {
+    if !child.host.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "mount {:?}: host path {} is not absolute",
+                child.name,
+                child.host.display()
+            ),
+        ));
+    }
+    Ok(microsandbox_filesystem::MountTableChild {
+        name: child.name,
+        host_path: child.host,
+        readonly: child.readonly,
+        quota_bytes: child.quota_bytes,
+        stat_virtualization: match child.stat_virtualization {
+            microsandbox_types::StatVirtualization::Strict => StatVirtualization::Strict,
+            microsandbox_types::StatVirtualization::Relaxed => StatVirtualization::Relaxed,
+            microsandbox_types::StatVirtualization::Off => StatVirtualization::Off,
+        },
+        host_permissions: match child.host_permissions {
+            microsandbox_types::HostPermissions::Private => HostPermissions::Private,
+            microsandbox_types::HostPermissions::Mirror => HostPermissions::Mirror,
+        },
+        cache_policy: match child.cache {
+            microsandbox_types::MountTableCache::Auto => microsandbox_filesystem::CachePolicy::Auto,
+            microsandbox_types::MountTableCache::Never => {
+                microsandbox_filesystem::CachePolicy::Never
+            }
+        },
+    })
 }
 
 /// Build the host-directory rootfs backend used for `RootfsSource::Bind`.

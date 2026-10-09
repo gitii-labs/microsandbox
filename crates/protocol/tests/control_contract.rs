@@ -640,6 +640,33 @@ fn generation_two_inventory_and_requests_are_additive() {
             },
         )
         .unwrap(),
+        Envelope::new(
+            2,
+            "control.mounts.update",
+            &MountsUpdate {
+                changes: vec![
+                    MountChange::Attach {
+                        child: microsandbox_types::MountTableChild {
+                            name: "data".into(),
+                            host: "/srv/data".into(),
+                            readonly: false,
+                            quota_bytes: None,
+                            stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+                            host_permissions: microsandbox_types::HostPermissions::Private,
+                            cache: microsandbox_types::MountTableCache::Never,
+                        },
+                    },
+                    MountChange::SetMode {
+                        name: "data".into(),
+                        readonly: true,
+                    },
+                    MountChange::Detach {
+                        name: "data".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap(),
     ];
     for request in requests {
         assert!(ControlOperation::from_envelope(&request, 2).is_ok());
@@ -663,6 +690,32 @@ fn generation_two_rejects_duplicate_nested_compaction_selectors() {
             field("target", target),
             field("dry_run", true.into()),
         ])),
+    };
+    assert_eq!(
+        ControlOperation::from_envelope(&envelope, 2).unwrap_err(),
+        WireError::DuplicateKey
+    );
+}
+
+#[test]
+fn generation_two_rejects_duplicate_keys_in_an_attached_mount() {
+    let child = Value::Map(vec![
+        field("name", "data".into()),
+        field("host", "/first".into()),
+        field("host", "/second".into()),
+        field("stat_virtualization", "strict".into()),
+    ]);
+    let change = Value::Map(vec![
+        field("change", "attach".into()),
+        field("child", child),
+    ]);
+    let envelope = Envelope {
+        v: 2,
+        t: "control.mounts.update".into(),
+        p: bytes(&Value::Map(vec![field(
+            "changes",
+            Value::Array(vec![change]),
+        )])),
     };
     assert_eq!(
         ControlOperation::from_envelope(&envelope, 2).unwrap_err(),

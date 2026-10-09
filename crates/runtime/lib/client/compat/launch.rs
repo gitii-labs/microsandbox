@@ -189,6 +189,8 @@ impl PreviousLaunch {
             owned_volumes: self.owned_volumes,
             file_mounts: self.file_mounts,
             disks: self.disks,
+            // Previous launch formats had no mount table.
+            mount_table: None,
             init_path: self.init_path,
             exec_path: self.exec_path,
             exec_args: self.exec_args,

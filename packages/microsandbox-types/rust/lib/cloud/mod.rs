@@ -526,6 +526,7 @@ impl CloudSandboxSpec {
             patches: patches.into_iter().map(Into::into).collect(),
             network,
             vsock: VsockSpec::default(),
+            mount_table: None,
             init: self.init,
             pull_policy: pull_policy.into(),
             security_profile: self.security_profile,

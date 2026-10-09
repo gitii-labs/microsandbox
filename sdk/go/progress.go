@@ -49,10 +49,13 @@ func CreateSandboxWithProgress(ctx context.Context, name string, opts ...Sandbox
 		if err := resolveRegistryCACertPaths(&config); err != nil {
 			return nil, err
 		}
-		options := buildFFICreateOptions(config)
 		if err := validateOwnedMounts(config.Volumes); err != nil {
 			return nil, err
 		}
+		if err := validateMountTables(config.Volumes); err != nil {
+			return nil, err
+		}
+		options := buildFFICreateOptions(config)
 		options.CreationProgress = id
 		return ffi.CreateSandbox(ctx, name, options)
 	})

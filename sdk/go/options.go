@@ -1823,6 +1823,10 @@ type MountConfig struct {
 	// mount that carry no per-file stat override. Only meaningful for Bind and
 	// Named mounts. Nil keeps the runtime's fallback owner.
 	Owner *MountOwner
+
+	// TableChildren are the children a mount table attaches at launch. Only
+	// meaningful for Table mounts.
+	TableChildren []MountTableChild
 }
 
 // MountOwner pins the guest owner presented for host files under a bind or named
@@ -1848,6 +1852,8 @@ const (
 	MountKindDisk
 	// MountKindOwned is storage removed with its sandbox.
 	MountKindOwned
+	// MountKindTable is a live mount table; see Mount.Table.
+	MountKindTable
 )
 
 // Kind reports which flavour of mount this is.

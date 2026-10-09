@@ -60,7 +60,7 @@ pub(crate) fn do_setattr(
     if fs.is_virtual_init_inode(ino) {
         return Err(platform::eacces());
     }
-    if fs.cfg.readonly() && setattr_mutates(valid) {
+    if fs.readonly() && setattr_mutates(valid) {
         return Err(platform::erofs());
     }
 
@@ -283,6 +283,19 @@ pub(crate) fn do_access(fs: &PassthroughFs, ctx: Context, ino: u64, mask: u32) -
     }
 
     let st_mode = platform::mode_u32(st.st_mode);
+
+    // A read-only backend refuses write access the way an MS_RDONLY mount
+    // does: only for regular files, directories and symlinks. Device, fifo
+    // and socket nodes stay writable because writes do not reach the mount.
+    if fs.readonly()
+        && mask & platform::ACCESS_W_OK != 0
+        && matches!(
+            st_mode & platform::MODE_TYPE_MASK,
+            platform::MODE_REG | platform::MODE_DIR | platform::MODE_LNK
+        )
+    {
+        return Err(platform::erofs());
+    }
 
     // Root (uid 0) bypasses read/write checks.
     if ctx.uid == 0 {

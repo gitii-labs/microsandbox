@@ -211,6 +211,9 @@ impl LaunchContract {
         if !launch.guest_clock.is_sync() {
             return unsupported("guest clock policy");
         }
+        if launch.mount_table.is_some() {
+            return unsupported("mount tables");
+        }
         if !launch.owned_volumes.is_empty() {
             return unsupported("sandbox-owned volumes");
         }
@@ -527,6 +530,7 @@ pub(crate) async fn validate_runtime_config(
         .require_network_capabilities(&runtime.msb_path, &network)
         .await?;
     validate_guest_clock(&runtime.msb_path, config).await?;
+    validate_mount_table(&runtime.msb_path, config).await?;
     Ok(())
 }
 
@@ -649,6 +653,29 @@ pub(crate) async fn validate_guest_clock(
         return Err(MicrosandboxError::unsupported(
             crate::error::Operation::SandboxStart,
             crate::error::UnsupportedReason::NotAvailable(upgrade_required("runtime.guest_clock")),
+        ));
+    }
+    Ok(())
+}
+
+/// Probe mount-table support only for a sandbox that has one. Runtimes that
+/// predate the capability reject the launch field.
+pub(crate) async fn validate_mount_table(
+    path: &Path,
+    config: &SandboxConfig,
+) -> MicrosandboxResult<()> {
+    if config.spec.mount_table.is_none() {
+        return Ok(());
+    }
+    let supported = bounded_probe(path, "__launch-protocol")
+        .await
+        .ok()
+        .and_then(|output| serde_json::from_slice::<LaunchCapabilities>(&output).ok())
+        .is_some_and(|capabilities| capabilities.mount_table);
+    if !supported {
+        return Err(MicrosandboxError::unsupported(
+            crate::error::Operation::SandboxStart,
+            crate::error::UnsupportedReason::NotAvailable(upgrade_required("mount_table")),
         ));
     }
     Ok(())
@@ -1838,6 +1865,38 @@ mod protocol {
             encode_bytes(&config, LEGACY)
                 .unwrap_err()
                 .contains("requires a newer runtime launch contract")
+        );
+    }
+
+    #[test]
+    fn legacy_codec_refuses_a_mount_table() {
+        let config = LaunchConfig {
+            mount_table: Some(microsandbox_types::MountTableSpec {
+                guest: "/mnt/shared".into(),
+                children: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(
+            encode_bytes(&config, LEGACY)
+                .unwrap_err()
+                .contains("requires a newer runtime launch contract")
+        );
+        let current = LaunchContract {
+            patch: 18,
+            machine: true,
+        };
+        let encoded =
+            serde_json::from_slice::<Value>(&encode_bytes(&config, current).unwrap()).unwrap();
+        assert_eq!(encoded["mount_table"]["guest"], "/mnt/shared");
+        // Without a table the field is omitted, so older runtimes keep accepting launches.
+        let default = encode_bytes(&LaunchConfig::default(), current).unwrap();
+        assert!(
+            !serde_json::from_slice::<Value>(&default)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("mount_table")
         );
     }
 

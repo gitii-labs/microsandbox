@@ -631,6 +631,9 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     {
         return Err(unsupported("sandbox-owned volumes"));
     }
+    if config.spec.mount_table.is_some() {
+        return Err(unsupported("mount_table"));
+    }
     if config.spec.mounts.iter().any(|mount| {
         let options = match mount {
             microsandbox_types::VolumeMount::Bind { options, .. }

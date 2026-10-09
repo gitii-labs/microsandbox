@@ -8,6 +8,8 @@ pub mod dualfs;
 #[cfg(unix)]
 pub mod memfs;
 pub(crate) mod mobility;
+#[cfg(unix)]
+pub mod mounttablefs;
 pub mod passthroughfs;
 #[cfg(unix)]
 pub(crate) mod shared;

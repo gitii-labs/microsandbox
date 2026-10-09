@@ -98,7 +98,7 @@ pub(crate) fn do_fallocate(
     if fs.is_virtual_init_inode(inode) {
         return Err(platform::eacces());
     }
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 
@@ -238,7 +238,7 @@ pub(crate) fn do_copyfilerange(
     if fs.is_virtual_init_inode(inode_in) || fs.is_virtual_init_inode(inode_out) {
         return Err(platform::enosys());
     }
-    if fs.cfg.readonly() {
+    if fs.readonly() {
         return Err(platform::erofs());
     }
 

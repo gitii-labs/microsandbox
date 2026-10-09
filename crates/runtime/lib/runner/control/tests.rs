@@ -945,3 +945,146 @@ async fn windows_cancelled_reply_drain_releases_its_flush_worker() {
         .unwrap();
     drop(client);
 }
+
+#[cfg(unix)]
+fn mount_child(name: &str, host: &std::path::Path) -> microsandbox_types::MountTableChild {
+    microsandbox_types::MountTableChild {
+        name: name.into(),
+        host: host.into(),
+        readonly: false,
+        quota_bytes: None,
+        stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+        host_permissions: microsandbox_types::HostPermissions::Private,
+        cache: microsandbox_types::MountTableCache::Auto,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mount_batches_apply_in_order_and_report_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = std::fs::canonicalize(dir.path()).unwrap();
+    let table = microsandbox_filesystem::MountTable::new();
+
+    let response = super::handler::apply_mount_changes(
+        Some(&table),
+        vec![
+            MountChange::Attach {
+                child: mount_child("data", &host),
+            },
+            MountChange::SetMode {
+                name: "data".into(),
+                readonly: true,
+            },
+        ],
+    );
+    assert!(response.ok);
+    assert!(matches!(
+        response.mounts_result,
+        Some(MountsResult::Complete { applied_count: 2 })
+    ));
+    assert_eq!(table.names(), ["data"]);
+
+    // The second change fails; the first stays applied and the third is not attempted.
+    let response = super::handler::apply_mount_changes(
+        Some(&table),
+        vec![
+            MountChange::Detach {
+                name: "data".into(),
+            },
+            MountChange::Detach {
+                name: "data".into(),
+            },
+            MountChange::Attach {
+                child: mount_child("other", &host),
+            },
+        ],
+    );
+    assert!(!response.ok);
+    assert_eq!(response.error_code.as_deref(), Some("mount_not_found"));
+    let Some(MountsResult::Failed {
+        applied_count: 1,
+        failed_index: 1,
+        error,
+    }) = response.mounts_result
+    else {
+        panic!("expected a failed batch after one change");
+    };
+    assert_eq!(error.code, "mount_not_found");
+    assert_eq!(error.effect, ErrorEffect::None);
+    assert!(table.is_empty());
+
+    // Relative host paths and duplicate names are refused before any change.
+    for change in [
+        MountChange::Attach {
+            child: mount_child("relative", std::path::Path::new("relative/dir")),
+        },
+        MountChange::Attach {
+            child: mount_child("bad/name", &host),
+        },
+    ] {
+        let response = super::handler::apply_mount_changes(Some(&table), vec![change]);
+        assert_eq!(response.error_code.as_deref(), Some("invalid_mount"));
+    }
+    super::handler::apply_mount_changes(
+        Some(&table),
+        vec![MountChange::Attach {
+            child: mount_child("data", &host),
+        }],
+    );
+    let response = super::handler::apply_mount_changes(
+        Some(&table),
+        vec![MountChange::Attach {
+            child: mount_child("data", &host),
+        }],
+    );
+    assert_eq!(response.error_code.as_deref(), Some("mount_exists"));
+
+    let response = super::handler::apply_mount_changes(
+        Some(&table),
+        vec![MountChange::Attach {
+            child: mount_child("missing", &host.join("missing")),
+        }],
+    );
+    assert_eq!(
+        response.error_code.as_deref(),
+        Some("mount_host_unavailable")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mount_batches_without_a_table_are_refused() {
+    let response = super::handler::apply_mount_changes(None, vec![]);
+    assert!(!response.ok);
+    assert_eq!(
+        response.error_code.as_deref(),
+        Some("mounts_update_unavailable")
+    );
+    assert!(response.mounts_result.is_none());
+}
+
+#[test]
+fn mounts_update_round_trips_through_json() {
+    let request = crate::control::ControlRequest::MountsUpdate {
+        changes: vec![MountChange::SetMode {
+            name: "data".into(),
+            readonly: true,
+        }],
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["op"], "mounts_update");
+    assert_eq!(json["changes"][0]["change"], "set_mode");
+    let parsed: crate::control::ControlRequest = serde_json::from_value(json).unwrap();
+    assert!(matches!(
+        parsed,
+        crate::control::ControlRequest::MountsUpdate { changes } if changes.len() == 1
+    ));
+    assert_eq!(
+        Reply::Mounts(MountsResult::Complete { applied_count: 1 })
+            .envelope(2)
+            .unwrap()
+            .t,
+        "control.mounts.result"
+    );
+}

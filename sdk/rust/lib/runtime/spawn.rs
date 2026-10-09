@@ -335,6 +335,7 @@ pub async fn spawn_sandbox(
     #[cfg(feature = "net")]
     launch_contract::validate_http_deny_response(&resolved_runtime.msb_path, config).await?;
     launch_contract::validate_guest_clock(&resolved_runtime.msb_path, config).await?;
+    launch_contract::validate_mount_table(&resolved_runtime.msb_path, config).await?;
     if config.checkpoint_restore.as_ref().is_some_and(|restore| {
         restore
             .external_mounts
@@ -3216,6 +3217,21 @@ fn machine_cli_args(
                 });
             }
         }
+    }
+
+    // The mount-table device is served by the runtime; agentd mounts it like a
+    // directory share. Its children are host directories, never setuid or device sources.
+    if let Some(table) = &config.spec.mount_table {
+        launch.mount_table = Some(table.clone());
+        launch.bootstrap.dir_mounts.push(BootstrapDirMount {
+            tag: microsandbox_protocol::MOUNT_TABLE_FS_TAG.to_string(),
+            guest_path: table.guest.clone(),
+            flags: BootstrapMountFlags {
+                nosuid: true,
+                nodev: true,
+                ..Default::default()
+            },
+        });
     }
 
     // Network configuration travels as a typed value inside the JSON payload.

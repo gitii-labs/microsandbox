@@ -135,6 +135,13 @@ pub enum ControlRequest {
         changes: Vec<SecretLiveChange>,
     },
 
+    /// Attach, detach and switch mount-table children in order, stopping at the first
+    /// failure. Earlier changes stay applied.
+    MountsUpdate {
+        /// Ordered changes to apply.
+        changes: Vec<microsandbox_protocol::control::MountChange>,
+    },
+
     /// Produce one same-epoch full checkpoint and return the source to its prior running
     /// state after root-last publication.
     CheckpointCreate {
@@ -204,6 +211,9 @@ pub struct ControlResponse {
     /// In-process completion metadata for the framed adapter; never emitted in JSON.
     #[serde(skip)]
     pub secret_result: Option<microsandbox_protocol::control::SecretsResult>,
+    /// In-process mount batch progress for the framed adapter; never emitted in JSON.
+    #[serde(skip)]
+    pub mounts_result: Option<microsandbox_protocol::control::MountsResult>,
     /// Available transports on this same endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_protocols: Option<Vec<String>>,
@@ -343,6 +353,9 @@ pub struct ControlCapabilities {
     /// Disk-only live capture is available without full-state admission.
     #[serde(default)]
     pub disk_checkpoint_create: bool,
+    /// The sandbox has a mount table whose children can change while it runs.
+    #[serde(default)]
+    pub mounts_update: bool,
 }
 
 /// Host-confirmed resident suspension state.
@@ -542,6 +555,7 @@ mod tests {
                 pause_resume: true,
                 disk_compact: true,
                 disk_compact_owned: true,
+                mounts_update: true,
             }),
             ..Default::default()
         };
@@ -550,6 +564,7 @@ mod tests {
         assert!(json.contains("\"secrets_update\":true"));
         assert!(json.contains("\"memory_resize\":false"));
         assert!(json.contains("\"disk_compact_owned\":true"));
+        assert!(json.contains("\"mounts_update\":true"));
 
         let parsed: ControlResponse = serde_json::from_str(&json).unwrap();
         assert!(parsed.capabilities.unwrap().secrets_update);

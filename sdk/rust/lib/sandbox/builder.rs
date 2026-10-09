@@ -1208,6 +1208,22 @@ impl SandboxBuilder {
         self
     }
 
+    /// Serve a mount table at `spec.guest`: one directory whose children are
+    /// host directories attached, detached and switched between read-only and
+    /// read-write while the sandbox runs, through
+    /// [`Sandbox::update_mounts`](super::Sandbox::update_mounts).
+    ///
+    /// `spec.children` are attached at launch. A sandbox with a mount table
+    /// cannot be checkpointed. Local backend on Linux and macOS only.
+    ///
+    /// ```ignore
+    /// .mount_table(MountTableSpec { guest: "/mnt/shared".into(), children: vec![] })
+    /// ```
+    pub fn mount_table(mut self, spec: microsandbox_types::MountTableSpec) -> Self {
+        self.config.spec.mount_table = Some(spec);
+        self
+    }
+
     /// Apply rootfs patches using a builder closure.
     ///
     /// Patches are applied before VM start. Managed OCI roots bake patches into their writable
@@ -1856,6 +1872,7 @@ impl SandboxBuilder {
         }
 
         super::types::validate_volume_mounts(&mut sandbox.spec.mounts)?;
+        Self::validate_mount_table(sandbox)?;
         super::validate_env(&sandbox.spec.env)?;
         super::validate_labels(&sandbox.spec.labels)?;
         Self::validate_vsock_routes(sandbox)?;
@@ -1911,6 +1928,73 @@ impl SandboxBuilder {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validate the mount table's guest path and children before launch.
+    fn validate_mount_table(sandbox: &SandboxConfig) -> MicrosandboxResult<()> {
+        let Some(table) = &sandbox.spec.mount_table else {
+            return Ok(());
+        };
+        let invalid = |message: String| Err(MicrosandboxError::InvalidConfig(message));
+        let guest = Path::new(&table.guest);
+        let normalized = guest.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        });
+        if !guest.is_absolute()
+            || guest.parent().is_none()
+            || !normalized
+            || table.guest.ends_with('/')
+        {
+            return invalid(format!(
+                "mount table guest path {} must be an absolute, normalized directory other than /",
+                table.guest
+            ));
+        }
+        // The table root is synthetic and read-only, so no volume can be
+        // mounted at or beneath it.
+        if sandbox
+            .spec
+            .mounts
+            .iter()
+            .any(|mount| Path::new(mount.guest()).starts_with(guest))
+        {
+            return invalid(format!(
+                "a volume cannot be mounted at or beneath the mount table path {}",
+                table.guest
+            ));
+        }
+        let mut names = HashSet::new();
+        for child in &table.children {
+            if child.name.is_empty()
+                || child.name == "."
+                || child.name == ".."
+                || child.name.contains(['/', '\0'])
+            {
+                return invalid(format!(
+                    "mount table child name {:?} must be one path component",
+                    child.name
+                ));
+            }
+            if !names.insert(child.name.as_str()) {
+                return invalid(format!(
+                    "mount table child name {:?} is used twice",
+                    child.name
+                ));
+            }
+            // The runtime opens the path in another process; a relative path
+            // would resolve against that process's working directory.
+            if !child.host.is_absolute() {
+                return invalid(format!(
+                    "mount table child {:?}: host path {} must be absolute",
+                    child.name,
+                    child.host.display()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -5100,6 +5184,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("alphanumeric"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn builder_validates_the_mount_table() {
+        let child = |name: &str, host: &str| microsandbox_types::MountTableChild {
+            name: name.into(),
+            host: host.into(),
+            readonly: false,
+            quota_bytes: None,
+            stat_virtualization: microsandbox_types::StatVirtualization::Strict,
+            host_permissions: microsandbox_types::HostPermissions::Private,
+            cache: microsandbox_types::MountTableCache::Auto,
+        };
+        let table = |guest: &str, children| microsandbox_types::MountTableSpec {
+            guest: guest.into(),
+            children,
+        };
+
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .mount_table(table("/mnt/shared", vec![child("data", "/srv/data")]))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.spec.mount_table.unwrap().children.len(), 1);
+
+        for (spec, expected) in [
+            (table("mnt", vec![]), "absolute, normalized"),
+            (table("/", vec![]), "absolute, normalized"),
+            (table("/mnt/../etc", vec![]), "absolute, normalized"),
+            (
+                table("/mnt/x", vec![child("a/b", "/srv")]),
+                "one path component",
+            ),
+            (
+                table("/mnt/x", vec![child("a", "/srv"), child("a", "/srv")]),
+                "used twice",
+            ),
+            (table("/mnt/x", vec![child("a", "srv")]), "must be absolute"),
+        ] {
+            let error = SandboxBuilder::new("test")
+                .image("alpine")
+                .mount_table(spec)
+                .build()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "got: {error}");
+        }
+
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/mnt/shared", |m| m.tmpfs())
+            .mount_table(table("/mnt/shared", vec![]))
+            .build()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at or beneath"), "got: {error}");
+
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .volume("/mnt/shared/inner", |m| m.tmpfs())
+            .mount_table(table("/mnt/shared", vec![]))
+            .build()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at or beneath"), "got: {error}");
     }
 
     #[tokio::test]

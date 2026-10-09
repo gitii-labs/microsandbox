@@ -52,6 +52,7 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         MicrosandboxError::ControlClient(_) => "Runtime",
         MicrosandboxError::ControlStateChanged => "Runtime",
         MicrosandboxError::ControlSecretBatch { .. } => "Runtime",
+        MicrosandboxError::ControlMountBatch { .. } => "Runtime",
         #[cfg(unix)]
         MicrosandboxError::Nix(_) => "Nix",
         #[cfg(windows)]

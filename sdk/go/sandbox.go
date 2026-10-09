@@ -121,6 +121,9 @@ func createSandboxWithMode(ctx context.Context, name string, connectOrCreate boo
 	if err := validateOwnedMounts(o.Volumes); err != nil {
 		return nil, err
 	}
+	if err := validateMountTables(o.Volumes); err != nil {
+		return nil, err
+	}
 
 	ffiOpts := buildFFICreateOptions(o)
 
@@ -238,6 +241,10 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 	if len(o.Volumes) > 0 {
 		ffiOpts.Volumes = make(map[string]ffi.MountSpec, len(o.Volumes))
 		for guestPath, m := range o.Volumes {
+			if m.kind == MountKindTable {
+				ffiOpts.MountTable = buildFFIMountTable(guestPath, m.TableChildren)
+				continue
+			}
 			spec := ffi.MountSpec{
 				Bind:               m.Bind,
 				Named:              m.Named,

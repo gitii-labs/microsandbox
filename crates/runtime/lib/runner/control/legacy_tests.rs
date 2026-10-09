@@ -142,6 +142,7 @@ fn capabilities_response_serializes_flags() {
             secrets_update: true,
             checkpoint_create: true,
             disk_checkpoint_create: true,
+            mounts_update: false,
         }),
         ..Default::default()
     };

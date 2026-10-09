@@ -45,6 +45,7 @@ pub use backends::{
         DualFsConfig, MergeReadsBackendAPrecedence, ReadBackendBWriteBackendA,
     },
     memfs::{CachePolicy as MemCachePolicy, MemFs, MemFsConfig},
+    mounttablefs::{MountTable, MountTableChild, MountTableFs},
     passthroughfs::{
         BindIdentityMap, BindIdentityMapHandle, CachePolicy, HostPermissions, PassthroughConfig,
         PassthroughFs, PassthroughFsBuilder, StatVirtualization,

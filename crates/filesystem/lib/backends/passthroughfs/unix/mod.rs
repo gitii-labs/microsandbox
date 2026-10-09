@@ -231,6 +231,10 @@ pub struct PassthroughFs {
 
     /// Optional guest-write byte budget for this mount's subtree.
     pub(crate) quota: Option<super::quota::DirQuota>,
+
+    /// Whether mutating guest operations are rejected, initialized from
+    /// `cfg.readonly` and switchable while the guest holds open handles.
+    pub(crate) readonly: AtomicBool,
 }
 
 /// Open directory handle with a lazy point-in-time snapshot.
@@ -373,6 +377,7 @@ impl PassthroughFs {
 
         Ok(Self {
             invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
+            readonly: AtomicBool::new(cfg.readonly),
             cfg,
             root_fd,
             inodes: RwLock::new(MultikeyBTreeMap::new()),
@@ -470,6 +475,19 @@ impl PassthroughFs {
             CachePolicy::Auto => OpenOptions::empty(),
             CachePolicy::Always => OpenOptions::CACHE_DIR,
         }
+    }
+
+    /// Whether mutating guest operations are currently rejected.
+    pub(crate) fn readonly(&self) -> bool {
+        self.readonly.load(Ordering::Acquire)
+    }
+
+    /// Switch read-only enforcement for every later operation.
+    ///
+    /// The check runs per operation, not only at open, so a write through a
+    /// handle opened before the switch fails with `EROFS` once it is set.
+    pub fn set_readonly(&self, readonly: bool) {
+        self.readonly.store(readonly, Ordering::Release);
     }
 
     /// Whether this mount exposes the synthetic init binary.

@@ -18,6 +18,7 @@ export const CONTROL_GENERATION_TWO_MESSAGES = [
   "control.branch.create", "control.branch.result", "control.pause", "control.resume",
   "control.pause.state", "control.root-disk.grow", "control.root-disk.state",
   "control.disk.compact", "control.disk.compact.result",
+  "control.mounts.update", "control.mounts.result",
 ] as const;
 
 export type ControlHello = {

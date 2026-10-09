@@ -219,6 +219,7 @@ impl PassthroughFsBuilder {
 
         Ok(PassthroughFs {
             invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
+            readonly: AtomicBool::new(cfg.readonly),
             cfg,
             root_fd,
             inodes: RwLock::new(MultikeyBTreeMap::new()),

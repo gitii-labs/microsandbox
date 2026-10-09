@@ -95,3 +95,30 @@ fn test_readonly_rejects_fallocate_and_copyfilerange() {
         LINUX_EROFS,
     );
 }
+
+#[test]
+fn test_readonly_access_refuses_write_only_for_files_dirs_and_symlinks() {
+    let sb = readonly_sandbox();
+    sb.host_create_file("data.txt", b"data");
+    let fifo =
+        std::ffi::CString::new(sb.root.join("fifo").into_os_string().into_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    let file = sb.lookup_root("data.txt").unwrap();
+    TestSandbox::assert_errno(
+        sb.fs.access(sb.ctx(), file.inode, libc::W_OK as u32),
+        LINUX_EROFS,
+    );
+    TestSandbox::assert_errno(
+        sb.fs.access(sb.ctx(), ROOT_INODE, libc::W_OK as u32),
+        LINUX_EROFS,
+    );
+    sb.fs
+        .access(sb.ctx(), file.inode, libc::R_OK as u32)
+        .unwrap();
+    // Writing to a fifo does not modify the mount, so MS_RDONLY allows it.
+    let fifo = sb.lookup_root("fifo").unwrap();
+    sb.fs
+        .access(sb.ctx(), fifo.inode, libc::W_OK as u32)
+        .unwrap();
+}

@@ -27,7 +27,8 @@
     "patch": "2.8",
     "xz": "5.8.1",
     "perl": "5.40.0",
-    "git": "2.50.1"
+    "git": "2.50.1",
+    "go": "1.26"
   },
   "env": {
     "RUSTUP_HOME": "$DEVBOX_PROJECT_ROOT/.devbox/rustup",

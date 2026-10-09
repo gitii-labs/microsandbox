@@ -61,6 +61,9 @@ pub const AGENT_TRANSPORT_DUAL_PORT_CMDLINE: &str = "microsandbox.agent_transpor
 /// Virtiofs tag for the runtime filesystem (scripts, heartbeat).
 pub const RUNTIME_FS_TAG: &str = "msb_runtime";
 
+/// Virtiofs tag of the live mount-table device.
+pub const MOUNT_TABLE_FS_TAG: &str = "msb_mount_table";
+
 /// Guest-write byte budget for the runtime (`/.msb`) virtiofs mount.
 ///
 /// `/.msb` is a host↔guest control channel, not bulk storage: the only

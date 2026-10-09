@@ -467,6 +467,44 @@
         }
       }
     },
+    "go@1.26": {
+      "last_modified": "2026-10-07T09:43:42Z",
+      "resolved": "github:NixOS/nixpkgs/39ad350a0602fa0a58a544344e3e9187526ea45c#go",
+      "source": "devbox-search",
+      "version": "1.26.8",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/isqxa82c7f65sbhi51npr0547yz87bh5-go-1.26.8",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/isqxa82c7f65sbhi51npr0547yz87bh5-go-1.26.8"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/3677bfwiaibp0fs0dxijmn8bsmkx31vx-go-1.26.8",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/3677bfwiaibp0fs0dxijmn8bsmkx31vx-go-1.26.8"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/iqq9yz2yrcrzsn52h3vkkz72i92h1zds-go-1.26.8",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/iqq9yz2yrcrzsn52h3vkkz72i92h1zds-go-1.26.8"
+        }
+      }
+    },
     "just@1.58.0": {
       "last_modified": "2026-08-27T07:16:00Z",
       "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#just",
