@@ -780,7 +780,12 @@ async fn forward_plaintext(
             Err(e) => return Err(e),
         };
 
-        traffic.record("guest-request", &buf[..n]);
+        // OAuth routing headers can span reads. Raw guest tracing would record
+        // private markers before validation/removal; trace only the transformed
+        // upstream request for OAuth connections.
+        if oauth.is_empty() {
+            traffic.record("guest-request", &buf[..n]);
+        }
         detector.observe_request(&buf[..n]);
 
         if secrets_handler.is_empty() && oauth.is_empty() {

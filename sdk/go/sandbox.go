@@ -300,6 +300,7 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 			BrokerEndpoint:     grant.BrokerEndpoint,
 			GrantID:            grant.GrantID,
 			TokenEndpoint:      grant.TokenEndpoint,
+			RequireGrantMarker: grant.RequireGrantMarker,
 			DeviceCodeEndpoint: grant.DeviceCodeEndpoint,
 			PollEndpoint:       grant.PollEndpoint,
 			PollSecretFields:   grant.PollSecretFields,

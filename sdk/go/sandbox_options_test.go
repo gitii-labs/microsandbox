@@ -835,6 +835,7 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 		BrokerEndpoint:     "/run/msb/oauth.sock",
 		GrantID:            "opaque-42",
 		TokenEndpoint:      "https://login.example.com/oauth/token",
+		RequireGrantMarker: true,
 		DeviceCodeEndpoint: "https://login.example.com/oauth/device/code",
 		PollEndpoint:       "https://login.example.com/oauth/device/token",
 		PollSecretFields:   []string{"authorization_code", "code_verifier"},
@@ -857,6 +858,9 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 		t.Fatalf("oauth_secrets length = %d", len(grants))
 	}
 	grant := grants[0].(map[string]any)
+	if grant["require_grant_marker"] != true {
+		t.Fatalf("require_grant_marker = %v", grant["require_grant_marker"])
+	}
 	for key, want := range map[string]string{
 		"broker_endpoint":      "/run/msb/oauth.sock",
 		"grant_id":             "opaque-42",
@@ -899,6 +903,14 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 		if _, ok := grant[forbidden]; ok {
 			t.Fatalf("OAuth wire has token-bearing field %q: %+v", forbidden, grant)
 		}
+	}
+}
+
+func TestFFIWireShape_OAuthSecretsDefaultGrantMarker(t *testing.T) {
+	got := marshalCreateOptions(t, WithOAuthSecrets(OAuthSecretConfig{}))
+	grant := mustField(t, got, "oauth_secrets").([]any)[0].(map[string]any)
+	if grant["require_grant_marker"] != false {
+		t.Fatalf("require_grant_marker = %v, want false", grant["require_grant_marker"])
 	}
 }
 

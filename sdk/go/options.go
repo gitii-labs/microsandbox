@@ -1530,6 +1530,12 @@ type OAuthSecretConfig struct {
 	BrokerEndpoint string
 	GrantID        string
 	TokenEndpoint  string
+	// RequireGrantMarker requires X-Distributed-OAuth-Grant with an exact known
+	// access or refresh sentinel for exchanges without a sentinel. The runtime
+	// strips the header before forwarding. False permits an unmarked exchange
+	// only when exactly one matching grant allows it. Refresh sentinels do not
+	// require an additional marker.
+	RequireGrantMarker bool
 	// DeviceCodeEndpoint is the exact HTTPS RFC 8628 device-code URL, when
 	// the grant is obtained by a device flow. Requests to it are forwarded
 	// unmodified.

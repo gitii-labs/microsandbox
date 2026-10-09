@@ -2064,6 +2064,7 @@ type OAuthSecretOptions struct {
 	BrokerEndpoint     string                     `json:"broker_endpoint"`
 	GrantID            string                     `json:"grant_id"`
 	TokenEndpoint      string                     `json:"token_endpoint"`
+	RequireGrantMarker bool                       `json:"require_grant_marker"`
 	DeviceCodeEndpoint string                     `json:"device_code_endpoint,omitempty"`
 	PollEndpoint       string                     `json:"poll_endpoint,omitempty"`
 	PollSecretFields   []string                   `json:"poll_secret_fields,omitempty"`

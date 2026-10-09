@@ -2443,6 +2443,12 @@ pub struct OAuthSecret {
     pub grant_id: String,
     /// Exact HTTPS token endpoint, including path and optional query.
     pub token_endpoint: String,
+    /// Require `X-Distributed-OAuth-Grant` with an exact known access or refresh
+    /// sentinel for exchanges carrying no sentinel. The header is removed before
+    /// forwarding. False allows unmarked exchanges only when exactly one matching
+    /// grant allows them. Refresh sentinels remain authoritative without a header.
+    #[serde(default)]
+    pub require_grant_marker: bool,
     /// Exact HTTPS device-code endpoint (RFC 8628), when the grant is obtained
     /// by a device flow.
     ///
@@ -3922,6 +3928,7 @@ mod tests {
             broker_endpoint: "/run/microsandbox/oauth.sock".into(),
             grant_id: "grant".into(),
             token_endpoint: "https://github.com/login/oauth/access_token".into(),
+            require_grant_marker: false,
             device_code_endpoint: Some("https://github.com/login/device/code".into()),
             poll_endpoint: Some("https://github.com/login/oauth/access_token".into()),
             poll_secret_fields: vec![],
@@ -3939,6 +3946,25 @@ mod tests {
     #[test]
     fn oauth_access_and_refresh_token_fields_may_be_the_same() {
         assert_eq!(device_flow_oauth().validate(0), Ok(()));
+    }
+
+    #[test]
+    fn oauth_grant_marker_wire_policy() {
+        let mut value = serde_json::to_value(device_flow_oauth()).unwrap();
+        assert_eq!(value["require_grant_marker"], false);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("require_grant_marker");
+        let omitted: OAuthSecret = serde_json::from_value(value.clone()).unwrap();
+        assert!(!omitted.require_grant_marker);
+        value["require_grant_marker"] = true.into();
+        let required: OAuthSecret = serde_json::from_value(value).unwrap();
+        assert!(required.require_grant_marker);
+        assert_eq!(
+            serde_json::to_value(required).unwrap()["require_grant_marker"],
+            true
+        );
     }
 
     #[test]

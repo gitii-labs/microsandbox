@@ -1081,6 +1081,7 @@ mod tests {
             broker_endpoint: broker_endpoint.into(),
             grant_id: "grant".into(),
             token_endpoint: "https://auth.example.com/token".into(),
+            require_grant_marker: false,
             device_code_endpoint: None,
             poll_endpoint: None,
             poll_secret_fields: vec![],
