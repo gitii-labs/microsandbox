@@ -413,6 +413,14 @@ manifest adoption, and attachment so another worker cannot reopen the old image.
 The SDK does not acquire that lock or detect attached images.
 
 <CodeGroup>
+```typescript TypeScript
+import { Disk } from "microsandbox";
+
+const created = await Disk.create("working.ext4", 1024n * 1024n * 1024n);
+const current = await Disk.inspect("working.ext4");
+const replacement = await Disk.growCopy("working.ext4", "working-next.ext4", 2n * 1024n * 1024n * 1024n);
+```
+
 ```rust Rust
 use microsandbox::disk;
 
@@ -420,14 +428,6 @@ let created = disk::create("working.ext4", 1024 * 1024 * 1024)?;
 let current = disk::inspect("working.ext4")?;
 let replacement = disk::grow_copy("working.ext4", "working-next.ext4", 2 * 1024 * 1024 * 1024)?;
 assert_eq!(current.uuid, replacement.uuid);
-```
-
-```typescript TypeScript
-import { Disk } from "microsandbox";
-
-const created = await Disk.create("working.ext4", 1024n * 1024n * 1024n);
-const current = await Disk.inspect("working.ext4");
-const replacement = await Disk.growCopy("working.ext4", "working-next.ext4", 2n * 1024n * 1024n * 1024n);
 ```
 
 ```python Python
