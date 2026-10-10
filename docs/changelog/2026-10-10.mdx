@@ -1,0 +1,45 @@
+---
+title: "Distributed runtime v0.7.6-gitii.4"
+sidebarTitle: "Distributed runtime .4"
+description: "Explicit OAuth grant routing and credential-safe payload tracing for the Distributed runtime."
+icon: "bolt"
+---
+
+## OAuth grant routing
+
+OAuth token exchanges and device polling can select an exact registered grant
+sentinel through `X-Distributed-OAuth-Grant`. The runtime validates the configured
+token or poll endpoint and removes the header before forwarding. Unknown,
+duplicate or conflicting markers are refused.
+
+The Go SDK's `OAuthSecretConfig.RequireGrantMarker` requires a marker for
+sentinel-free exchanges and polling when enabled. Its default is `false`;
+unmarked exchanges require exactly one matching grant that permits them.
+Existing refresh sentinels remain authoritative without another header.
+
+All payload TRACE logging is suppressed on OAuth-protected connections, including
+guest markers, injected upstream tokens and raw provider responses. Other
+connections retain their existing tracing. TLS-denial test fixtures explicitly
+initialize their crypto provider so the tests also pass in isolation.
+
+## Runtime and SDK deployment
+
+Deploy the runtime tag `v0.7.6-gitii.4` together with the Go SDK module tag
+`sdk/go/v0.7.6-gitii.4`. The fork module is
+`github.com/gitii-labs/microsandbox/sdk/go`; its declared import path remains
+`github.com/superradcompany/microsandbox/sdk/go`. Adapters enabling the marker
+policy must send a current known sentinel at the configured token or poll URL.
+Markers are not accepted at a separate device-code URL.
+
+The fork's `runtime-release.yml` produces
+`microsandbox-runtime-linux-amd64.tar.gz`,
+`microsandbox-runtime-linux-arm64.tar.gz` and
+`microsandbox-runtime-darwin-arm64.tar.gz`, plus `checksums.sha256`.
+Each archive contains `bin/msb`, the native Go FFI, libkrunfw and
+`distributed-runtime.commit`. The runtime and SDK tags identify the same source
+commit. Linux builds and their glibc checks retain the 2.35 baseline.
+
+Fork runtime and module tags use the `-gitii.*` namespace; upstream package and
+binary version metadata remains `0.7.6`, as in the preceding fork releases.
+The release includes the reviewed OAuth change from
+[PR #32](https://github.com/gitii-labs/microsandbox/pull/32).
