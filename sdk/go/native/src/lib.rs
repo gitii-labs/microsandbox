@@ -1041,6 +1041,8 @@ struct OAuthSecretOpts {
     grant_id: String,
     token_endpoint: String,
     #[serde(default)]
+    require_grant_marker: bool,
+    #[serde(default)]
     device_code_endpoint: Option<String>,
     #[serde(default)]
     poll_endpoint: Option<String>,
@@ -1998,6 +2000,7 @@ fn apply_oauth_secret(
         broker_endpoint: oauth.broker_endpoint,
         grant_id: oauth.grant_id,
         token_endpoint: oauth.token_endpoint,
+        require_grant_marker: oauth.require_grant_marker,
         device_code_endpoint: oauth.device_code_endpoint,
         poll_endpoint: oauth.poll_endpoint,
         poll_secret_fields: oauth.poll_secret_fields,
@@ -7876,6 +7879,34 @@ fn agent_error(err: microsandbox::AgentClientError) -> FfiError {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn oauth_grant_marker_wire_policy_reaches_rust_config() {
+        for policy in [None, Some(false), Some(true)] {
+            let mut value = serde_json::json!({
+                "broker_endpoint": "/run/oauth.sock",
+                "grant_id": "account",
+                "token_endpoint": "https://console.anthropic.com/v1/oauth/token",
+                "inject_hosts": ["api.anthropic.com"],
+                "access_token_field": "access_token",
+                "refresh_token_field": "refresh_token",
+                "access_env_var": "ACCESS",
+                "refresh_env_var": "REFRESH",
+                "access_sentinel": "$ACCESS",
+                "refresh_sentinel": "$REFRESH"
+            });
+            if let Some(policy) = policy {
+                value["require_grant_marker"] = policy.into();
+            }
+            let opts: OAuthSecretOpts = serde_json::from_value(value).unwrap();
+            let builder = microsandbox::Sandbox::builder("oauth-wire").image("alpine");
+            let config = apply_oauth_secret(builder, opts).build().await.unwrap();
+            assert_eq!(
+                config.spec.network.secrets.unwrap().oauth[0].require_grant_marker,
+                policy.unwrap_or(false)
+            );
+        }
+    }
+
     #[test]
     fn tcp_network_aliases_are_exclusive() {
         for name in ["max_connections", "max_tcp_connections"] {

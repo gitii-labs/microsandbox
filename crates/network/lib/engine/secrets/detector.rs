@@ -672,6 +672,7 @@ mod tests {
             broker_endpoint: "/tmp/broker.sock".into(),
             grant_id: "grant".into(),
             token_endpoint: "https://auth.example.com/oauth/token".into(),
+            require_grant_marker: false,
             device_code_endpoint: None,
             poll_endpoint: Some("https://auth.example.com/oauth/device".into()),
             poll_secret_fields: vec!["authorization_code".into()],

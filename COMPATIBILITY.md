@@ -144,6 +144,21 @@ The subsequent unreleased generation-9 transport repair routes internal freeze/t
 
 ## 5. Launcher-to-Runtime Process Protocol
 
+The OAuth `require_grant_marker` field and `X-Distributed-OAuth-Grant` header
+require a coordinated SDK/native-FFI/runtime deployment for callers enabling
+the policy. Older peers ignore the new field and cannot enforce it or select a
+grant from the header. This coordinated cutover was explicitly requested for
+Distributed's mixed-harness login on 2026-10-10; no cross-version adapter is
+provided. Omitted policy defaults to false. Current runtimes accept unmarked
+exchanges only when exactly one endpoint grant explicitly allows them, retain
+sentinel-authoritative refresh routing, and refuse ambiguity before upstream
+dispatch. Markers are accepted at the grant's exact token or poll endpoint,
+not at its device-code URL. Adapters must send the marker for sentinel-free
+polling when the policy is enabled. All payload TRACE logging is suppressed on
+OAuth connections to keep markers, injected tokens and raw provider responses
+out of logs; other connections retain their existing tracing. Agent framing, storage and leases are
+unchanged.
+
 In v0.7.0, the private launcher is `msb machine`; `msb sandbox` is the public command group and `sbx` is its alias. The current CLI also recognizes previous internal `msb sandbox` launches. The SDK selects the tested v0.6.x launch contract for previous executables and encodes the corresponding arguments and JSON. Public top-level verbs such as `msb run` remain supported.
 
 Complete previous invocations use the separate boot-only decoder; `msb machine` retains strict execution-intent validation. Runtime selection keeps the unified setup API and its installed-binary precedence. Launch selection uses our embedded-version reader and cached previous contracts, without additional capability/help probes.

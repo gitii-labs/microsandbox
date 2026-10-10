@@ -21,6 +21,7 @@ use crate::shared::SharedState;
 //--------------------------------------------------------------------------------------------------
 
 const MAX_OAUTH_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const GRANT_MARKER_HEADER: &str = "x-distributed-oauth-grant";
 const MAX_BROKER_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTSTANDING_API_REQUESTS: usize = 1024;
 const MAX_RESPONSE_SCRUB_FRAMING_BYTES: usize = MAX_OAUTH_MESSAGE_BYTES;
@@ -803,7 +804,9 @@ impl OAuthConnection {
                     let Some(header_end) = header_boundary(&self.request_buffer) else {
                         break;
                     };
-                    let headers = self.request_buffer[..header_end].to_vec();
+                    let original_headers = self.request_buffer[..header_end].to_vec();
+                    let marker = grant_marker(&original_headers)?;
+                    let headers = remove_header(&original_headers, GRANT_MARKER_HEADER)?;
                     let request_line = first_header_line(&headers)?;
                     let method = request_line
                         .split_whitespace()
@@ -911,25 +914,78 @@ impl OAuthConnection {
                         }
                     }
                     let matching_grants = if endpoint_request {
-                        let framed_request = &self.request_buffer[..total_len];
-                        endpoint_grants
+                        let framed_request =
+                            remove_header(&self.request_buffer[..total_len], GRANT_MARKER_HEADER)?;
+                        self.grants
                             .iter()
+                            .enumerate()
                             .filter(|(_, grant)| {
                                 grant.sentinels().any(|sentinel| {
-                                    contains_bytes(framed_request, sentinel.as_bytes())
+                                    contains_bytes(&framed_request, sentinel.as_bytes())
                                 })
                             })
-                            .map(|(index, _)| *index)
+                            .map(|(index, _)| index)
                             .collect::<Vec<_>>()
                     } else {
                         Vec::new()
                     };
-                    let token_grant = match matching_grants.as_slice() {
-                        [index] => Some(*index),
-                        [] if endpoint_grants.len() == 1 => Some(endpoint_grants[0].0),
-                        [] if endpoint_grants.is_empty() => None,
-                        [] => return Err(invalid_http()),
-                        _ => return Err(invalid_http()),
+                    // Caller validation: explicit markers must identify one known
+                    // grant at its exact token or poll endpoint, and agree with every
+                    // sentinel already carried by the request. Never infer identity
+                    // from a grant ID, client ID, or provider-specific metadata.
+                    let marker_grant = marker
+                        .as_deref()
+                        .map(|marker| {
+                            let matches = self
+                                .grants
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, grant)| {
+                                    grant
+                                        .access_sentinels()
+                                        .chain(grant.refresh_sentinels())
+                                        .any(|sentinel| sentinel == marker)
+                                })
+                                .map(|(index, _)| index)
+                                .collect::<Vec<_>>();
+                            match matches.as_slice() {
+                                [index]
+                                    if self.grants[*index].token.matches(sni, port, target)
+                                        || self.grants[*index].poll.as_ref().is_some_and(
+                                            |poll| poll.matches(sni, port, target),
+                                        ) =>
+                                {
+                                    Ok(*index)
+                                }
+                                _ => Err(invalid_grant_routing()),
+                            }
+                        })
+                        .transpose()?;
+                    let token_grant = match (marker_grant, matching_grants.as_slice()) {
+                        (Some(index), []) => Some(index),
+                        (Some(index), [sentinel_index]) if index == *sentinel_index => Some(index),
+                        (None, [index])
+                            if endpoint_grants
+                                .iter()
+                                .any(|(candidate, _)| candidate == index) =>
+                        {
+                            Some(*index)
+                        }
+                        (None, []) if endpoint_grants.is_empty() => None,
+                        (None, []) => {
+                            // Caller validation: unmarked exchanges have an explicit
+                            // allow policy and must resolve to exactly one candidate.
+                            let allowed = endpoint_grants
+                                .iter()
+                                .filter(|(_, grant)| !grant.config.require_grant_marker)
+                                .map(|(index, _)| *index)
+                                .collect::<Vec<_>>();
+                            match allowed.as_slice() {
+                                [index] => Some(*index),
+                                _ => return Err(invalid_grant_routing()),
+                            }
+                        }
+                        _ => return Err(invalid_grant_routing()),
                     };
                     // A device code poll carries a device code, never a
                     // sentinel. When the poll endpoint is also the token
@@ -991,8 +1047,9 @@ impl OAuthConnection {
                     } else {
                         header_end
                     };
-                    let mut rewritten =
-                        remove_header(&self.request_buffer[..request_len], "accept-encoding")?;
+                    let unmarked =
+                        remove_header(&self.request_buffer[..request_len], GRANT_MARKER_HEADER)?;
+                    let mut rewritten = remove_header(&unmarked, "accept-encoding")?;
                     if let Some(index) = token_grant
                         && self.grants[index].lease.is_none()
                     {
@@ -2457,6 +2514,35 @@ fn remove_header(headers: &[u8], removed_name: &str) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Routing metadata is never included in errors or forwarded as credential data.
+fn grant_marker(headers: &[u8]) -> io::Result<Option<String>> {
+    let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
+    let mut marker = None;
+    for line in text.split("\r\n").skip(1) {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case(GRANT_MARKER_HEADER)
+        {
+            let value = value.trim_matches([' ', '\t']);
+            // Caller validation: duplicate, empty, or folded markers cannot
+            // unambiguously name one sentinel, even when duplicates agree.
+            if marker.is_some() || value.is_empty() {
+                return Err(invalid_grant_routing());
+            }
+            marker = Some(value.to_owned());
+        } else if marker.is_some() && line.starts_with([' ', '\t']) {
+            return Err(invalid_grant_routing());
+        }
+    }
+    Ok(marker)
+}
+
+fn invalid_grant_routing() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "OAuth grant routing is invalid or ambiguous",
+    )
+}
+
 fn validate_token_request_content_type(headers: &[u8]) -> io::Result<()> {
     let text = std::str::from_utf8(headers).map_err(|_| invalid_http())?;
     reject_expect_100_continue(headers)?;
@@ -2747,6 +2833,7 @@ mod tests {
             broker_endpoint: "/tmp/broker.sock".into(),
             grant_id: "opaque-grant".into(),
             token_endpoint: "https://auth.example.com/oauth/token".into(),
+            require_grant_marker: false,
             device_code_endpoint: None,
             poll_endpoint: None,
             poll_secret_fields: vec![],
@@ -5497,6 +5584,291 @@ mod tests {
     }
 
     const RAW_KEY: &str = "sk-ant-api03-real-minted-key";
+
+    fn mixed_anthropic_configs(opencode: &FakeBroker, claude: &FakeBroker) -> Vec<OAuthSecret> {
+        let mut marked = anthropic_config(opencode);
+        marked.grant_id = "opencode-account".into();
+        marked.require_grant_marker = true;
+        marked.access_sentinel = "$MSB_OAUTH_ACCESS_OPENCODE".into();
+        marked.refresh_sentinel = "$MSB_OAUTH_REFRESH_OPENCODE".into();
+        let mut native = anthropic_config(claude);
+        native.grant_id = "claude-account".into();
+        native.access_sentinel = "$MSB_OAUTH_ACCESS_CLAUDE".into();
+        native.refresh_sentinel = "$MSB_OAUTH_REFRESH_CLAUDE".into();
+        vec![marked, native]
+    }
+
+    fn marked_request(body: &str, marker: &str) -> String {
+        format!(
+            "POST /v1/oauth/token HTTP/1.1\r\nX-Distributed-OAuth-Grant: {marker}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn grant_routing_mixed_anthropic_code_exchanges_commit_to_exact_broker() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let opencode = start_broker("opencode-real-access", "opencode-real-refresh");
+        let claude = start_broker("claude-real-access", "claude-real-refresh");
+        // The broker can remint a JWT sentinel after configuration. Routing uses
+        // its exact known identity, not a prefix, claims, or an opaque grant ID.
+        opencode.set_sentinels(JWT_ACCESS_SENTINEL, JWT_REFRESH_SENTINEL);
+        let configs = mixed_anthropic_configs(&opencode, &claude);
+        let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = provider.local_addr().unwrap();
+        let provider_task = tokio::spawn(async move {
+            for account in ["opencode", "claude"] {
+                let (mut stream, _) = provider.accept().await.unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).await.unwrap();
+                let request = String::from_utf8(request).unwrap();
+                assert!(!request.to_ascii_lowercase().contains(GRANT_MARKER_HEADER));
+                assert!(!request.contains("$MSB_OAUTH_"));
+                assert!(!request.contains(JWT_ACCESS_SENTINEL));
+                assert!(request.ends_with(&format!(
+                    r#"{{"grant_type":"authorization_code","code":"{account}-code"}}"#
+                )));
+                let response = json_response(
+                    200,
+                    &format!(
+                        r#"{{"access_token":"{account}-new-access","refresh_token":"{account}-new-refresh"}}"#
+                    ),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        for (account, marker, expected_sentinel) in [
+            ("opencode", Some(JWT_ACCESS_SENTINEL), JWT_ACCESS_SENTINEL),
+            ("claude", None, "$MSB_OAUTH_ACCESS_CLAUDE"),
+        ] {
+            let mut connection = OAuthConnection::new(&configs, "console.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            let body = format!(r#"{{"grant_type":"authorization_code","code":"{account}-code"}}"#);
+            let request = marker.map_or_else(
+                || json_request("/v1/oauth/token", &body),
+                |marker| marked_request(&body, marker),
+            );
+            // Real network reads may split headers and the body arbitrarily.
+            assert!(
+                connection
+                    .transform_requests(&request.as_bytes()[..20], "console.anthropic.com")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let upstream = connection
+                .transform_requests(&request.as_bytes()[20..], "console.anthropic.com")
+                .await
+                .unwrap();
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(&upstream).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let sanitized =
+                String::from_utf8(connection.transform_responses(&response).await.unwrap())
+                    .unwrap();
+            assert!(sanitized.contains(expected_sentinel));
+            assert!(!sanitized.contains(&format!("{account}-new-access")));
+            assert!(!sanitized.contains(&format!("{account}-new-refresh")));
+        }
+        provider_task.await.unwrap();
+        assert_eq!(opencode.commits().len(), 1);
+        assert_eq!(claude.commits().len(), 1);
+        assert_eq!(opencode.commits()[0]["grant_id"], "opencode-account");
+        assert_eq!(opencode.commits()[0]["access"], "opencode-new-access");
+        assert_eq!(claude.commits()[0]["grant_id"], "claude-account");
+        assert_eq!(claude.commits()[0]["access"], "claude-new-access");
+    }
+
+    #[tokio::test]
+    async fn grant_routing_refuses_invalid_ambiguous_and_disagreeing_markers() {
+        let opencode = start_broker("opencode-real-access", "opencode-real-refresh");
+        let claude = start_broker("claude-real-access", "claude-real-refresh");
+        let configs = mixed_anthropic_configs(&opencode, &claude);
+        let body = r#"{"grant_type":"authorization_code","code":"first-login"}"#;
+        let refresh = r#"{"refresh_token":"$MSB_OAUTH_REFRESH_CLAUDE"}"#;
+        let marker = "$MSB_OAUTH_ACCESS_OPENCODE";
+        let mut no_allowed = configs.clone();
+        no_allowed[1].require_grant_marker = true;
+        let mut two_allowed = configs.clone();
+        two_allowed[0].require_grant_marker = false;
+        let cases = vec![
+            (configs.clone(), marked_request(body, "unknown-marker")),
+            (configs.clone(), marked_request(body, "opencode-account")),
+            (
+                configs.clone(),
+                marked_request(body, "opencode-real-access"),
+            ),
+            (
+                configs.clone(),
+                marked_request(body, &format!("{marker}, $MSB_OAUTH_ACCESS_CLAUDE")),
+            ),
+            (configs.clone(), marked_request(body, "")),
+            (
+                configs.clone(),
+                marked_request(body, marker).replace(
+                    "Content-Type:",
+                    &format!("x-distributed-oauth-grant: {marker}\r\nContent-Type:"),
+                ),
+            ),
+            (
+                configs.clone(),
+                marked_request(body, marker)
+                    .replace("Content-Type:", " another-value\r\nContent-Type:"),
+            ),
+            (
+                configs.clone(),
+                marked_request(body, marker).replace("/v1/oauth/token", "/other"),
+            ),
+            (configs.clone(), marked_request(refresh, marker)),
+            (
+                configs.clone(),
+                marked_request(body, &format!("prefix{marker}")),
+            ),
+            (no_allowed, json_request("/v1/oauth/token", body)),
+            (two_allowed, json_request("/v1/oauth/token", body)),
+        ];
+        for (configs, request) in cases {
+            let mut connection = OAuthConnection::new(&configs, "console.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            let error = connection
+                .transform_requests(request.as_bytes(), "console.anthropic.com")
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "OAuth grant routing is invalid or ambiguous"
+            );
+            assert!(connection.exchanges.is_empty());
+            assert!(connection.grants.iter().all(|grant| grant.lease.is_none()));
+        }
+        assert!(opencode.commits().is_empty());
+        assert!(claude.commits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn grant_routing_refresh_sentinel_is_authoritative_with_or_without_marker() {
+        let opencode = start_broker("opencode-real-access", "opencode-real-refresh");
+        let claude = start_broker("claude-real-access", "claude-real-refresh");
+        let configs = mixed_anthropic_configs(&opencode, &claude);
+        for marker in [None, Some("$MSB_OAUTH_ACCESS_OPENCODE")] {
+            let mut connection = OAuthConnection::new(&configs, "console.anthropic.com", 443, None)
+                .await
+                .unwrap();
+            let body =
+                r#"{"grant_type":"refresh_token","refresh_token":"$MSB_OAUTH_REFRESH_OPENCODE"}"#;
+            let request = marker.map_or_else(
+                || json_request("/v1/oauth/token", body),
+                |marker| marked_request(body, marker),
+            );
+            let output = String::from_utf8(
+                connection
+                    .transform_requests(request.as_bytes(), "console.anthropic.com")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(output.contains("opencode-real-refresh"));
+            assert!(!output.contains("claude-real-refresh"));
+            assert!(!output.to_ascii_lowercase().contains(GRANT_MARKER_HEADER));
+            assert!(matches!(
+                connection.exchanges.front(),
+                Some(Exchange::Token {
+                    grant: 0,
+                    poll: false
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_routing_distinct_poll_endpoint_requires_and_accepts_exact_marker() {
+        let broker = start_broker("real-access", "real-refresh");
+        let mut config = broker_config(&broker);
+        config.device_code_endpoint = Some("https://auth.example.com/oauth/device/code".into());
+        config.poll_endpoint = Some("https://auth.example.com/oauth/device/token".into());
+        config.require_grant_marker = true;
+        let body = r#"{"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":"device-code"}"#;
+        let poll = json_request("/oauth/device/token", body);
+        let marked = format!("X-Distributed-OAuth-Grant: {}\r\n", config.access_sentinel);
+        let marked_poll = poll.replace("Content-Type:", &format!("{marked}Content-Type:"));
+
+        for target in ["/oauth/device/code", "/oauth/other", "/oauth/device/other"] {
+            let mut connection =
+                OAuthConnection::new(&[config.clone()], "auth.example.com", 443, None)
+                    .await
+                    .unwrap();
+            let request = marked_poll.replace("/oauth/device/token", target);
+            let error = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "OAuth grant routing is invalid or ambiguous"
+            );
+            assert!(connection.grants[0].lease.is_none());
+        }
+        let mut required = OAuthConnection::new(&[config.clone()], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        let error = required
+            .transform_requests(poll.as_bytes(), "auth.example.com")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth grant routing is invalid or ambiguous"
+        );
+        assert!(required.grants[0].lease.is_none());
+
+        for require_marker in [true, false] {
+            config.require_grant_marker = require_marker;
+            let mut connection =
+                OAuthConnection::new(&[config.clone()], "auth.example.com", 443, None)
+                    .await
+                    .unwrap();
+            let request = if require_marker { &marked_poll } else { &poll };
+            let upstream = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap();
+            assert_eq!(upstream, poll.as_bytes());
+            assert!(matches!(
+                connection.exchanges.front(),
+                Some(Exchange::Token {
+                    grant: 0,
+                    poll: true
+                })
+            ));
+            let response = json_response(
+                200,
+                r#"{"access_token":"polled-access","refresh_token":"polled-refresh"}"#,
+            );
+            let sanitized = String::from_utf8(
+                connection
+                    .transform_responses(response.as_bytes())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(sanitized.contains(&config.access_sentinel));
+            assert!(!sanitized.contains("polled-access"));
+            assert!(!sanitized.contains("polled-refresh"));
+        }
+        assert_eq!(broker.commits().len(), 2);
+        assert!(
+            broker
+                .commits()
+                .iter()
+                .all(|commit| commit["grant_id"] == config.grant_id)
+        );
+    }
 
     #[tokio::test]
     async fn a_minted_api_key_is_sentineled_and_substituted_back() {
