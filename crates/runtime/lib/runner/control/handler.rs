@@ -435,7 +435,7 @@ pub(super) fn apply_mount_changes(
             let code = match error.kind() {
                 std::io::ErrorKind::AlreadyExists => "mount_exists",
                 std::io::ErrorKind::InvalidInput => "invalid_mount",
-                // An attach names a host directory; detach and set mode name a child.
+                // An attach names a host directory or file; detach and set mode name a child.
                 _ if attach => "mount_host_unavailable",
                 std::io::ErrorKind::NotFound => "mount_not_found",
                 _ => "mount_update_failed",
