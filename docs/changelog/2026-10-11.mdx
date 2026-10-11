@@ -1,0 +1,48 @@
+---
+title: "Distributed runtime v0.7.6-gitii.5"
+sidebarTitle: "Distributed runtime .5"
+description: "Mount-table file children and per-child guest owners for the Distributed runtime."
+icon: "bolt"
+---
+
+## Mount-table file children
+
+A mount-table child whose host path is a regular file is now a file child: the
+guest sees one regular file at `<table>/<name>`. File children have the same
+read-only switch (including writes through handles opened before the switch),
+detach with `ESTALE`, attachment-id inode numbers, cache policy and stat
+virtualization as directory children.
+
+A file child follows its host path, not its inode. Each guest lookup and open
+resolves the path again, so a file the host replaces by renaming a new one into
+place shows the new content at the guest's next open. Files the guest already
+holds open keep the replaced content. A read-only file child needs only read
+access on the host.
+
+## Mount-table owners
+
+`MountTableChild.owner` (Rust) and `MountTableChild.Owner` (Go) present entries
+owned by the runtime's host user as a guest uid and gid; entries owned by any
+other host user show as 65534. Host inodes are not changed: guest-created
+entries are owned by the runtime's host user and the host kernel checks every
+access against that user. An owner requires `strict` or `relaxed` stat
+virtualization.
+
+`MountTableChild` now refuses unknown fields, so a runtime that predates a
+field fails the attach instead of ignoring it. Runtime `v0.7.6-gitii.4` and
+earlier ignore `owner`.
+
+## Runtime and SDK deployment
+
+Deploy the runtime tag `v0.7.6-gitii.5` together with the Go SDK module tag
+`sdk/go/v0.7.6-gitii.5`. The fork module is
+`github.com/gitii-labs/microsandbox/sdk/go`; its declared import path remains
+`github.com/superradcompany/microsandbox/sdk/go`.
+
+The fork's `runtime-release.yml` produces
+`microsandbox-runtime-linux-amd64.tar.gz`,
+`microsandbox-runtime-linux-arm64.tar.gz` and
+`microsandbox-runtime-darwin-arm64.tar.gz`, plus `checksums.sha256`.
+Each archive contains `bin/msb`, the native Go FFI, libkrunfw and
+`distributed-runtime.commit`. The runtime and SDK tags identify the same source
+commit. Linux builds and their glibc checks retain the 2.35 baseline.
