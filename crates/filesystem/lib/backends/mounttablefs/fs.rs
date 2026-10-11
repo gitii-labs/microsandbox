@@ -886,6 +886,16 @@ impl DynFileSystem for MountTableFs {
                 .cloned()
                 .ok_or_else(|| errno(LINUX_EBADF))?;
             let _op = self.table.begin();
+            // A file child's entry carries a lookup reference the guest
+            // kernel forgets only for entries it receives. One the reply has
+            // no room for is released here, and on an error the kernel drops
+            // the whole reply, so every reference taken in this call is.
+            let mut taken: Vec<(Arc<Child>, u64)> = Vec::new();
+            let release = |taken: &[(Arc<Child>, u64)]| {
+                for (child, local) in taken {
+                    child.fs.as_dyn().forget(ctx, *local, 1);
+                }
+            };
             // Offsets match `readdir_for_each`: 1 and 2 are the dot entries,
             // which readdirplus omits like the passthrough backend does.
             for (index, (name, id)) in listed.iter().enumerate() {
@@ -897,17 +907,36 @@ impl DynFileSystem for MountTableFs {
                 let Some(child) = self.table.child_by_id(*id) else {
                     continue;
                 };
-                let Some(entry) = listed_child(self.child_root_entry(ctx, &child))? else {
-                    continue;
+                let entry = match listed_child(self.child_root_entry(ctx, &child)) {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        release(&taken);
+                        return Err(error);
+                    }
                 };
+                if child.fs.is_file() {
+                    taken.push((Arc::clone(&child), table::decode(entry.inode).1));
+                }
                 let dir_entry = DirEntry {
                     ino: entry.attr.st_ino,
                     offset: position,
                     type_: if child.fs.is_file() { DT_REG } else { DT_DIR },
                     name: name.as_bytes(),
                 };
-                if add_entry(dir_entry, entry)? == 0 {
-                    break;
+                match add_entry(dir_entry, entry) {
+                    Ok(0) => {
+                        // Not delivered: release only this entry's reference.
+                        if child.fs.is_file() {
+                            release(&taken[taken.len() - 1..]);
+                        }
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        release(&taken);
+                        return Err(error);
+                    }
                 }
             }
             return Ok(());

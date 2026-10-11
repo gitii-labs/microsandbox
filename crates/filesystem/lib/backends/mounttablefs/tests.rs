@@ -781,6 +781,12 @@ fn a_file_child_is_one_regular_file_at_the_root() {
         errno(fixture.fs.unlink(ctx(), ROOT, &cstr("item"))),
         LINUX_EACCES
     );
+    // A forged number for the child's synthetic directory shows only the file.
+    let synthetic = table::encode(id, 1).unwrap();
+    assert_eq!(errno(fixture.lookup(synthetic, "sibling")), LINUX_ENOENT);
+    assert_eq!(errno(fixture.lookup(synthetic, "..")), LINUX_ENOENT);
+    assert!(fixture.create(synthetic, "new").is_err());
+    assert!(!file.with_file_name("new").exists());
 
     // Both listings type the file child as a regular file and agree on its number.
     let (plain, plus) = fixture.root_types();
@@ -958,6 +964,67 @@ fn a_file_child_whose_host_file_is_gone_is_left_out_of_listings() {
     let entry = fixture.lookup(ROOT, "item").unwrap();
     let handle = fixture.open(entry.inode, 0).unwrap();
     assert_eq!(fixture.read(entry.inode, handle).unwrap(), b"back");
+}
+
+fn kernel_refs(fixture: &Fixture, name: &str, guest_inode: u64) -> u64 {
+    let child = fixture.table.child_by_name(name).unwrap();
+    let super::table::ChildFs::File(fs) = &child.fs else {
+        panic!("{name} is not a file child");
+    };
+    fs.kernel_refs(table::decode(guest_inode).1)
+}
+
+#[test]
+fn root_readdirplus_releases_file_references_the_guest_never_receives() {
+    let mut fixture = Fixture::new();
+    let a = fixture.host_file(b"a");
+    let b = fixture.host_file(b"b");
+    fixture.attach("a", &a, false);
+    fixture.attach("b", &b, false);
+    let a_inode = fixture.lookup(ROOT, "a").unwrap().inode;
+    let b_inode = fixture.lookup(ROOT, "b").unwrap().inode;
+    fixture.fs.forget(ctx(), a_inode, 1);
+    fixture.fs.forget(ctx(), b_inode, 1);
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 0);
+
+    let readdirplus = |reply: &mut dyn FnMut(usize) -> io::Result<usize>| {
+        let (handle, _) = fixture.fs.opendir(ctx(), ROOT, 0).unwrap();
+        let handle = handle.unwrap();
+        let mut index = 0;
+        let result = fixture
+            .fs
+            .readdirplus_for_each(ctx(), ROOT, handle, 4096, 0, &mut |_, _| {
+                index += 1;
+                reply(index)
+            });
+        fixture.fs.releasedir(ctx(), ROOT, 0, handle).unwrap();
+        result
+    };
+
+    // Delivered entries keep their reference for the kernel to forget.
+    readdirplus(&mut |_| Ok(1)).unwrap();
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 1);
+    assert_eq!(kernel_refs(&fixture, "b", b_inode), 1);
+    fixture.fs.forget(ctx(), a_inode, 1);
+    fixture.fs.forget(ctx(), b_inode, 1);
+
+    // A full reply releases the entry it could not hold.
+    readdirplus(&mut |index| Ok(usize::from(index == 1))).unwrap();
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 1);
+    assert_eq!(kernel_refs(&fixture, "b", b_inode), 0);
+    fixture.fs.forget(ctx(), a_inode, 1);
+
+    // A failed reply is dropped whole, so every reference is released.
+    let error = readdirplus(&mut |index| {
+        if index == 2 {
+            Err(io::Error::from_raw_os_error(LINUX_EBADF))
+        } else {
+            Ok(1)
+        }
+    });
+    assert_eq!(errno(error), LINUX_EBADF);
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 0);
+    assert_eq!(kernel_refs(&fixture, "b", b_inode), 0);
 }
 
 #[test]

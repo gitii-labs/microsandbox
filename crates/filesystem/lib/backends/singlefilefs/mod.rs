@@ -183,6 +183,17 @@ impl SingleFileFs {
         self.inner.set_readonly(readonly);
     }
 
+    /// Lookup references the guest kernel holds on `inode` and may forget.
+    #[cfg(all(unix, test))]
+    pub(crate) fn kernel_refs(&self, inode: u64) -> u64 {
+        self.lookup_refs
+            .read()
+            .unwrap()
+            .get(&inode)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Whether mutating guest operations are currently rejected.
     #[cfg(all(unix, test))]
     pub(crate) fn readonly(&self) -> bool {

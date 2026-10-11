@@ -61,6 +61,8 @@ pub struct MountTableChild {
     /// open resolves the host path again, so a file the host replaces by
     /// renaming a new one into place shows the new content at the guest's
     /// next open. Files the guest already holds open keep the replaced inode.
+    /// While the host path is missing, the child is left out of root listings
+    /// and a lookup of its name fails with `ENOENT`.
     pub host_path: PathBuf,
 
     /// Whether the child starts read-only. [`MountTable::set_readonly`] changes it later.
@@ -74,8 +76,9 @@ pub struct MountTableChild {
     /// [`StatVirtualization::Strict`] requires writable `user.*` xattrs on a
     /// directory child even when it is read-only, because the child can be
     /// switched to read-write later. A file child is probed for the access it
-    /// starts with: a read-only file child needs readable xattrs only, and a
-    /// read-write one must be writable by this process.
+    /// starts with, under every policy: a read-only file child needs read
+    /// access only, and a read-write one must be writable by this process.
+    /// Switching a file child to read-write later does not probe again.
     pub stat_virtualization: StatVirtualization,
 
     /// Whether guest permission changes reach the host inode.
@@ -362,6 +365,9 @@ fn open_child(child: &MountTableChild) -> io::Result<ChildFs> {
             ));
         }
         Some((uid, gid)) => {
+            // Only entries this process owns take the guest owner. Entries
+            // of another host user (say root) show as 65534, so the guest
+            // does not see as its own a file the host would refuse it.
             // SAFETY: geteuid has no preconditions and cannot fail.
             let host_uid = unsafe { libc::geteuid() };
             Some(Arc::new(OnceLock::from(BindIdentityMap::new(
@@ -375,7 +381,9 @@ fn open_child(child: &MountTableChild) -> io::Result<ChildFs> {
         stat_virtualization: child.stat_virtualization,
         host_permissions: child.host_permissions,
         // A directory is probed for the strongest access the child can later
-        // be switched to; see `MountTableChild::stat_virtualization`.
+        // be switched to. A file is probed for the access it starts with, so
+        // a read-only file the host keeps at mode 0400, such as a secret, can
+        // be attached; switching it to read-write later does not probe again.
         readonly: metadata.is_file() && child.readonly,
         entry_timeout: timeout,
         attr_timeout: timeout,

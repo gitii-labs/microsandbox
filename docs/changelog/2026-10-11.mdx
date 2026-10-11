@@ -16,8 +16,13 @@ virtualization as directory children.
 A file child follows its host path, not its inode. Each guest lookup and open
 resolves the path again, so a file the host replaces by renaming a new one into
 place shows the new content at the guest's next open. Files the guest already
-holds open keep the replaced content. A read-only file child needs only read
-access on the host.
+holds open keep the replaced content. While the host file is missing, the child
+is left out of the table listing and opening it fails with `ENOENT`.
+
+A file child is checked at attach for the access it starts with: a read-only one
+needs only read access on the host, so a 0400 secret can be attached, while a
+read-write one must be writable by the runtime's host user. Switching a file
+child to read-write later does not check again.
 
 ## Mount-table owners
 
