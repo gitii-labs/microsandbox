@@ -932,6 +932,35 @@ fn a_never_cached_file_child_uses_direct_io_and_zero_timeouts() {
 }
 
 #[test]
+fn a_file_child_whose_host_file_is_gone_is_left_out_of_listings() {
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"item");
+    let dir = fixture.host_dir();
+    fixture.attach("item", &file, false);
+    fixture.attach("dir", &dir, false);
+    std::fs::remove_file(&file).unwrap();
+
+    assert_eq!(errno(fixture.lookup(ROOT, "item")), LINUX_ENOENT);
+    let (plain, plus) = fixture.root_types();
+    assert_eq!(
+        plain,
+        [
+            (".".into(), DT_DIR),
+            ("..".into(), DT_DIR),
+            ("dir".into(), DT_DIR)
+        ]
+    );
+    assert_eq!(plus.len(), 1);
+    assert_eq!(fixture.table.names(), ["dir", "item"]);
+
+    // The file shows again once the host path exists.
+    std::fs::write(&file, b"back").unwrap();
+    let entry = fixture.lookup(ROOT, "item").unwrap();
+    let handle = fixture.open(entry.inode, 0).unwrap();
+    assert_eq!(fixture.read(entry.inode, handle).unwrap(), b"back");
+}
+
+#[test]
 fn only_directories_and_regular_files_are_children() {
     let mut fixture = Fixture::new();
     let dir = fixture.host_dir();

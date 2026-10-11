@@ -809,7 +809,9 @@ impl DynFileSystem for MountTableFs {
                     continue;
                 };
                 // `ino` matches the `st_ino` a lookup of the name returns.
-                let (ino, type_) = self.child_root_dirent(ctx, &child)?;
+                let Some((ino, type_)) = listed_child(self.child_root_dirent(ctx, &child))? else {
+                    continue;
+                };
                 let entry = DirEntry {
                     ino,
                     offset: position,
@@ -895,7 +897,9 @@ impl DynFileSystem for MountTableFs {
                 let Some(child) = self.table.child_by_id(*id) else {
                     continue;
                 };
-                let entry = self.child_root_entry(ctx, &child)?;
+                let Some(entry) = listed_child(self.child_root_entry(ctx, &child))? else {
+                    continue;
+                };
                 let dir_entry = DirEntry {
                     ino: entry.attr.st_ino,
                     offset: position,
@@ -1037,6 +1041,16 @@ fn guest_ino(child: &Child, host_ino: u64) -> io::Result<u64> {
 fn guest_stat(child: &Child, mut stat: stat64) -> io::Result<stat64> {
     stat.st_ino = guest_ino(child, stat.st_ino)?;
     Ok(stat)
+}
+
+/// A root listing leaves out a file child whose host path is missing, as a
+/// lookup of its name fails; it still lists every other child.
+fn listed_child<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.raw_os_error() == Some(LINUX_ENOENT) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn errno(code: i32) -> io::Error {
