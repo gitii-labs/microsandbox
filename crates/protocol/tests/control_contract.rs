@@ -654,6 +654,10 @@ fn generation_two_inventory_and_requests_are_additive() {
                             stat_virtualization: microsandbox_types::StatVirtualization::Strict,
                             host_permissions: microsandbox_types::HostPermissions::Private,
                             cache: microsandbox_types::MountTableCache::Never,
+                            owner: Some(microsandbox_types::MountTableOwner {
+                                uid: 1000,
+                                gid: 1000,
+                            }),
                         },
                     },
                     MountChange::SetMode {
