@@ -21,7 +21,7 @@ let sb = Sandbox::builder("worker").image("alpine")
 
 ## Mount tables
 
-`.mount_table(MountTableSpec)` serves a guest directory whose children change while the sandbox runs. Each child is a name over an absolute host directory. `Sandbox::update_mounts` applies attach, detach and mode changes in order without a restart, and `attach_mount`, `detach_mount` and `set_mount_readonly` wrap single changes. Local backend on Linux and macOS only; Cloud rejects mount tables.
+`.mount_table(MountTableSpec)` serves a guest directory whose children change while the sandbox runs. Each child is a name over an absolute host directory or regular host file. `Sandbox::update_mounts` applies attach, detach and mode changes in order without a restart, and `attach_mount`, `detach_mount` and `set_mount_readonly` wrap single changes. Local backend on Linux and macOS only; Cloud rejects mount tables.
 
 ```rust
 let sb = Sandbox::builder("worker").image("alpine")
@@ -35,6 +35,7 @@ let sb = Sandbox::builder("worker").image("alpine")
             stat_virtualization: StatVirtualization::Strict,
             host_permissions: HostPermissions::Mirror,
             cache: MountTableCache::Auto,
+            owner: Some(MountTableOwner { uid: 1000, gid: 1000 }),
         }],
     })
     .create().await?;
@@ -43,7 +44,13 @@ sb.set_mount_readonly("data", true).await?;
 sb.detach_mount("data").await?;
 ```
 
-The table directory is read-only, mounted `nosuid,nodev`, and lists the attached children. A read-only child refuses every mutation with `EROFS`, including writes through files opened before the switch. Detaching closes the child's host descriptors, so files and working directories the guest still holds fail with `ESTALE`; re-attaching the name never reaches them. A failed change stops the batch with `MicrosandboxError::ControlMountBatch` and leaves earlier changes applied. `quota_bytes: None` is unlimited, `StatVirtualization::Strict` needs writable `user.*` xattrs on the host directory, and `MountTableCache::Never` uses direct I/O with zero cache timeouts. `host_permissions` defaults to `Private` (guest modes live in the metadata overlay); `Mirror` copies ordinary rwx bits of guest `chmod` and create modes to the host inode. Mode switches and detaches return only after operations already in flight on the child have finished. Live changes are not saved to the configuration, live snapshots (full or disk-only) and forks of a running sandbox with a mount table are refused, and changes also apply while the sandbox is paused.
+The table directory is read-only, mounted `nosuid,nodev`, and lists the attached children. A read-only child refuses every mutation with `EROFS`, including writes through files opened before the switch. Detaching closes the child's host descriptors, so files and working directories the guest still holds fail with `ESTALE`; re-attaching the name never reaches them. A failed change stops the batch with `MicrosandboxError::ControlMountBatch` and leaves earlier changes applied. `quota_bytes: None` is unlimited, `StatVirtualization::Strict` needs writable `user.*` xattrs on the host directory, and `MountTableCache::Never` uses direct I/O with zero cache timeouts. `host_permissions` defaults to `Private` (guest modes live in the metadata overlay); `Mirror` copies ordinary rwx bits of guest `chmod` and create modes to the host inode. Mode switches and detaches return only after operations already in flight on the child have finished.
+
+A `host` that is a regular file attaches a file child: the guest sees one regular file at `<table>/<name>`, with the same read-only, detach, cache and stat behavior as a directory child. The child follows the path, not the inode: each guest lookup and open resolves `host` again, so a file the host replaces by renaming a new one into place shows the new content at the guest's next open, while files the guest already holds open keep the replaced content. While the host file is missing, the child is left out of the table listing and opening it fails with `ENOENT`. A file child is checked at attach for the access it starts with: a read-only one needs only read access on the host, so a 0400 secret can be attached, while a read-write one must be writable by the runtime's host user (and, with `Strict`, have writable `user.*` xattrs). Switching a file child to read-write later does not check again.
+
+`owner` presents entries owned by the runtime's host user, without a per-file stat override, as that guest uid and gid; entries owned by another host user show as 65534. It requires `Strict` or `Relaxed` stat virtualization. Host inodes are not changed: entries the guest creates are owned by the runtime's host user, and the host kernel checks every access against that user, so the guest gains no access the host user lacks. Use it when the guest user's uid differs from the host user's, such as uid 1000 in the guest on a macOS host where the user is uid 501.
+
+Live changes are not saved to the configuration, live snapshots (full or disk-only) and forks of a running sandbox with a mount table are refused, and changes also apply while the sandbox is paused.
 
 ## Volume
 

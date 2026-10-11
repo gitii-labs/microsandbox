@@ -24,6 +24,7 @@ use crate::{
 const ROOT: u64 = 1;
 const LINUX_ENOENT: i32 = 2;
 const LINUX_EBADF: i32 = 9;
+const LINUX_ENOTDIR: i32 = 20;
 const LINUX_EACCES: i32 = 13;
 const LINUX_EEXIST: i32 = 17;
 const LINUX_EXDEV: i32 = 18;
@@ -201,6 +202,7 @@ fn child(name: &str, host_path: &Path, readonly: bool) -> MountTableChild {
         stat_virtualization: StatVirtualization::Strict,
         host_permissions: HostPermissions::Private,
         cache_policy: CachePolicy::Auto,
+        owner: None,
     }
 }
 
@@ -679,4 +681,485 @@ fn detach_replies_after_in_flight_operations_and_drops_the_backend() {
         move || table.names().is_empty(),
     );
     assert!(child.upgrade().is_none());
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: file children
+//--------------------------------------------------------------------------------------------------
+
+const DT_DIR: u32 = 4;
+const DT_REG: u32 = 8;
+const S_IFMT: u32 = 0o170000;
+const S_IFREG: u32 = 0o100000;
+
+impl Fixture {
+    /// A fresh host file with `content`, in its own canonical directory.
+    fn host_file(&mut self, content: &[u8]) -> PathBuf {
+        let path = self.host_dir().join("item");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn open(&self, inode: u64, flags: u32) -> io::Result<u64> {
+        let (handle, _) = self.fs.open(ctx(), inode, false, flags)?;
+        Ok(handle.unwrap())
+    }
+
+    /// Root entries as `(name, type)` from plain readdir and from readdirplus.
+    fn root_types(&self) -> (Vec<(String, u32)>, Vec<(String, u32, u64)>) {
+        let (handle, _) = self.fs.opendir(ctx(), ROOT, 0).unwrap();
+        let handle = handle.unwrap();
+        let mut plain = Vec::new();
+        self.fs
+            .readdir_for_each(ctx(), ROOT, handle, 4096, 0, &mut |entry: DirEntry<'_>| {
+                plain.push((String::from_utf8(entry.name.to_vec()).unwrap(), entry.type_));
+                Ok(1)
+            })
+            .unwrap();
+        let mut plus = Vec::new();
+        self.fs
+            .readdirplus_for_each(ctx(), ROOT, handle, 4096, 0, &mut |dir, entry| {
+                assert_eq!(dir.ino, entry.attr.st_ino);
+                plus.push((
+                    String::from_utf8(dir.name.to_vec()).unwrap(),
+                    dir.type_,
+                    entry.inode,
+                ));
+                Ok(1)
+            })
+            .unwrap();
+        self.fs.releasedir(ctx(), ROOT, 0, handle).unwrap();
+        (plain, plus)
+    }
+}
+
+/// Replace `path` the way the node does: write a sibling, rename it into place.
+fn replace_by_rename(path: &Path, content: &[u8]) {
+    let staged = path.with_extension("staged");
+    std::fs::write(&staged, content).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+#[test]
+fn a_file_child_is_one_regular_file_at_the_root() {
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"text item");
+    std::fs::write(file.with_file_name("sibling"), b"hidden").unwrap();
+    let dir = fixture.host_dir();
+    fixture.attach("item", &file, false);
+    fixture.attach("dir", &dir, false);
+
+    let entry = fixture.lookup(ROOT, "item").unwrap();
+    assert_eq!(u32::from(entry.attr.st_mode) & S_IFMT, S_IFREG);
+    assert_eq!(entry.entry_timeout, Duration::ZERO);
+    assert_eq!(entry.attr_timeout, Duration::ZERO);
+    let (id, local) = table::decode(entry.inode);
+    assert_ne!(id, 0);
+    assert_ne!(local, 1, "the synthetic directory is never handed out");
+    let host_ino = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&file).unwrap().ino()
+    };
+    assert_eq!(table::decode(entry.attr.st_ino), (id, host_ino));
+    let (stat, _) = fixture.fs.getattr(ctx(), entry.inode, None).unwrap();
+    assert_eq!(stat.st_ino, entry.attr.st_ino);
+
+    let handle = fixture.open(entry.inode, LINUX_O_RDWR).unwrap();
+    assert_eq!(table::decode(handle).0, id);
+    assert_eq!(fixture.read(entry.inode, handle).unwrap(), b"text item");
+    fixture.write(entry.inode, handle, b"TEXT").unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"TEXT item");
+
+    // Nothing beside the file is reachable through it.
+    assert_eq!(errno(fixture.lookup(entry.inode, "sibling")), LINUX_ENOTDIR);
+    assert_eq!(errno(fixture.lookup(entry.inode, "..")), LINUX_ENOTDIR);
+    assert_eq!(
+        errno(fixture.fs.opendir(ctx(), entry.inode, 0)),
+        LINUX_ENOTDIR
+    );
+    assert_eq!(
+        errno(fixture.fs.unlink(ctx(), ROOT, &cstr("item"))),
+        LINUX_EACCES
+    );
+    // A forged number for the child's synthetic directory shows only the file.
+    let synthetic = table::encode(id, 1).unwrap();
+    assert_eq!(errno(fixture.lookup(synthetic, "sibling")), LINUX_ENOENT);
+    assert_eq!(errno(fixture.lookup(synthetic, "..")), LINUX_ENOENT);
+    assert!(fixture.create(synthetic, "new").is_err());
+    assert!(!file.with_file_name("new").exists());
+
+    // Both listings type the file child as a regular file and agree on its number.
+    let (plain, plus) = fixture.root_types();
+    assert_eq!(
+        plain,
+        [
+            (".".into(), DT_DIR),
+            ("..".into(), DT_DIR),
+            ("dir".into(), DT_DIR),
+            ("item".into(), DT_REG)
+        ]
+    );
+    assert_eq!(plus[1].0, "item");
+    assert_eq!(plus[1].1, DT_REG);
+    assert_eq!(plus[1].2, entry.inode);
+    // Only directory children count as root links.
+    let (root, _) = fixture.fs.getattr(ctx(), ROOT, None).unwrap();
+    assert_eq!(root.st_nlink, 3);
+}
+
+#[test]
+fn a_file_child_follows_its_path_across_a_rename_into_place() {
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"first");
+    fixture.attach("item", &file, true);
+    let old = fixture.lookup(ROOT, "item").unwrap();
+    let old_handle = fixture.open(old.inode, 0).unwrap();
+
+    replace_by_rename(&file, b"second version");
+
+    // A new lookup resolves the path again: a new inode with the new content.
+    let new = fixture.lookup(ROOT, "item").unwrap();
+    assert_ne!(new.inode, old.inode);
+    assert_ne!(new.attr.st_ino, old.attr.st_ino);
+    let new_handle = fixture.open(new.inode, 0).unwrap();
+    assert_eq!(
+        fixture.read(new.inode, new_handle).unwrap(),
+        b"second version"
+    );
+    // An open through the inode the guest already has also follows the path.
+    let reopened = fixture.open(old.inode, 0).unwrap();
+    assert_eq!(
+        fixture.read(old.inode, reopened).unwrap(),
+        b"second version"
+    );
+    // A handle opened before the replacement keeps the replaced file.
+    assert_eq!(fixture.read(old.inode, old_handle).unwrap(), b"first");
+    // The forgets the guest kernel sends for both lookups are accepted.
+    fixture.fs.forget(ctx(), old.inode, 1);
+    fixture.fs.forget(ctx(), new.inode, 1);
+    assert_eq!(fixture.root_types().0.len(), 3);
+}
+
+#[test]
+fn a_file_child_read_only_switch_applies_to_handles_opened_before_it() {
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"original");
+    fixture.attach("item", &file, false);
+    let entry = fixture.lookup(ROOT, "item").unwrap();
+    let handle = fixture.open(entry.inode, LINUX_O_RDWR).unwrap();
+    fixture.write(entry.inode, handle, b"changed!").unwrap();
+
+    fixture.table.set_readonly("item", true).unwrap();
+    assert!(fixture.table.child_by_name("item").unwrap().fs.readonly());
+    assert_eq!(
+        errno(fixture.write(entry.inode, handle, b"refused")),
+        LINUX_EROFS
+    );
+    let mut attr: stat64 = unsafe { std::mem::zeroed() };
+    attr.st_size = 0;
+    assert_eq!(
+        errno(
+            fixture
+                .fs
+                .setattr(ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+        ),
+        LINUX_EROFS
+    );
+    assert_eq!(
+        errno(fixture.open(entry.inode, LINUX_O_WRONLY)),
+        LINUX_EROFS
+    );
+    assert_eq!(errno(fixture.fs.access(ctx(), entry.inode, 2)), LINUX_EROFS);
+    assert_eq!(fixture.read(entry.inode, handle).unwrap(), b"changed!");
+
+    fixture.table.set_readonly("item", false).unwrap();
+    fixture.write(entry.inode, handle, b"writable").unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"writable");
+}
+
+#[test]
+fn a_read_only_file_child_needs_only_read_access_on_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"secret");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    fixture.attach("secret", &file, true);
+    let entry = fixture.lookup(ROOT, "secret").unwrap();
+    let handle = fixture.open(entry.inode, 0).unwrap();
+    assert_eq!(fixture.read(entry.inode, handle).unwrap(), b"secret");
+    assert_eq!(errno(fixture.open(entry.inode, LINUX_O_RDWR)), LINUX_EROFS);
+}
+
+#[test]
+fn detaching_a_file_child_makes_its_inode_and_handles_stale() {
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"old");
+    fixture.attach("item", &file, false);
+    let entry = fixture.lookup(ROOT, "item").unwrap();
+    let handle = fixture.open(entry.inode, 0).unwrap();
+    let child = std::sync::Arc::downgrade(&fixture.table.child_by_name("item").unwrap());
+
+    fixture.table.detach("item").unwrap();
+    assert!(child.upgrade().is_none());
+    assert_eq!(fixture.root_names(), [".", ".."]);
+    assert_eq!(fixture.fs.request_error(entry.inode), Some(LINUX_ESTALE));
+    assert_eq!(errno(fixture.read(entry.inode, handle)), LINUX_ESTALE);
+    assert_eq!(
+        errno(fixture.fs.getattr(ctx(), entry.inode, None)),
+        LINUX_ESTALE
+    );
+    fixture.fs.forget(ctx(), entry.inode, 1);
+
+    // Re-attaching the name never aliases the old numbers.
+    replace_by_rename(&file, b"new");
+    fixture.attach("item", &file, false);
+    let fresh = fixture.lookup(ROOT, "item").unwrap();
+    assert_ne!(table::decode(fresh.inode).0, table::decode(entry.inode).0);
+    let handle = fixture.open(fresh.inode, 0).unwrap();
+    assert_eq!(fixture.read(fresh.inode, handle).unwrap(), b"new");
+}
+
+#[test]
+fn a_never_cached_file_child_uses_direct_io_and_zero_timeouts() {
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"value");
+    fixture
+        .table
+        .attach(MountTableChild {
+            cache_policy: CachePolicy::Never,
+            ..child("secret", &file, true)
+        })
+        .unwrap();
+    let entry = fixture.lookup(ROOT, "secret").unwrap();
+    assert_eq!(entry.entry_timeout, Duration::ZERO);
+    assert_eq!(entry.attr_timeout, Duration::ZERO);
+    let (_, options) = fixture.fs.open(ctx(), entry.inode, false, 0).unwrap();
+    assert!(options.contains(OpenOptions::DIRECT_IO));
+}
+
+#[test]
+fn a_file_child_whose_host_file_is_gone_is_left_out_of_listings() {
+    let mut fixture = Fixture::new();
+    let file = fixture.host_file(b"item");
+    let dir = fixture.host_dir();
+    fixture.attach("item", &file, false);
+    fixture.attach("dir", &dir, false);
+    std::fs::remove_file(&file).unwrap();
+
+    assert_eq!(errno(fixture.lookup(ROOT, "item")), LINUX_ENOENT);
+    let (plain, plus) = fixture.root_types();
+    assert_eq!(
+        plain,
+        [
+            (".".into(), DT_DIR),
+            ("..".into(), DT_DIR),
+            ("dir".into(), DT_DIR)
+        ]
+    );
+    assert_eq!(plus.len(), 1);
+    assert_eq!(fixture.table.names(), ["dir", "item"]);
+
+    // The file shows again once the host path exists.
+    std::fs::write(&file, b"back").unwrap();
+    let entry = fixture.lookup(ROOT, "item").unwrap();
+    let handle = fixture.open(entry.inode, 0).unwrap();
+    assert_eq!(fixture.read(entry.inode, handle).unwrap(), b"back");
+}
+
+fn kernel_refs(fixture: &Fixture, name: &str, guest_inode: u64) -> u64 {
+    let child = fixture.table.child_by_name(name).unwrap();
+    let super::table::ChildFs::File(fs) = &child.fs else {
+        panic!("{name} is not a file child");
+    };
+    fs.kernel_refs(table::decode(guest_inode).1)
+}
+
+#[test]
+fn root_readdirplus_releases_file_references_the_guest_never_receives() {
+    let mut fixture = Fixture::new();
+    let a = fixture.host_file(b"a");
+    let b = fixture.host_file(b"b");
+    fixture.attach("a", &a, false);
+    fixture.attach("b", &b, false);
+    let a_inode = fixture.lookup(ROOT, "a").unwrap().inode;
+    let b_inode = fixture.lookup(ROOT, "b").unwrap().inode;
+    fixture.fs.forget(ctx(), a_inode, 1);
+    fixture.fs.forget(ctx(), b_inode, 1);
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 0);
+
+    let readdirplus = |reply: &mut dyn FnMut(usize) -> io::Result<usize>| {
+        let (handle, _) = fixture.fs.opendir(ctx(), ROOT, 0).unwrap();
+        let handle = handle.unwrap();
+        let mut index = 0;
+        let result = fixture
+            .fs
+            .readdirplus_for_each(ctx(), ROOT, handle, 4096, 0, &mut |_, _| {
+                index += 1;
+                reply(index)
+            });
+        fixture.fs.releasedir(ctx(), ROOT, 0, handle).unwrap();
+        result
+    };
+
+    // Delivered entries keep their reference for the kernel to forget.
+    readdirplus(&mut |_| Ok(1)).unwrap();
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 1);
+    assert_eq!(kernel_refs(&fixture, "b", b_inode), 1);
+    fixture.fs.forget(ctx(), a_inode, 1);
+    fixture.fs.forget(ctx(), b_inode, 1);
+
+    // A full reply releases the entry it could not hold.
+    readdirplus(&mut |index| Ok(usize::from(index == 1))).unwrap();
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 1);
+    assert_eq!(kernel_refs(&fixture, "b", b_inode), 0);
+    fixture.fs.forget(ctx(), a_inode, 1);
+
+    // A failed reply is dropped whole, so every reference is released.
+    let error = readdirplus(&mut |index| {
+        if index == 2 {
+            Err(io::Error::from_raw_os_error(LINUX_EBADF))
+        } else {
+            Ok(1)
+        }
+    });
+    assert_eq!(errno(error), LINUX_EBADF);
+    assert_eq!(kernel_refs(&fixture, "a", a_inode), 0);
+    assert_eq!(kernel_refs(&fixture, "b", b_inode), 0);
+}
+
+#[test]
+fn only_directories_and_regular_files_are_children() {
+    let mut fixture = Fixture::new();
+    let dir = fixture.host_dir();
+    let fifo = dir.join("fifo");
+    let path = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let error = fixture
+        .table
+        .attach(child("fifo", &fifo, false))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+
+    let file = fixture.host_file(b"target");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(fixture.table.attach(child("link", &link, false)).is_err());
+    assert!(
+        fixture
+            .table
+            .attach(child("missing", &dir.join("missing"), false))
+            .is_err()
+    );
+    assert!(fixture.table.is_empty());
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests: owner
+//--------------------------------------------------------------------------------------------------
+
+const GUEST_UID: u32 = 4242;
+const GUEST_GID: u32 = 4343;
+
+fn guest_ctx() -> Context {
+    Context {
+        uid: GUEST_UID,
+        gid: GUEST_GID,
+        pid: 1,
+    }
+}
+
+fn owned(name: &str, host_path: &Path, stat_virtualization: StatVirtualization) -> MountTableChild {
+    MountTableChild {
+        stat_virtualization,
+        host_permissions: HostPermissions::Mirror,
+        owner: Some((GUEST_UID, GUEST_GID)),
+        ..child(name, host_path, false)
+    }
+}
+
+fn owner_of(stat: &stat64) -> (u32, u32) {
+    (stat.st_uid, stat.st_gid)
+}
+
+fn host_owner(path: &Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).unwrap();
+    (metadata.uid(), metadata.gid())
+}
+
+#[test]
+fn an_owner_presents_host_owned_entries_as_the_guest_owner() {
+    for stat_virtualization in [StatVirtualization::Strict, StatVirtualization::Relaxed] {
+        let mut fixture = Fixture::new();
+        let dir = fixture.host_dir();
+        std::fs::write(dir.join("from-host"), b"host").unwrap();
+        let file = fixture.host_file(b"item");
+        fixture
+            .table
+            .attach(owned("dir", &dir, stat_virtualization))
+            .unwrap();
+        fixture
+            .table
+            .attach(owned("item", &file, stat_virtualization))
+            .unwrap();
+
+        let root = fixture.lookup(ROOT, "dir").unwrap();
+        assert_eq!(owner_of(&root.attr), (GUEST_UID, GUEST_GID));
+        let from_host = fixture.lookup(root.inode, "from-host").unwrap();
+        assert_eq!(owner_of(&from_host.attr), (GUEST_UID, GUEST_GID));
+        let item = fixture.lookup(ROOT, "item").unwrap();
+        assert_eq!(owner_of(&item.attr), (GUEST_UID, GUEST_GID));
+        let (stat, _) = fixture.fs.getattr(ctx(), item.inode, None).unwrap();
+        assert_eq!(owner_of(&stat), (GUEST_UID, GUEST_GID));
+
+        // The guest owner may write; the host inode keeps this process's user.
+        assert!(fixture.fs.access(guest_ctx(), from_host.inode, 2).is_ok());
+        let (created, _, _) = fixture
+            .fs
+            .create(
+                guest_ctx(),
+                root.inode,
+                &cstr("from-guest"),
+                0o644,
+                false,
+                LINUX_O_RDWR,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(owner_of(&created.attr), (GUEST_UID, GUEST_GID));
+        let me = host_owner(&dir);
+        assert_eq!(host_owner(&dir.join("from-guest")), me);
+        assert_eq!(host_owner(&dir.join("from-host")), me);
+        assert_eq!(host_owner(&file), me);
+    }
+}
+
+#[test]
+fn without_an_owner_the_guest_sees_the_host_owner() {
+    let mut fixture = Fixture::new();
+    let dir = fixture.host_dir();
+    std::fs::write(dir.join("from-host"), b"host").unwrap();
+    fixture
+        .table
+        .attach(MountTableChild {
+            owner: None,
+            ..owned("dir", &dir, StatVirtualization::Relaxed)
+        })
+        .unwrap();
+    let root = fixture.lookup(ROOT, "dir").unwrap();
+    let file = fixture.lookup(root.inode, "from-host").unwrap();
+    assert_eq!(owner_of(&file.attr), host_owner(&dir.join("from-host")));
+}
+
+#[test]
+fn an_owner_requires_stat_virtualization() {
+    let mut fixture = Fixture::new();
+    let dir = fixture.host_dir();
+    let error = fixture
+        .table
+        .attach(owned("dir", &dir, StatVirtualization::Off))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    assert!(error.to_string().contains("owner"), "{error}");
 }

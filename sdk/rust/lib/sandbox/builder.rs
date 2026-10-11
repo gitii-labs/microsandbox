@@ -1209,8 +1209,8 @@ impl SandboxBuilder {
     }
 
     /// Serve a mount table at `spec.guest`: one directory whose children are
-    /// host directories attached, detached and switched between read-only and
-    /// read-write while the sandbox runs, through
+    /// host directories or regular host files attached, detached and switched
+    /// between read-only and read-write while the sandbox runs, through
     /// [`Sandbox::update_mounts`](super::Sandbox::update_mounts).
     ///
     /// `spec.children` are attached at launch. A sandbox with a mount table
@@ -5196,6 +5196,7 @@ mod tests {
             stat_virtualization: microsandbox_types::StatVirtualization::Strict,
             host_permissions: microsandbox_types::HostPermissions::Private,
             cache: microsandbox_types::MountTableCache::Auto,
+            owner: None,
         };
         let table = |guest: &str, children| microsandbox_types::MountTableSpec {
             guest: guest.into(),

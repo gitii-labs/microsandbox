@@ -500,25 +500,35 @@ pub enum MountTableCache {
     Never,
 }
 
-/// One child of a mount table: a guest-visible name over a host directory.
+/// One child of a mount table: a guest-visible name over a host directory or
+/// a regular host file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// A field this runtime does not know is refused rather than ignored.
+#[serde(deny_unknown_fields)]
 pub struct MountTableChild {
     /// Guest-visible name, one path component, unique within the table.
     pub name: String,
-    /// Absolute host directory. No component may be a symlink.
+    /// Absolute host directory or regular file; its type when the child is
+    /// attached selects the child kind. No component may be a symlink.
+    ///
+    /// A file child follows the path, not the inode: each guest lookup and
+    /// open resolves the host path again, so a file replaced by renaming a new
+    /// one into place shows the new content at the guest's next open, while
+    /// files the guest already holds open keep the replaced content.
     #[cfg_attr(feature = "ts", ts(type = "string"))]
     #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub host: PathBuf,
     /// Refuse every guest mutation, including writes through already open files.
     #[serde(default)]
     pub readonly: bool,
-    /// Guest-write byte budget for the directory; `None` is unlimited.
+    /// Guest-write byte budget for the directory or file; `None` is unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<u64>,
     /// Guest-visible metadata policy. `strict` needs writable `user.*` xattrs
-    /// on the host directory, even for a read-only child.
+    /// on a host directory, even for a read-only child, and on a host file
+    /// that starts read-write.
     pub stat_virtualization: StatVirtualization,
     /// Whether guest `chmod` and create modes reach the host inode. Defaults to `private`.
     #[serde(default = "private_host_permissions")]
@@ -526,6 +536,27 @@ pub struct MountTableChild {
     /// Guest caching policy.
     #[serde(default)]
     pub cache: MountTableCache,
+    /// Guest owner presented for entries the runtime's host user owns.
+    ///
+    /// Applies where an entry has no per-file stat override; entries owned by
+    /// another host user show as 65534. Host inodes are not changed: entries
+    /// the guest creates are owned by the runtime's host user, and the host
+    /// kernel checks every access against that user. Requires `strict` or
+    /// `relaxed` stat virtualization. `None` shows host owners unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<MountTableOwner>,
+}
+
+/// The guest uid and gid a mount-table child presents for host-owned entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MountTableOwner {
+    /// Guest user id.
+    pub uid: u32,
+    /// Guest group id.
+    pub gid: u32,
 }
 
 fn private_host_permissions() -> HostPermissions {

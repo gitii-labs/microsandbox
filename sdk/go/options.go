@@ -1837,7 +1837,10 @@ type MountConfig struct {
 }
 
 // MountOwner pins the guest owner presented for host files under a bind or named
-// mount that carry no per-file stat override (host-created files). Both fields
+// mount, or a mount-table child, that carry no per-file stat override
+// (host-created files). A bind or named mount shows every host owner as
+// MountOwner; a mount-table child shows only entries the runtime's host user
+// owns as MountOwner and others as 65534. Both fields
 // are required together; because uid 0 (root) is a valid value, this is passed
 // by pointer so that "unset" is distinct from "root".
 type MountOwner struct {

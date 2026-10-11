@@ -201,7 +201,7 @@ pub use microsandbox_types::{
 pub use microsandbox_types::{ExternalMountRestorePolicy, ExternalMountWarning};
 #[cfg(feature = "net")]
 pub use microsandbox_types::{MintEndpoint, OAuthSecret};
-pub use microsandbox_types::{MountTableCache, MountTableChild, MountTableSpec};
+pub use microsandbox_types::{MountTableCache, MountTableChild, MountTableOwner, MountTableSpec};
 #[cfg(feature = "local")]
 pub(crate) use restore_builder::RestoreBootOverrides;
 pub use restore_builder::RestoreBuilder;

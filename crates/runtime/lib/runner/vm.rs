@@ -3184,6 +3184,7 @@ pub(crate) fn mount_table_child(
                 microsandbox_filesystem::CachePolicy::Never
             }
         },
+        owner: child.owner.map(|owner| (owner.uid, owner.gid)),
     })
 }
 

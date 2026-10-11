@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         RwLock,
         atomic::{AtomicU64, Ordering},
@@ -30,6 +30,10 @@ mod mobility;
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
+
+/// The name a mount-table file child's synthetic root gives its file.
+#[cfg(unix)]
+pub(crate) const MOUNT_TABLE_FILE_NAME: &CStr = c"file";
 
 const ROOT_INODE: u64 = 1;
 const ROOT_HANDLE: u64 = 0;
@@ -78,17 +82,50 @@ impl SingleFileFs {
     /// The source is canonicalized once so the passthrough backend is anchored
     /// to a real parent directory. The guest-facing namespace is synthetic and
     /// never exposes that parent or any of its other entries.
-    pub fn new(
-        source: PathBuf,
-        guest_name: String,
-        mut cfg: PassthroughConfig,
-    ) -> io::Result<Self> {
+    pub fn new(source: PathBuf, guest_name: String, cfg: PassthroughConfig) -> io::Result<Self> {
         let source = std::fs::canonicalize(source)?;
         let metadata = std::fs::metadata(&source)?;
         if !metadata.is_file() {
             return Err(linux_error(LINUX_EISDIR));
         }
+        if guest_name.is_empty()
+            || guest_name == "."
+            || guest_name == ".."
+            || guest_name.contains('/')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "single-file guest name must be a normal path component",
+            ));
+        }
+        let guest_name = CString::new(guest_name)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "guest filename contains NUL")
+            })?
+            .into_bytes()
+            .into_boxed_slice();
+        // The backend lives for the VM lifetime. A stable name lets both
+        // vector and streaming readdir callbacks borrow it safely.
+        Self::open(&source, Box::leak(guest_name), cfg)
+    }
 
+    /// Create the backend of a mount-table file child.
+    ///
+    /// `source` must already be absolute and free of symlinks: the parent is
+    /// opened without following any component and the file itself is looked
+    /// up without following it. The synthetic root names the file
+    /// [`MOUNT_TABLE_FILE_NAME`]; the table presents it under its own name, so
+    /// attaching a child allocates no name for the VM's lifetime.
+    #[cfg(unix)]
+    pub(crate) fn for_mount_table(source: &Path, cfg: PassthroughConfig) -> io::Result<Self> {
+        Self::open(source, MOUNT_TABLE_FILE_NAME.to_bytes(), cfg)
+    }
+
+    fn open(
+        source: &Path,
+        guest_name: &'static [u8],
+        mut cfg: PassthroughConfig,
+    ) -> io::Result<Self> {
         let parent = source
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file has no parent"))?;
@@ -104,21 +141,10 @@ impl SingleFileFs {
             })?
             .to_string();
 
-        if guest_name.is_empty()
-            || guest_name == "."
-            || guest_name == ".."
-            || guest_name.contains('/')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "single-file guest name must be a normal path component",
-            ));
-        }
-
         cfg.root_dir = parent.to_path_buf();
         // The passthrough backend needs the parent as its namespace anchor,
         // but quota accounting must include only the selected file.
-        cfg.quota_root = Some(source.clone());
+        cfg.quota_root = Some(source.to_path_buf());
         cfg.no_symlink_root = true;
         cfg.inject_init = false;
         // The host may atomically replace the selected path. Positive dentry
@@ -138,24 +164,40 @@ impl SingleFileFs {
             io::Error::new(io::ErrorKind::InvalidInput, "host filename contains NUL")
         })?;
         let inner = PassthroughFs::new_with_stat_probe(cfg, Some(&inner_name))?;
-        let guest_name = CString::new(guest_name)
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "guest filename contains NUL")
-            })?
-            .into_bytes()
-            .into_boxed_slice();
 
         Ok(Self {
             inner,
             inner_name,
-            // The backend lives for the VM lifetime. A stable name lets both
-            // vector and streaming readdir callbacks borrow it safely.
-            guest_name: Box::leak(guest_name),
+            guest_name,
             current_inode: AtomicU64::new(0),
             lookup_refs: RwLock::new(HashMap::new()),
             open_handles: RwLock::new(HashMap::new()),
             checkpoint_remapped,
         })
+    }
+
+    /// Switch read-only enforcement for every later operation, including
+    /// writes through handles opened before the switch.
+    #[cfg(unix)]
+    pub fn set_readonly(&self, readonly: bool) {
+        self.inner.set_readonly(readonly);
+    }
+
+    /// Lookup references the guest kernel holds on `inode` and may forget.
+    #[cfg(all(unix, test))]
+    pub(crate) fn kernel_refs(&self, inode: u64) -> u64 {
+        self.lookup_refs
+            .read()
+            .unwrap()
+            .get(&inode)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether mutating guest operations are currently rejected.
+    #[cfg(all(unix, test))]
+    pub(crate) fn readonly(&self) -> bool {
+        self.inner.readonly()
     }
 
     /// Validate an external single-file checkpoint without opening destination paths.

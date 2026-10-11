@@ -22,28 +22,42 @@ const (
 )
 
 // MountTableChild is one child of a mount table: a guest-visible name over a
-// host directory.
+// host directory or a regular host file.
 type MountTableChild struct {
 	// Name is the guest-visible name, one path component, unique within the
 	// table.
 	Name string
-	// Host is the absolute host directory. No path component may be a
+	// Host is the absolute host directory or regular file; its type when the
+	// child is attached selects the child kind. No path component may be a
 	// symlink; resolve a symlinked prefix such as /var on macOS first.
+	//
+	// A file child follows the path, not the inode: each guest lookup and
+	// open resolves Host again, so a file the host replaces by renaming a new
+	// one into place shows the new content at the guest's next open. Files the
+	// guest already holds open keep the replaced content.
 	Host string
 	// Readonly refuses every guest mutation, including writes through files
 	// the guest opened before the child became read-only.
 	Readonly bool
-	// QuotaBytes bounds guest writes to the directory. Nil is unlimited.
+	// QuotaBytes bounds guest writes to the directory or file. Nil is
+	// unlimited.
 	QuotaBytes *uint64
 	// StatVirtualization is the guest-visible metadata policy. The zero value
-	// is Strict, which needs writable user.* xattrs on the host directory
-	// even for a read-only child.
+	// is Strict, which needs writable user.* xattrs on a host directory even
+	// for a read-only child, and on a host file that starts read-write.
 	StatVirtualization StatVirtualization
 	// HostPermissions selects whether guest chmod and create modes reach the
 	// host inode. The zero value is Private; Mirror copies ordinary rwx bits.
 	HostPermissions HostPermissions
 	// Cache is the guest caching policy. The zero value is Auto.
 	Cache MountTableCache
+	// Owner, when set, is the guest owner presented for entries the runtime's
+	// host user owns and that carry no per-file stat override; entries owned
+	// by another host user show as 65534. Host inodes are not changed: entries
+	// the guest creates are owned by the runtime's host user, and the host
+	// kernel checks every access against that user. Requires Strict or Relaxed
+	// stat virtualization. Nil shows host owners unchanged.
+	Owner *MountOwner
 }
 
 // Table returns a MountConfig that serves a mount table at its guest path:
@@ -130,6 +144,10 @@ func buildFFIMountTableChild(child MountTableChild) *ffi.MountTableChild {
 	if stat == StatVirtualizationDefault {
 		stat = StatVirtualizationStrict
 	}
+	var owner *ffi.MountTableOwner
+	if child.Owner != nil {
+		owner = &ffi.MountTableOwner{UID: child.Owner.UID, GID: child.Owner.GID}
+	}
 	return &ffi.MountTableChild{
 		Name:               child.Name,
 		Host:               child.Host,
@@ -138,5 +156,6 @@ func buildFFIMountTableChild(child MountTableChild) *ffi.MountTableChild {
 		StatVirtualization: string(stat),
 		HostPermissions:    string(child.HostPermissions),
 		Cache:              string(child.Cache),
+		Owner:              owner,
 	}
 }

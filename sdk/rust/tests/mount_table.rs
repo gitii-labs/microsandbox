@@ -3,7 +3,9 @@
 //! One VM serves a mount table with a disk-backed child and a tmpfs-backed
 //! child. The test attaches, switches and detaches children over the control
 //! socket while guest processes hold files and a working directory inside
-//! them. `#[ignore]`-gated via `#[msb_test]`; needs KVM (Linux) or
+//! them. A second VM serves file children, replaced on the host by rename,
+//! and children with an owner, written by a guest user whose uid differs
+//! from the host user's. `#[ignore]`-gated via `#[msb_test]`; needs KVM (Linux) or
 //! Hypervisor.framework (macOS):
 //!
 //!     cargo nextest run -p microsandbox --test mount_table --run-ignored=only
@@ -14,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use microsandbox::Sandbox;
 use microsandbox::sandbox::{
-    HostPermissions, MountChange, MountTableCache, MountTableChild, MountTableSpec,
-    StatVirtualization,
+    HostPermissions, MountChange, MountTableCache, MountTableChild, MountTableOwner,
+    MountTableSpec, StatVirtualization,
 };
 use test_utils::msb_test;
 
@@ -250,6 +252,200 @@ async fn mount_table_changes_apply_live_inside_the_guest() {
     let _ = Sandbox::remove(name).await;
 }
 
+/// Holds a write handle on the text file child and a read handle on the
+/// secret file child, then reports each operation's exit status after the
+/// host switches the text child to read-only and detaches the secret child.
+const FILE_HOLDER: &str = r#"
+set -u
+exec 3>>/mnt/distributed/text
+exec 4</mnt/distributed/secret
+printf abcd > /tmp/payload
+wait_for() { i=0; while [ ! -f "$1" ]; do i=$((i+1)); [ "$i" -gt 1200 ] && exit 1; sleep 0.05; done; }
+touch /tmp/ready
+
+wait_for /tmp/go-readonly
+dd if=/tmp/payload bs=4 count=1 1>&3 2>/tmp/text-write.err; echo "text_write=$?" >> /tmp/readonly
+touch /tmp/done-readonly
+
+wait_for /tmp/go-detach
+cat <&4 >/dev/null 2>/tmp/secret-read.err; echo "secret_read=$?" >> /tmp/detach
+touch /tmp/done-detach
+"#;
+
+/// The guest user that writes into owned children. It differs from the host
+/// user running the test, as uid 1000 in the guest differs from uid 501 on a
+/// macOS node.
+const AGENT_UID: u32 = 2000;
+
+#[msb_test]
+async fn mount_table_file_children_and_owners_inside_the_guest() {
+    let name = "mount-table-files";
+    let disk = HostDir::new(&disk_root());
+    let shm = HostDir::new(Path::new("/dev/shm"));
+    let text = disk.path.join("text");
+    std::fs::write(&text, b"first").unwrap();
+    let secret = shm.path.join("secret");
+    std::fs::write(&secret, b"s3cret").unwrap();
+    let host_uid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&text).unwrap().uid()
+    };
+    assert_ne!(
+        host_uid, AGENT_UID,
+        "the agent uid must differ from the host user"
+    );
+
+    let sandbox = Sandbox::builder(name)
+        .image(IMAGE)
+        .cpus(1)
+        .memory(512)
+        .replace()
+        .mount_table(MountTableSpec {
+            guest: ROOT.into(),
+            children: vec![file_child("text", &text, false, MountTableCache::Auto)],
+        })
+        .create()
+        .await
+        .expect("create sandbox with a file child");
+    sandbox
+        .attach_mount(file_child("secret", &secret, true, MountTableCache::Never))
+        .await
+        .expect("attach secret file child");
+
+    // Both children are regular files at the table root.
+    assert_eq!(sh(&sandbox, &format!("ls {ROOT}")).await, "secret\ntext");
+    assert_eq!(
+        sh(&sandbox, &format!("stat -c %F {ROOT}/text {ROOT}/secret")).await,
+        "regular file\nregular file"
+    );
+    assert_eq!(sh(&sandbox, &format!("cat {ROOT}/text")).await, "first");
+    assert_eq!(sh(&sandbox, &format!("cat {ROOT}/secret")).await, "s3cret");
+    let (ok, output) = sh_status(&sandbox, &format!("echo x > {ROOT}/secret")).await;
+    assert!(!ok && output.contains("Read-only file system"), "{output}");
+
+    // A guest write reaches the host file.
+    sh(&sandbox, &format!("printf guest > {ROOT}/text")).await;
+    assert_eq!(std::fs::read(&text).unwrap(), b"guest");
+
+    // The child follows the path: after the host renames a new file into
+    // place, the guest's next open shows the new content, each time.
+    for content in ["second", "third, and longer than before"] {
+        replace_by_rename(&text, content.as_bytes());
+        assert_eq!(sh(&sandbox, &format!("cat {ROOT}/text")).await, content);
+    }
+    replace_by_rename(&secret, b"rotated");
+    assert_eq!(sh(&sandbox, &format!("cat {ROOT}/secret")).await, "rotated");
+
+    // Switch the text child to read-only while a write handle is held, then
+    // detach the secret child while a read handle is held.
+    sh(
+        &sandbox,
+        &format!(
+            "cat > /tmp/holder.sh <<'EOF'\n{FILE_HOLDER}\nEOF\n\
+             setsid sh /tmp/holder.sh >/tmp/holder.log 2>&1 </dev/null &\n\
+             {}",
+            bounded_wait("/tmp/ready")
+        ),
+    )
+    .await;
+    sandbox
+        .set_mount_readonly("text", true)
+        .await
+        .expect("switch text child to read-only");
+    let readonly = run_step(&sandbox, "readonly").await;
+    assert!(readonly.contains("text_write=1"), "{readonly}");
+    let error = sh(&sandbox, "cat /tmp/text-write.err").await;
+    assert!(error.contains("Read-only file system"), "{error}");
+    assert_eq!(
+        std::fs::read(&text).unwrap(),
+        b"third, and longer than before"
+    );
+
+    sandbox
+        .detach_mount("secret")
+        .await
+        .expect("detach secret child");
+    assert_eq!(sh(&sandbox, &format!("ls {ROOT}")).await, "text");
+    let detach = run_step(&sandbox, "detach").await;
+    assert!(detach.contains("secret_read=1"), "{detach}");
+    let error = sh(&sandbox, "cat /tmp/secret-read.err").await;
+    assert!(error.contains("Stale file handle"), "{error}");
+
+    // Owner: host entries owned by the host user show as the agent, who can
+    // write them; the same directory without an owner refuses the agent.
+    let work = HostDir::new(&disk_root());
+    std::fs::write(work.path.join("existing"), b"host\n").unwrap();
+    let plain = HostDir::new(&disk_root());
+    let item = disk.path.join("item");
+    std::fs::write(&item, b"item\n").unwrap();
+    let owner = Some(MountTableOwner {
+        uid: AGENT_UID,
+        gid: AGENT_UID,
+    });
+    sandbox
+        .update_mounts(vec![
+            MountChange::Attach {
+                child: MountTableChild {
+                    owner,
+                    ..file_child("work", &work.path, false, MountTableCache::Auto)
+                },
+            },
+            MountChange::Attach {
+                child: MountTableChild {
+                    owner,
+                    ..file_child("item", &item, false, MountTableCache::Auto)
+                },
+            },
+            MountChange::Attach {
+                child: file_child("plain", &plain.path, false, MountTableCache::Auto),
+            },
+        ])
+        .await
+        .expect("attach owned children");
+    let agent = format!("{AGENT_UID}:{AGENT_UID}");
+    let owners = sh_as(
+        &sandbox,
+        &agent,
+        &format!(
+            "set -e; cd {ROOT}; echo guest > work/new; echo more >> work/existing; \
+             mkdir work/sub; echo nested > work/sub/file; echo agent >> item; \
+             stat -c %u:%g work work/existing work/new work/sub/file item"
+        ),
+    )
+    .await;
+    assert_eq!(owners, [agent.as_str(); 5].join("\n"));
+    let (ok, output) = sh_status_as(&sandbox, &agent, &format!("echo x > {ROOT}/plain/new")).await;
+    assert!(!ok && output.contains("Permission denied"), "{output}");
+    assert_eq!(
+        sh(&sandbox, &format!("stat -c %u {ROOT}/plain")).await,
+        host_uid.to_string()
+    );
+
+    // The host files keep the host user as owner, created ones included.
+    for path in [
+        work.path.join("new"),
+        work.path.join("existing"),
+        work.path.join("sub/file"),
+        item.clone(),
+    ] {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().uid(),
+            host_uid,
+            "{path:?}"
+        );
+    }
+    assert_eq!(std::fs::read(work.path.join("new")).unwrap(), b"guest\n");
+    assert_eq!(
+        std::fs::read(work.path.join("existing")).unwrap(),
+        b"host\nmore\n"
+    );
+    assert_eq!(std::fs::read(&item).unwrap(), b"item\nagent\n");
+
+    sandbox.stop_and_wait().await.expect("stop");
+    let _ = Sandbox::remove(name).await;
+}
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -286,7 +482,43 @@ fn child(name: &str, host: &Path, readonly: bool, cache: MountTableCache) -> Mou
         stat_virtualization: StatVirtualization::Strict,
         host_permissions: HostPermissions::Mirror,
         cache,
+        owner: None,
     }
+}
+
+/// A child as Distributed attaches one: relaxed stat virtualization, mirrored
+/// host permissions.
+fn file_child(name: &str, host: &Path, readonly: bool, cache: MountTableCache) -> MountTableChild {
+    MountTableChild {
+        stat_virtualization: StatVirtualization::Relaxed,
+        ..child(name, host, readonly, cache)
+    }
+}
+
+/// Replace `path` the way the node does: write a sibling, rename it into place.
+fn replace_by_rename(path: &Path, content: &[u8]) {
+    let staged = path.with_extension("staged");
+    std::fs::write(&staged, content).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+async fn sh_as(sandbox: &Sandbox, user: &str, script: &str) -> String {
+    let (ok, output) = sh_status_as(sandbox, user, script).await;
+    assert!(ok, "guest command as {user} failed: {script}\n{output}");
+    output
+}
+
+async fn sh_status_as(sandbox: &Sandbox, user: &str, script: &str) -> (bool, String) {
+    let output = sandbox
+        .shell_with(script, |exec| exec.user(user))
+        .await
+        .expect("exec");
+    let text = format!(
+        "{}{}",
+        output.stdout().unwrap_or_default(),
+        output.stderr().unwrap_or_default()
+    );
+    (output.status().success, text.trim().to_string())
 }
 
 async fn sh(sandbox: &Sandbox, script: &str) -> String {

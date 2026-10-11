@@ -12,8 +12,8 @@ import (
 )
 
 // TestMountTableLiveChanges drives a mount table through the Go SDK: a launch
-// child, a live attach, a read-only switch and a detach, each observed from
-// inside the guest without a restart.
+// child, a live attach, a read-only switch, a detach and a file child with an
+// owner, each observed from inside the guest without a restart.
 func TestMountTableLiveChanges(t *testing.T) {
 	ctx := integrationCtx(t)
 	name := "go-sdk-mount-table"
@@ -89,6 +89,31 @@ func TestMountTableLiveChanges(t *testing.T) {
 	}
 	if err := sb.DetachMount(ctx, "attached"); err == nil {
 		t.Fatal("detaching a missing child must fail")
+	}
+	// A file child with an owner: the host file shows as the owner, and a
+	// file the host renames into place shows at the guest's next open.
+	item := filepath.Join(canonicalTempDir(t), "item")
+	if err := os.WriteFile(item, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.AttachMount(ctx, microsandbox.MountTableChild{
+		Name: "item", Host: item, StatVirtualization: microsandbox.StatVirtualizationRelaxed,
+		Owner: &microsandbox.MountOwner{UID: 2000, GID: 2001},
+	}); err != nil {
+		t.Fatalf("AttachMount file child: %v", err)
+	}
+	if got := mustShell("stat -c '%F %u:%g' /mnt/distributed/item"); got != "regular file 2000:2001" {
+		t.Fatalf("file child stat = %q", got)
+	}
+	staged := item + ".staged"
+	if err := os.WriteFile(staged, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(staged, item); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustShell("cat /mnt/distributed/item"); got != "second" {
+		t.Fatalf("file child content after rename = %q", got)
 	}
 }
 
