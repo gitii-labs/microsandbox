@@ -15,6 +15,10 @@ func TestFFIWireShape_MountTable(t *testing.T) {
 				StatVirtualization: StatVirtualizationOff, HostPermissions: HostPermissionsMirror,
 				Cache: MountTableCacheNever,
 			},
+			MountTableChild{
+				Name: "item", Host: "/srv/items/item", StatVirtualization: StatVirtualizationRelaxed,
+				Owner: &MountOwner{UID: 1000, GID: 1001},
+			},
 		),
 		"/tmp": Mount.Tmpfs(TmpfsOptions{SizeMiB: 16}),
 	}))
@@ -23,7 +27,7 @@ func TestFFIWireShape_MountTable(t *testing.T) {
 		t.Fatalf("guest = %v", table["guest"])
 	}
 	children := table["children"].([]any)
-	if len(children) != 2 {
+	if len(children) != 3 {
 		t.Fatalf("children = %v", children)
 	}
 	data := children[0].(map[string]any)
@@ -35,11 +39,19 @@ func TestFFIWireShape_MountTable(t *testing.T) {
 	if _, ok := data["quota_bytes"]; ok {
 		t.Fatalf("an unlimited child must omit quota_bytes: %v", data)
 	}
+	if _, ok := data["owner"]; ok {
+		t.Fatalf("a child without an owner must omit owner: %v", data)
+	}
 	secret := children[1].(map[string]any)
 	if secret["readonly"] != true || secret["quota_bytes"] != float64(4096) ||
 		secret["stat_virtualization"] != "off" || secret["host_permissions"] != "mirror" ||
 		secret["cache"] != "never" {
 		t.Fatalf("secret child = %v", secret)
+	}
+	item := children[2].(map[string]any)
+	owner, ok := item["owner"].(map[string]any)
+	if item["host"] != "/srv/items/item" || !ok || owner["uid"] != float64(1000) || owner["gid"] != float64(1001) {
+		t.Fatalf("item child = %v", item)
 	}
 	// The table is not a volume.
 	volumes := mustField(t, got, "volumes").(map[string]any)

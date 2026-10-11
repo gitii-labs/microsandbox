@@ -1876,13 +1876,20 @@ type MountTableSpec struct {
 
 // MountTableChild is the JSON representation of one mount-table child.
 type MountTableChild struct {
-	Name               string  `json:"name"`
-	Host               string  `json:"host"`
-	Readonly           bool    `json:"readonly"`
-	QuotaBytes         *uint64 `json:"quota_bytes,omitempty"`
-	StatVirtualization string  `json:"stat_virtualization"`
-	HostPermissions    string  `json:"host_permissions,omitempty"`
-	Cache              string  `json:"cache,omitempty"`
+	Name               string           `json:"name"`
+	Host               string           `json:"host"`
+	Readonly           bool             `json:"readonly"`
+	QuotaBytes         *uint64          `json:"quota_bytes,omitempty"`
+	StatVirtualization string           `json:"stat_virtualization"`
+	HostPermissions    string           `json:"host_permissions,omitempty"`
+	Cache              string           `json:"cache,omitempty"`
+	Owner              *MountTableOwner `json:"owner,omitempty"`
+}
+
+// MountTableOwner is the JSON representation of a mount-table child's guest owner.
+type MountTableOwner struct {
+	UID uint32 `json:"uid"`
+	GID uint32 `json:"gid"`
 }
 
 // InitOptions describes a guest PID-1 init handoff.
