@@ -4,15 +4,19 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     path::PathBuf,
-    sync::{Arc, RwLock, RwLockReadGuard},
+    sync::{Arc, OnceLock, RwLock, RwLockReadGuard},
     time::Duration,
 };
 
 use super::MountTableFs;
 use crate::{
     DynFileSystem, FsOptions,
-    backends::passthroughfs::{
-        CachePolicy, HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,
+    backends::{
+        passthroughfs::{
+            BindIdentityMap, CachePolicy, HostPermissions, PassthroughConfig, PassthroughFs,
+            StatVirtualization,
+        },
+        singlefilefs::SingleFileFs,
     },
 };
 
@@ -41,28 +45,37 @@ pub(super) const LINUX_ESTALE: i32 = 116;
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// One child to attach: a guest-visible name over a host directory.
+/// One child to attach: a guest-visible name over a host directory or a
+/// regular host file.
 #[derive(Debug, Clone)]
 pub struct MountTableChild {
     /// Guest-visible name, one path component.
     pub name: String,
 
-    /// Absolute, symlink-free host directory. Every path component is opened
-    /// without following symlinks, so callers canonicalize a legitimately
-    /// symlinked prefix (such as `/var` on macOS) first.
+    /// Absolute, symlink-free host directory or regular file; its type at
+    /// attach selects the child kind. Every path component is opened without
+    /// following symlinks, so callers canonicalize a legitimately symlinked
+    /// prefix (such as `/var` on macOS) first.
+    ///
+    /// A file child follows the path, not the inode: every guest lookup and
+    /// open resolves the host path again, so a file the host replaces by
+    /// renaming a new one into place shows the new content at the guest's
+    /// next open. Files the guest already holds open keep the replaced inode.
     pub host_path: PathBuf,
 
     /// Whether the child starts read-only. [`MountTable::set_readonly`] changes it later.
     pub readonly: bool,
 
-    /// Guest-write byte budget for the child's directory; `None` is unlimited.
+    /// Guest-write byte budget for the child's directory or file; `None` is unlimited.
     pub quota_bytes: Option<u64>,
 
     /// Guest-visible metadata policy.
     ///
-    /// [`StatVirtualization::Strict`] requires writable `user.*` xattrs on the
-    /// host directory even for a read-only child, because the child can be
-    /// switched to read-write later.
+    /// [`StatVirtualization::Strict`] requires writable `user.*` xattrs on a
+    /// directory child even when it is read-only, because the child can be
+    /// switched to read-write later. A file child is probed for the access it
+    /// starts with: a read-only file child needs readable xattrs only, and a
+    /// read-write one must be writable by this process.
     pub stat_virtualization: StatVirtualization,
 
     /// Whether guest permission changes reach the host inode.
@@ -71,6 +84,17 @@ pub struct MountTableChild {
     /// Guest caching. [`CachePolicy::Never`] also sets zero entry and
     /// attribute timeouts, for content that must not linger in guest memory.
     pub cache_policy: CachePolicy,
+
+    /// Guest `(uid, gid)` presented for entries this process owns on the host.
+    ///
+    /// Applies where an entry carries no per-file stat override; entries
+    /// owned by any other host user show as 65534. The host inodes are not
+    /// changed: guest-created entries are created by this process and owned
+    /// by its user, and the host kernel still checks every access against
+    /// that user. Only the owner the guest sees is rewritten, so a guest user
+    /// with this uid passes the guest kernel's permission checks on files the
+    /// node owns. Requires stat virtualization (`Strict` or `Relaxed`).
+    pub owner: Option<(u32, u32)>,
 }
 
 /// Shared handle to a mount table.
@@ -104,7 +128,16 @@ pub(super) struct Children {
 /// One attached child backend.
 pub(super) struct Child {
     pub(super) id: u64,
-    pub(super) fs: PassthroughFs,
+    pub(super) fs: ChildFs,
+}
+
+/// A child's backend, by the kind of its host path.
+pub(super) enum ChildFs {
+    /// A host directory; the child root is the directory itself.
+    Directory(PassthroughFs),
+    /// A regular host file behind a synthetic directory that holds only it;
+    /// the child root is the file.
+    File(SingleFileFs),
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -124,8 +157,10 @@ impl MountTable {
 
     /// Attach a child under a new name.
     ///
-    /// Fails with `EEXIST` when the name is attached and `EINVAL` when it is
-    /// not one path component. The child's inode numbers carry an attachment
+    /// Fails with `EEXIST` when the name is attached, and with `EINVAL` when
+    /// it is not one path component, when the host path is neither a
+    /// directory nor a regular file, or when an owner is given without stat
+    /// virtualization. The child's inode numbers carry an attachment
     /// id that is never reused, so a name detached and attached again never
     /// resolves to the inodes the guest holds from the earlier attachment.
     pub fn attach(&self, child: MountTableChild) -> io::Result<()> {
@@ -141,39 +176,11 @@ impl MountTable {
             return Err(name_error(LINUX_EEXIST, &child.name, "is already attached"));
         }
 
-        let timeout = match child.cache_policy {
-            CachePolicy::Never => Duration::ZERO,
-            CachePolicy::Auto | CachePolicy::Always => PassthroughConfig::default().attr_timeout,
-        };
-        let cfg = PassthroughConfig {
-            root_dir: child.host_path.clone(),
-            no_symlink_root: true,
-            stat_virtualization: child.stat_virtualization,
-            host_permissions: child.host_permissions,
-            // Probe for the strongest access the child can later be switched to.
-            readonly: false,
-            entry_timeout: timeout,
-            attr_timeout: timeout,
-            cache_policy: child.cache_policy,
-            writeback: false,
-            inject_init: false,
-            quota_bytes: child.quota_bytes,
-            ..Default::default()
-        };
-        let fs = PassthroughFs::new(cfg).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "mount {:?}: cannot open host directory {}: {error}",
-                    child.name,
-                    child.host_path.display()
-                ),
-            )
-        })?;
+        let fs = open_child(&child)?;
         fs.set_readonly(child.readonly);
         // Registers the child's root inode. The negotiated options belong to
         // the table device; a child never enables writeback caching.
-        fs.init(FsOptions::empty())?;
+        fs.as_dyn().init(FsOptions::empty())?;
 
         let mut children = self.state.children.write().unwrap();
         if children.by_name.contains_key(&child.name) {
@@ -289,9 +296,115 @@ impl MountTable {
     }
 }
 
+impl ChildFs {
+    pub(super) fn as_dyn(&self) -> &dyn DynFileSystem {
+        match self {
+            Self::Directory(fs) => fs,
+            Self::File(fs) => fs,
+        }
+    }
+
+    pub(super) fn set_readonly(&self, readonly: bool) {
+        match self {
+            Self::Directory(fs) => fs.set_readonly(readonly),
+            Self::File(fs) => fs.set_readonly(readonly),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn readonly(&self) -> bool {
+        match self {
+            Self::Directory(fs) => fs.readonly(),
+            Self::File(fs) => fs.readonly(),
+        }
+    }
+
+    pub(super) fn is_file(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+/// Open the backend for a child, by the type of its host path.
+fn open_child(child: &MountTableChild) -> io::Result<ChildFs> {
+    let open_error = |what: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "mount {:?}: cannot open host {what} {}: {error}",
+                child.name,
+                child.host_path.display()
+            ),
+        )
+    };
+    // Does not follow a symlink at the last component; the backends refuse
+    // symlinks in the other components when they open the path.
+    let metadata =
+        std::fs::symlink_metadata(&child.host_path).map_err(|error| open_error("path", error))?;
+    let timeout = match child.cache_policy {
+        CachePolicy::Never => Duration::ZERO,
+        CachePolicy::Auto | CachePolicy::Always => PassthroughConfig::default().attr_timeout,
+    };
+    let bind_identity_map = match child.owner {
+        None => None,
+        // Caller validation: without stat virtualization the backend shows
+        // raw host metadata and has no place to apply the map.
+        Some(_) if matches!(child.stat_virtualization, StatVirtualization::Off) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "mount {:?}: an owner requires stat virtualization strict or relaxed",
+                    child.name
+                ),
+            ));
+        }
+        Some((uid, gid)) => {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let host_uid = unsafe { libc::geteuid() };
+            Some(Arc::new(OnceLock::from(BindIdentityMap::new(
+                host_uid, uid, gid,
+            ))))
+        }
+    };
+    let cfg = PassthroughConfig {
+        root_dir: child.host_path.clone(),
+        no_symlink_root: true,
+        stat_virtualization: child.stat_virtualization,
+        host_permissions: child.host_permissions,
+        // A directory is probed for the strongest access the child can later
+        // be switched to; see `MountTableChild::stat_virtualization`.
+        readonly: metadata.is_file() && child.readonly,
+        entry_timeout: timeout,
+        attr_timeout: timeout,
+        cache_policy: child.cache_policy,
+        writeback: false,
+        inject_init: false,
+        quota_bytes: child.quota_bytes,
+        bind_identity_map,
+        ..Default::default()
+    };
+    if metadata.is_dir() {
+        PassthroughFs::new(cfg)
+            .map(ChildFs::Directory)
+            .map_err(|error| open_error("directory", error))
+    } else if metadata.is_file() {
+        SingleFileFs::for_mount_table(&child.host_path, cfg)
+            .map(ChildFs::File)
+            .map_err(|error| open_error("file", error))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "mount {:?}: host path {} is neither a directory nor a regular file",
+                child.name,
+                child.host_path.display()
+            ),
+        ))
+    }
+}
 
 /// Combine an attachment id and a child-local inode or handle number.
 pub(super) fn encode(id: u64, inner: u64) -> io::Result<u64> {

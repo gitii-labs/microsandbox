@@ -18,6 +18,7 @@ use std::{
 };
 
 use super::table::{self, Child, LINUX_ENOENT, LINUX_ESTALE, MountTable};
+use crate::backends::singlefilefs::MOUNT_TABLE_FILE_NAME;
 use crate::{
     AddDirEntry, AddDirEntryPlus, Context, DirEntry, DynFileSystem, Entry, Extensions, FsOptions,
     GetxattrReply, ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
@@ -32,6 +33,7 @@ const ROOT_INODE: u64 = 1;
 const CHILD_ROOT_INODE: u64 = 1;
 
 const DT_DIR: u32 = 4;
+const DT_REG: u32 = 8;
 const S_IFDIR: u32 = 0o040000;
 const ACCESS_W_OK: u32 = 2;
 
@@ -158,17 +160,46 @@ impl MountTableFs {
             .transpose()
     }
 
-    /// The root's entry for a child: its root inode, never cached by the guest.
+    /// The root's entry for a child, never cached by the guest.
+    ///
+    /// A directory child's entry is its pinned root inode, which carries no
+    /// lookup reference. A file child's entry is a lookup of the file at its
+    /// host path, so each call follows a file replaced by rename; the guest
+    /// kernel forgets that reference like any other lookup.
     fn child_root_entry(&self, ctx: Context, child: &Child) -> io::Result<Entry> {
-        let (attr, _) = child.fs.getattr(ctx, CHILD_ROOT_INODE, None)?;
-        Ok(Entry {
-            inode: table::encode(child.id, CHILD_ROOT_INODE)?,
-            attr: guest_stat(child, attr)?,
-            generation: 0,
-            attr_flags: 0,
-            attr_timeout: Duration::ZERO,
-            entry_timeout: Duration::ZERO,
-        })
+        let mut entry = match &child.fs {
+            table::ChildFs::Directory(fs) => {
+                let (attr, _) = fs.getattr(ctx, CHILD_ROOT_INODE, None)?;
+                Entry {
+                    inode: CHILD_ROOT_INODE,
+                    attr,
+                    generation: 0,
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                }
+            }
+            table::ChildFs::File(fs) => fs.lookup(ctx, CHILD_ROOT_INODE, MOUNT_TABLE_FILE_NAME)?,
+        };
+        entry.attr_timeout = Duration::ZERO;
+        entry.entry_timeout = Duration::ZERO;
+        self.guest_entry(child, entry)
+    }
+
+    /// A child's `st_ino` and directory entry type for a plain root readdir,
+    /// which creates no lookup reference.
+    fn child_root_dirent(&self, ctx: Context, child: &Child) -> io::Result<(u64, u32)> {
+        match &child.fs {
+            table::ChildFs::Directory(fs) => {
+                let (attr, _) = fs.getattr(ctx, CHILD_ROOT_INODE, None)?;
+                Ok((guest_ino(child, attr.st_ino)?, DT_DIR))
+            }
+            table::ChildFs::File(fs) => {
+                let entry = fs.lookup(ctx, CHILD_ROOT_INODE, MOUNT_TABLE_FILE_NAME)?;
+                fs.forget(ctx, entry.inode, 1);
+                Ok((guest_ino(child, entry.attr.st_ino)?, DT_REG))
+            }
+        }
     }
 }
 
@@ -198,7 +229,7 @@ impl DynFileSystem for MountTableFs {
         }
         let _op = self.table.begin();
         match self.table.child_by_id(id) {
-            Some(child) => child.fs.request_error(local),
+            Some(child) => child.fs.as_dyn().request_error(local),
             // Detached: the guest still holds this inode or handle.
             None => Some(LINUX_ESTALE),
         }
@@ -207,7 +238,7 @@ impl DynFileSystem for MountTableFs {
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         // A remount after destroy needs every child's root registered again.
         for child in self.table.all() {
-            child.fs.init(FsOptions::empty())?;
+            child.fs.as_dyn().init(FsOptions::empty())?;
         }
         // The options a passthrough child negotiates without writeback caching,
         // plus data invalidation: the host changes child contents directly.
@@ -225,7 +256,7 @@ impl DynFileSystem for MountTableFs {
     fn destroy(&self) {
         self.root_handles.lock().unwrap().clear();
         for child in self.table.all() {
-            child.fs.destroy();
+            child.fs.as_dyn().destroy();
         }
     }
 
@@ -240,21 +271,23 @@ impl DynFileSystem for MountTableFs {
             return self.child_root_entry(ctx, &child);
         }
         let target = self.target(parent)?;
-        let entry = target.child.fs.lookup(ctx, target.inode, name)?;
+        let entry = target.child.fs.as_dyn().lookup(ctx, target.inode, name)?;
         self.guest_entry(&target.child, entry)
     }
 
     fn forget(&self, ctx: Context, inode: u64, count: u64) {
         let (id, local) = table::decode(inode);
-        // The child root is pinned by its backend and never looked up through
-        // it, so its forgets carry no backend reference. A forget for a
+        // A directory child's root is pinned by its backend and never looked
+        // up through it, so its forgets carry no backend reference. Local
+        // inode 1 of a file child is the synthetic directory the guest is
+        // never given. A forget for a
         // detached child has nothing left to release.
         if id == 0 || local == CHILD_ROOT_INODE {
             return;
         }
         let _op = self.table.begin();
         if let Some(child) = self.table.child_by_id(id) {
-            child.fs.forget(ctx, local, count);
+            child.fs.as_dyn().forget(ctx, local, count);
         }
     }
 
@@ -269,7 +302,7 @@ impl DynFileSystem for MountTableFs {
         let _op = self.table.begin();
         for (id, requests) in by_child {
             if let Some(child) = self.table.child_by_id(id) {
-                child.fs.batch_forget(ctx, requests);
+                child.fs.as_dyn().batch_forget(ctx, requests);
             }
         }
     }
@@ -281,11 +314,21 @@ impl DynFileSystem for MountTableFs {
         handle: Option<u64>,
     ) -> io::Result<(stat64, Duration)> {
         if inode == ROOT_INODE {
-            return Ok((root_stat(self.table.entries().len()), Duration::ZERO));
+            let directories = self
+                .table
+                .all()
+                .iter()
+                .filter(|child| !child.fs.is_file())
+                .count();
+            return Ok((root_stat(directories), Duration::ZERO));
         }
         let target = self.target(inode)?;
         let handle = handle.map(|h| self.handle(&target, h)).transpose()?;
-        let (attr, timeout) = target.child.fs.getattr(ctx, target.inode, handle)?;
+        let (attr, timeout) = target
+            .child
+            .fs
+            .as_dyn()
+            .getattr(ctx, target.inode, handle)?;
         Ok((guest_stat(&target.child, attr)?, timeout))
     }
 
@@ -302,10 +345,12 @@ impl DynFileSystem for MountTableFs {
         }
         let target = self.target(inode)?;
         let handle = handle.map(|h| self.handle(&target, h)).transpose()?;
-        let (attr, timeout) = target
-            .child
-            .fs
-            .setattr(ctx, target.inode, attr, handle, valid)?;
+        let (attr, timeout) =
+            target
+                .child
+                .fs
+                .as_dyn()
+                .setattr(ctx, target.inode, attr, handle, valid)?;
         Ok((guest_stat(&target.child, attr)?, timeout))
     }
 
@@ -314,7 +359,7 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EINVAL));
         }
         let target = self.target(inode)?;
-        target.child.fs.readlink(ctx, target.inode)
+        target.child.fs.as_dyn().readlink(ctx, target.inode)
     }
 
     fn symlink(
@@ -329,10 +374,12 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        let entry = target
-            .child
-            .fs
-            .symlink(ctx, linkname, target.inode, name, extensions)?;
+        let entry =
+            target
+                .child
+                .fs
+                .as_dyn()
+                .symlink(ctx, linkname, target.inode, name, extensions)?;
         self.guest_entry(&target.child, entry)
     }
 
@@ -350,11 +397,15 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        let entry =
-            target
-                .child
-                .fs
-                .mknod(ctx, target.inode, name, mode, rdev, umask, extensions)?;
+        let entry = target.child.fs.as_dyn().mknod(
+            ctx,
+            target.inode,
+            name,
+            mode,
+            rdev,
+            umask,
+            extensions,
+        )?;
         self.guest_entry(&target.child, entry)
     }
 
@@ -371,10 +422,12 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        let entry = target
-            .child
-            .fs
-            .mkdir(ctx, target.inode, name, mode, umask, extensions)?;
+        let entry =
+            target
+                .child
+                .fs
+                .as_dyn()
+                .mkdir(ctx, target.inode, name, mode, umask, extensions)?;
         self.guest_entry(&target.child, entry)
     }
 
@@ -383,7 +436,7 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        target.child.fs.unlink(ctx, target.inode, name)
+        target.child.fs.as_dyn().unlink(ctx, target.inode, name)
     }
 
     fn rmdir(&self, ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
@@ -391,7 +444,7 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        target.child.fs.rmdir(ctx, target.inode, name)
+        target.child.fs.as_dyn().rmdir(ctx, target.inode, name)
     }
 
     fn rename(
@@ -409,6 +462,7 @@ impl DynFileSystem for MountTableFs {
         let (old, new_local) = self.same_child(olddir, newdir)?;
         old.child
             .fs
+            .as_dyn()
             .rename(ctx, old.inode, oldname, new_local, newname, flags)
     }
 
@@ -420,6 +474,7 @@ impl DynFileSystem for MountTableFs {
         let entry = source
             .child
             .fs
+            .as_dyn()
             .link(ctx, source.inode, parent_local, newname)?;
         self.guest_entry(&source.child, entry)
     }
@@ -435,7 +490,12 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EISDIR));
         }
         let target = self.target(inode)?;
-        let (handle, options) = target.child.fs.open(ctx, target.inode, kill_priv, flags)?;
+        let (handle, options) =
+            target
+                .child
+                .fs
+                .as_dyn()
+                .open(ctx, target.inode, kill_priv, flags)?;
         Ok((self.guest_handle(&target.child, handle)?, options))
     }
 
@@ -454,7 +514,7 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        let (entry, handle, options) = target.child.fs.create(
+        let (entry, handle, options) = target.child.fs.as_dyn().create(
             ctx,
             target.inode,
             name,
@@ -484,7 +544,7 @@ impl DynFileSystem for MountTableFs {
     ) -> io::Result<usize> {
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
-        target.child.fs.read(
+        target.child.fs.as_dyn().read(
             ctx,
             target.inode,
             handle,
@@ -511,7 +571,7 @@ impl DynFileSystem for MountTableFs {
     ) -> io::Result<usize> {
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
-        target.child.fs.write(
+        target.child.fs.as_dyn().write(
             ctx,
             target.inode,
             handle,
@@ -528,13 +588,21 @@ impl DynFileSystem for MountTableFs {
     fn flush(&self, ctx: Context, inode: u64, handle: u64, lock_owner: u64) -> io::Result<()> {
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
-        target.child.fs.flush(ctx, target.inode, handle, lock_owner)
+        target
+            .child
+            .fs
+            .as_dyn()
+            .flush(ctx, target.inode, handle, lock_owner)
     }
 
     fn fsync(&self, ctx: Context, inode: u64, datasync: bool, handle: u64) -> io::Result<()> {
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
-        target.child.fs.fsync(ctx, target.inode, datasync, handle)
+        target
+            .child
+            .fs
+            .as_dyn()
+            .fsync(ctx, target.inode, datasync, handle)
     }
 
     fn fallocate(
@@ -551,6 +619,7 @@ impl DynFileSystem for MountTableFs {
         target
             .child
             .fs
+            .as_dyn()
             .fallocate(ctx, target.inode, handle, mode, offset, length)
     }
 
@@ -566,7 +635,7 @@ impl DynFileSystem for MountTableFs {
     ) -> io::Result<()> {
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
-        target.child.fs.release(
+        target.child.fs.as_dyn().release(
             ctx,
             target.inode,
             flags,
@@ -586,7 +655,7 @@ impl DynFileSystem for MountTableFs {
             return Ok(st);
         }
         let target = self.target(inode)?;
-        target.child.fs.statfs(ctx, target.inode)
+        target.child.fs.as_dyn().statfs(ctx, target.inode)
     }
 
     fn setxattr(
@@ -604,6 +673,7 @@ impl DynFileSystem for MountTableFs {
         target
             .child
             .fs
+            .as_dyn()
             .setxattr(ctx, target.inode, name, value, flags)
     }
 
@@ -618,7 +688,11 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_ENODATA));
         }
         let target = self.target(inode)?;
-        target.child.fs.getxattr(ctx, target.inode, name, size)
+        target
+            .child
+            .fs
+            .as_dyn()
+            .getxattr(ctx, target.inode, name, size)
     }
 
     fn listxattr(&self, ctx: Context, inode: u64, size: u32) -> io::Result<ListxattrReply> {
@@ -630,7 +704,7 @@ impl DynFileSystem for MountTableFs {
             });
         }
         let target = self.target(inode)?;
-        target.child.fs.listxattr(ctx, target.inode, size)
+        target.child.fs.as_dyn().listxattr(ctx, target.inode, size)
     }
 
     fn removexattr(&self, ctx: Context, inode: u64, name: &CStr) -> io::Result<()> {
@@ -638,7 +712,11 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EPERM));
         }
         let target = self.target(inode)?;
-        target.child.fs.removexattr(ctx, target.inode, name)
+        target
+            .child
+            .fs
+            .as_dyn()
+            .removexattr(ctx, target.inode, name)
     }
 
     fn opendir(
@@ -656,7 +734,7 @@ impl DynFileSystem for MountTableFs {
             return Ok((Some(table::encode(0, handle)?), OpenOptions::empty()));
         }
         let target = self.target(inode)?;
-        let (handle, options) = target.child.fs.opendir(ctx, target.inode, flags)?;
+        let (handle, options) = target.child.fs.as_dyn().opendir(ctx, target.inode, flags)?;
         Ok((self.guest_handle(&target.child, handle)?, options))
     }
 
@@ -678,6 +756,7 @@ impl DynFileSystem for MountTableFs {
         target
             .child
             .fs
+            .as_dyn()
             .readdir(ctx, target.inode, handle, size, offset)?
             .into_iter()
             .map(|mut entry| {
@@ -730,11 +809,11 @@ impl DynFileSystem for MountTableFs {
                     continue;
                 };
                 // `ino` matches the `st_ino` a lookup of the name returns.
-                let (attr, _) = child.fs.getattr(ctx, CHILD_ROOT_INODE, None)?;
+                let (ino, type_) = self.child_root_dirent(ctx, &child)?;
                 let entry = DirEntry {
-                    ino: guest_ino(&child, attr.st_ino)?,
+                    ino,
                     offset: position,
-                    type_: DT_DIR,
+                    type_,
                     name: name.as_bytes(),
                 };
                 if add_entry(entry)? == 0 {
@@ -750,10 +829,14 @@ impl DynFileSystem for MountTableFs {
             entry.ino = guest_ino(&child, entry.ino)?;
             add_entry(entry)
         };
-        target
-            .child
-            .fs
-            .readdir_for_each(ctx, target.inode, handle, size, offset, &mut map_entry)
+        target.child.fs.as_dyn().readdir_for_each(
+            ctx,
+            target.inode,
+            handle,
+            size,
+            offset,
+            &mut map_entry,
+        )
     }
 
     fn readdirplus(
@@ -773,6 +856,7 @@ impl DynFileSystem for MountTableFs {
         target
             .child
             .fs
+            .as_dyn()
             .readdirplus(ctx, target.inode, handle, size, offset)?
             .into_iter()
             .map(|(mut dir_entry, entry)| {
@@ -815,7 +899,7 @@ impl DynFileSystem for MountTableFs {
                 let dir_entry = DirEntry {
                     ino: entry.attr.st_ino,
                     offset: position,
-                    type_: DT_DIR,
+                    type_: if child.fs.is_file() { DT_REG } else { DT_DIR },
                     name: name.as_bytes(),
                 };
                 if add_entry(dir_entry, entry)? == 0 {
@@ -831,7 +915,7 @@ impl DynFileSystem for MountTableFs {
             dir_entry.ino = guest_ino(&child, dir_entry.ino)?;
             add_entry(dir_entry, self.guest_entry(&child, entry)?)
         };
-        target.child.fs.readdirplus_for_each(
+        target.child.fs.as_dyn().readdirplus_for_each(
             ctx,
             target.inode,
             handle,
@@ -850,6 +934,7 @@ impl DynFileSystem for MountTableFs {
         target
             .child
             .fs
+            .as_dyn()
             .fsyncdir(ctx, target.inode, datasync, handle)
     }
 
@@ -861,7 +946,11 @@ impl DynFileSystem for MountTableFs {
         }
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
-        target.child.fs.releasedir(ctx, target.inode, flags, handle)
+        target
+            .child
+            .fs
+            .as_dyn()
+            .releasedir(ctx, target.inode, flags, handle)
     }
 
     fn access(&self, ctx: Context, inode: u64, mask: u32) -> io::Result<()> {
@@ -873,7 +962,7 @@ impl DynFileSystem for MountTableFs {
             };
         }
         let target = self.target(inode)?;
-        target.child.fs.access(ctx, target.inode, mask)
+        target.child.fs.as_dyn().access(ctx, target.inode, mask)
     }
 
     fn lseek(
@@ -889,6 +978,7 @@ impl DynFileSystem for MountTableFs {
         target
             .child
             .fs
+            .as_dyn()
             .lseek(ctx, target.inode, handle, offset, whence)
     }
 
@@ -907,7 +997,7 @@ impl DynFileSystem for MountTableFs {
         let (source, local_out) = self.same_child(inode_in, inode_out)?;
         let handle_in = self.handle(&source, handle_in)?;
         let handle_out = self.handle(&source, handle_out)?;
-        source.child.fs.copyfilerange(
+        source.child.fs.as_dyn().copyfilerange(
             ctx,
             source.inode,
             handle_in,
@@ -925,11 +1015,11 @@ impl DynFileSystem for MountTableFs {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-fn root_stat(children: usize) -> stat64 {
+fn root_stat(directories: usize) -> stat64 {
     let mut stat: stat64 = unsafe { std::mem::zeroed() };
     stat.st_ino = ROOT_INODE;
     stat.st_mode = (S_IFDIR | 0o555) as _;
-    stat.st_nlink = (2 + children) as _;
+    stat.st_nlink = (2 + directories) as _;
     stat.st_blksize = 4096;
     stat
 }
