@@ -300,6 +300,73 @@ mod unix {
     // Tests
     //--------------------------------------------------------------------------------------------------
 
+    /// Closing a descriptor drops every POSIX lock the process holds on that file. If
+    /// identity verification closed one, another process's last connection close would
+    /// delete the WAL and its index while this process still uses them.
+    #[tokio::test]
+    async fn database_identity_verify_keeps_sqlite_locks_held() {
+        use std::os::unix::fs::MetadataExt;
+
+        use microsandbox_db::DbWriteConnection;
+        use sea_orm::ConnectionTrait;
+
+        const CHILD: &str = "MSB_TEST_CATALOG_LOCK_CHILD";
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        if let Some(path) = std::env::var_os(CHILD) {
+            let connection = DbWriteConnection::open(path.as_ref(), TIMEOUT, TIMEOUT)
+                .await
+                .unwrap();
+            connection
+                .execute_unprepared("SELECT COUNT(*) FROM lock_test")
+                .await
+                .unwrap();
+            connection.inner().clone().close().await.unwrap();
+            println!("catalog connection closed");
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("msb.db");
+        let wal = directory.path().join("msb.db-wal");
+        let shm = directory.path().join("msb.db-shm");
+        let connection = DbWriteConnection::open(&path, TIMEOUT, TIMEOUT)
+            .await
+            .unwrap();
+        connection
+            .execute_unprepared("CREATE TABLE lock_test (value INTEGER)")
+            .await
+            .unwrap();
+        let wal_inode = std::fs::metadata(&wal).unwrap().ino();
+        let shm_inode = std::fs::metadata(&shm).unwrap().ino();
+
+        let identity = super::super::identity::DatabaseIdentity::capture(&path).unwrap();
+        identity.verify().unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("backend::local::control::tests::unix::database_identity_verify_keeps_sqlite_locks_held")
+            .arg("--nocapture")
+            .env(CHILD, &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("catalog connection closed"));
+
+        // The child must not take itself for the last connection and remove either file.
+        assert_eq!(std::fs::metadata(&wal).unwrap().ino(), wal_inode);
+        assert_eq!(std::fs::metadata(&shm).unwrap().ino(), shm_inode);
+        connection
+            .execute_unprepared("INSERT INTO lock_test VALUES (1)")
+            .await
+            .unwrap();
+        drop(identity);
+    }
+
     #[tokio::test]
     async fn shared_setup_survives_one_cancelled_waiter() {
         let registry = Arc::new(ControlSessions::default());

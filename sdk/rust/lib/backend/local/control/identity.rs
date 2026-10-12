@@ -1,5 +1,6 @@
 //! OS identity without any new runtime handshake field or persisted schema.
 
+#[cfg(any(target_os = "linux", windows))]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -38,11 +39,21 @@ pub(in crate::backend::local) struct ProcessIdentity {
     handle: OwnedHandle,
 }
 
+/// Identity of the catalog file a backend opened.
+///
+/// On Unix the identity comes from `stat` on the path and never from an open
+/// descriptor. Closing any descriptor of a file drops every POSIX record lock
+/// the process holds on that file, including SQLite's: a later connection close
+/// in another process then takes itself for the last one and deletes the WAL
+/// index while this process still uses it. The backend's own SQLite connections
+/// keep the inode allocated, so its number cannot be recycled meanwhile.
 pub(in crate::backend::local) struct DatabaseIdentity {
     path: PathBuf,
     id: (u64, u64, u64),
-    // Keep the original object alive so an unlinked inode/file ID cannot be
-    // recycled and mistaken for this backend's database.
+    // Windows file IDs are read through a handle. Keep the original handle so an
+    // unlinked file ID cannot be recycled and mistaken for this backend's database.
+    // Windows locks belong to a handle, so this handle never affects SQLite's.
+    #[cfg(windows)]
     _file: File,
 }
 
@@ -171,18 +182,40 @@ impl ProcessIdentity {
 
 impl DatabaseIdentity {
     pub fn capture(path: impl AsRef<Path>) -> ControlClientResult<Self> {
-        let file = File::open(path.as_ref()).map_err(ClientError::from)?;
-        let id = file_id(&file)?;
-        Ok(Self {
-            path: path.as_ref().to_owned(),
-            id,
-            _file: file,
-        })
+        let path = path.as_ref().to_owned();
+        #[cfg(unix)]
+        {
+            let id = path_id(&path).map_err(ClientError::from)?;
+            Ok(Self { path, id })
+        }
+        #[cfg(windows)]
+        {
+            let file = File::open(&path).map_err(ClientError::from)?;
+            let id = file_id(&file)?;
+            Ok(Self {
+                path,
+                id,
+                _file: file,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Err(ClientError::new(ErrorKind::UnsupportedOperation).into())
+        }
     }
 
     pub fn verify(&self) -> ControlClientResult<()> {
-        let current = File::open(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
-        if file_id(&current)? != self.id {
+        #[cfg(unix)]
+        let current = path_id(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+        #[cfg(windows)]
+        let current = {
+            let file = File::open(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+            file_id(&file)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let current = return Err(ClientError::new(ErrorKind::UnsupportedOperation).into());
+        if current != self.id {
             return Err(ControlClientError::RuntimeChanged);
         }
         Ok(())
@@ -285,29 +318,24 @@ fn windows_start(handle: &OwnedHandle) -> ControlClientResult<ProcessStart> {
     ))
 }
 
+#[cfg(unix)]
+fn path_id(path: &Path) -> std::io::Result<(u64, u64, u64)> {
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino(), 0))
+}
+
+#[cfg(windows)]
 fn file_id(file: &File) -> ControlClientResult<(u64, u64, u64)> {
-    #[cfg(unix)]
-    {
-        let metadata = file.metadata().map_err(ClientError::from)?;
-        Ok((metadata.dev(), metadata.ino(), 0))
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return Err(ClientError::from(std::io::Error::last_os_error()).into());
     }
-    #[cfg(windows)]
-    {
-        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
-            return Err(ClientError::from(std::io::Error::last_os_error()).into());
-        }
-        let info = unsafe { info.assume_init() };
-        Ok((
-            u64::from(info.dwVolumeSerialNumber),
-            u64::from(info.nFileIndexHigh),
-            u64::from(info.nFileIndexLow),
-        ))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Err(ClientError::new(ErrorKind::UnsupportedOperation).into())
-    }
+    let info = unsafe { info.assume_init() };
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        u64::from(info.nFileIndexHigh),
+        u64::from(info.nFileIndexLow),
+    ))
 }
 
 #[cfg(target_os = "linux")]
