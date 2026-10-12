@@ -45,8 +45,9 @@ pub(in crate::backend::local) struct ProcessIdentity {
 /// descriptor. Closing any descriptor of a file drops every POSIX record lock
 /// the process holds on that file, including SQLite's: a later connection close
 /// in another process then takes itself for the last one and deletes the WAL
-/// index while this process still uses it. The backend's own SQLite connections
-/// keep the inode allocated, so its number cannot be recycled meanwhile.
+/// index while this process still uses it. Idle pool connections close, so an
+/// unlinked catalog's inode number may be reused; the birth time, where the
+/// filesystem records one, tells such a replacement apart.
 pub(in crate::backend::local) struct DatabaseIdentity {
     path: PathBuf,
     id: (u64, u64, u64),
@@ -321,7 +322,14 @@ fn windows_start(handle: &OwnedHandle) -> ControlClientResult<ProcessStart> {
 #[cfg(unix)]
 fn path_id(path: &Path) -> std::io::Result<(u64, u64, u64)> {
     let metadata = std::fs::metadata(path)?;
-    Ok((metadata.dev(), metadata.ino(), 0))
+    // Filesystems without a birth time report an error here on every call, so
+    // capture and verify both record zero and compare device and inode only.
+    let born = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos() as u64);
+    Ok((metadata.dev(), metadata.ino(), born))
 }
 
 #[cfg(windows)]
