@@ -2784,14 +2784,14 @@ pub struct SecretSubstitution {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "kebab-case")]
 pub enum SecretViolationAction {
-    /// Block the request silently.
+    /// Block the request and emit safe rejection metadata, even with diagnostics off.
     #[serde(alias = "Block")]
     Block,
-    /// Block and log (default).
+    /// Block and emit safe rejection metadata (default).
     #[default]
     #[serde(alias = "BlockAndLog", alias = "block_and_log")]
     BlockAndLog,
-    /// Block and terminate the sandbox.
+    /// Block, emit safe rejection metadata, and terminate the sandbox.
     #[serde(alias = "BlockAndTerminate", alias = "block_and_terminate")]
     BlockAndTerminate,
 }
