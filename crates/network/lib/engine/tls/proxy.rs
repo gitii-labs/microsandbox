@@ -629,6 +629,7 @@ pub(crate) async fn intercept_relay(
     let mut server_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut plaintext_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut traffic = TrafficTrace::new(sni_name, guest_dst, connect_dst, !oauth.is_empty());
+    let mut upstream_started = false;
 
     // Drain any application data already buffered during the TLS handshake.
     // In TLS 1.3, the client sends Finished + application data in the same
@@ -642,6 +643,8 @@ pub(crate) async fn intercept_relay(
         &mut detector,
         &mut traffic,
         &shared,
+        &to_smoltcp,
+        &mut upstream_started,
         &mut plaintext_buf,
     )
     .await?;
@@ -683,6 +686,8 @@ pub(crate) async fn intercept_relay(
                         &mut detector,
                         &mut traffic,
                         &shared,
+                        &to_smoltcp,
+                        &mut upstream_started,
                         &mut plaintext_buf,
                     )
                     .await?;
@@ -778,6 +783,8 @@ async fn forward_plaintext(
     detector: &mut CredentialDetector,
     traffic: &mut TrafficTrace<'_>,
     shared: &SharedState,
+    to_smoltcp: &mpsc::Sender<Bytes>,
+    upstream_started: &mut bool,
     buf: &mut [u8],
 ) -> io::Result<()> {
     let mut wrote_plaintext = false;
@@ -794,6 +801,7 @@ async fn forward_plaintext(
         detector.observe_request(&buf[..n]);
 
         if secrets_handler.is_empty() && oauth.is_empty() {
+            *upstream_started = true;
             server_tls.write_all(&buf[..n]).await?;
             traffic.record("upstream-request", &buf[..n]);
             wrote_plaintext = true;
@@ -804,15 +812,24 @@ async fn forward_plaintext(
             Ok(data) => {
                 let data = oauth.transform_requests(&data, traffic.sni).await?;
                 if !data.is_empty() {
+                    *upstream_started = true;
                     server_tls.write_all(&data).await?;
                     traffic.record("upstream-request", &data);
                     wrote_plaintext = true;
                 }
             }
             Err(action) => {
-                // Secret policy rejected the request. Drop the connection.
                 if matches!(action, SecretViolationAction::BlockAndTerminate) {
                     shared.trigger_termination();
+                }
+                // Caller validation: only answer parsed HTTP/1 before any
+                // upstream request bytes; later, HTTP/2 and opaque rejections close.
+                if !*upstream_started && secrets_handler.rejected_http1() {
+                    guest_tls.writer().write_all(&http_forbidden_response(
+                        "Secret not permitted on this connection\n",
+                    ))?;
+                    let mut output = Vec::new();
+                    flush_to_guest(guest_tls, to_smoltcp, shared, &mut output).await?;
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -866,6 +883,116 @@ mod tests {
 
     use super::*;
     use crate::secrets::{config::SecretsConfig, handle::SecretsHandle};
+
+    #[tokio::test]
+    async fn secret_body_rejection_answers_tls_before_upstream_request() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = SecretsConfig {
+            secrets: vec![
+                crate::config::builder::SecretBuilder::new()
+                    .env("API_KEY")
+                    .value("real-secret")
+                    .placeholder("$KEY")
+                    .allow("allowed.example")
+                    .build(),
+            ],
+            ..Default::default()
+        };
+        let state = TlsState::new(Default::default(), SecretsHandle::new(config.clone())).unwrap();
+        let cert = state.get_or_generate_cert("blocked.example").unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(state.intercept_ca.cert_der.clone()).unwrap();
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let mut client = rustls::ClientConnection::new(
+            client_config.clone(),
+            ServerName::try_from("blocked.example").unwrap(),
+        )
+        .unwrap();
+        let mut guest = rustls::ServerConnection::new(cert.server_config.clone()).unwrap();
+        while client.is_handshaking() || guest.is_handshaking() {
+            let mut wire = Vec::new();
+            client.write_tls(&mut wire).unwrap();
+            guest.read_tls(&mut wire.as_slice()).unwrap();
+            guest.process_new_packets().unwrap();
+            wire.clear();
+            guest.write_tls(&mut wire).unwrap();
+            client.read_tls(&mut wire.as_slice()).unwrap();
+            client.process_new_packets().unwrap();
+        }
+        client
+            .writer()
+            .write_all(b"POST / HTTP/1.1\r\nHost: blocked.example\r\nContent-Length: 4\r\n\r\n$KEY")
+            .unwrap();
+        let mut wire = Vec::new();
+        client.write_tls(&mut wire).unwrap();
+        guest.read_tls(&mut wire.as_slice()).unwrap();
+        guest.process_new_packets().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_rustls::TlsAcceptor::from(cert.server_config.clone())
+                .accept(stream)
+                .await
+                .unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            request
+        });
+        let mut server = tokio_rustls::TlsConnector::from(client_config)
+            .connect(
+                ServerName::try_from("blocked.example").unwrap(),
+                TcpStream::connect(addr).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut handler =
+            SecretsHandler::new_tls_intercepted_via_connect(&config, "blocked.example")
+                .with_guest_dst(addr);
+        let mut oauth = OAuthConnection::new_tls_intercepted_via_connect(
+            &config.oauth,
+            "blocked.example",
+            addr.port(),
+        )
+        .await
+        .unwrap();
+        let mut detector =
+            CredentialDetector::new(&config.oauth, "blocked.example", addr.port(), true);
+        let mut traffic = TrafficTrace::new("blocked.example", addr, addr, false);
+        let shared = SharedState::new(16);
+        let (to_tx, mut to_rx) = mpsc::channel(16);
+        let mut started = false;
+        let mut buffer = vec![0; RELAY_BUF_SIZE];
+        let error = forward_plaintext(
+            &mut guest,
+            &mut server,
+            &mut handler,
+            &mut oauth,
+            &mut detector,
+            &mut traffic,
+            &shared,
+            &to_tx,
+            &mut started,
+            &mut buffer,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!started);
+        let response = to_rx.recv().await.unwrap();
+        client.read_tls(&mut response.as_ref()).unwrap();
+        client.process_new_packets().unwrap();
+        let n = client.reader().read(&mut buffer).unwrap();
+        assert!(buffer[..n].starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+        assert!(buffer[..n].ends_with(b"Secret not permitted on this connection\n"));
+        server.shutdown().await.unwrap();
+        assert!(upstream.await.unwrap().is_empty());
+    }
 
     async fn tls_denial_response(chunks: &[&[u8]], close_input: bool, enabled: bool) -> Vec<u8> {
         // Select the real provider before any config builder. Concurrent fixtures
