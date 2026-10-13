@@ -1599,6 +1599,6 @@ Action taken when a secret placeholder is sent to a disallowed host. Also docume
 
 | Value | Wire format | Description |
 |-------|-------------|-------------|
-| `Block` | `"block"` | Silently drop the request |
-| `BlockAndLog` | `"block-and-log"` | Drop the request and emit a warning log (the default) |
-| `BlockAndTerminate` | `"block-and-terminate"` | Drop the request, log an error, and shut down the sandbox |
+| `Block` | `"block"` | Block the request and emit safe rejection metadata, including with diagnostics off |
+| `BlockAndLog` | `"block-and-log"` | Block and emit safe rejection metadata (the default) |
+| `BlockAndTerminate` | `"block-and-terminate"` | Block, emit safe rejection metadata, and shut down the sandbox |

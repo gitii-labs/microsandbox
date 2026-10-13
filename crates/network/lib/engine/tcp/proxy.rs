@@ -393,7 +393,7 @@ impl TcpProxy {
         }
 
         let mut late_connect_state = tls_state;
-        let mut secrets_handler: Option<SecretsHandler> = if is_tls {
+        let secrets_handler: Option<SecretsHandler> = if is_tls {
             None
         } else if enforce_http_authority {
             let host = extract_http_host(&initial_buf).unwrap_or_default();
@@ -415,6 +415,9 @@ impl TcpProxy {
             None
         };
 
+        let mut secrets_handler = secrets_handler.map(|h| h.with_guest_dst(guest_dst));
+        let mut upstream_started = false;
+
         // Replay the buffered first flight — run through secrets handler first.
         if !initial_buf.is_empty() {
             let out: Cow<[u8]> = match secrets_handler.as_mut() {
@@ -426,12 +429,26 @@ impl TcpProxy {
                         if matches!(action, SecretViolationAction::BlockAndTerminate) {
                             shared.trigger_termination();
                         }
+                        // Caller validation: only parsed policy-rejected HTTP/1
+                        // requests receive HTTP bytes; opaque streams just close.
+                        if h.rejected_http1() {
+                            to_smoltcp
+                                .send(Bytes::from(http_forbidden_response(
+                                    "Secret not permitted on this connection\n",
+                                )))
+                                .await
+                                .map_err(|_| {
+                                    io::Error::new(io::ErrorKind::BrokenPipe, "channel closed")
+                                })?;
+                            shared.proxy_wake.wake();
+                        }
                         return Ok(());
                     }
                 },
                 None => Cow::Borrowed(&initial_buf),
             };
             if !out.is_empty() {
+                upstream_started = true;
                 if let Err(e) = server_tx.write_all(&out).await {
                     tracing::debug!(dst = %connect_dst, error = %e, "replay of buffered first flight failed");
                     return Ok(());
@@ -488,9 +505,15 @@ impl TcpProxy {
                                 Some(h) => match h.substitute(&bytes) {
                                     Ok(cow) => cow,
                                     Err(action) => {
-                                        if matches!(action, SecretViolationAction::BlockAndTerminate)
-                                        {
+                                        if matches!(action, SecretViolationAction::BlockAndTerminate) {
                                             shared.trigger_termination();
+                                        }
+                                        // Caller validation: never append HTTP after an upstream
+                                        // request has started, or write it into opaque traffic.
+                                        if !upstream_started && h.rejected_http1() {
+                                            to_smoltcp.send(Bytes::from(http_forbidden_response("Secret not permitted on this connection\n"))).await
+                                                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+                                            shared.proxy_wake.wake();
                                         }
                                         break;
                                     }
@@ -498,6 +521,7 @@ impl TcpProxy {
                                 None => Cow::Borrowed(&bytes),
                             };
                             if !out.is_empty() {
+                                upstream_started = true;
                                 if let Err(e) = server_tx.write_all(&out).await {
                                     tracing::debug!(dst = %connect_dst, error = %e, "write to server failed");
                                     break;
@@ -641,16 +665,33 @@ async fn handle_connect_tunnel(
     let connect_req =
         parse_connect_request(buffer_connect_request(initial_buf, &mut from_smoltcp).await?)?;
 
-    let connect_headers =
-        match sanitize_connect_headers(connect_req.header_bytes(), &tls_state.secrets.load()) {
-            Ok(headers) => headers,
-            Err(action) => {
-                if matches!(action, SecretViolationAction::BlockAndTerminate) {
-                    shared.trigger_termination();
-                }
-                return Ok(());
+    let connect_headers = match sanitize_connect_headers(
+        connect_req.header_bytes(),
+        &tls_state.secrets.load(),
+        Some((
+            connect_req.target.expected_sni.as_deref().unwrap_or(""),
+            guest_dst,
+        )),
+    ) {
+        Ok(headers) => headers,
+        Err(action) => {
+            if matches!(action, SecretViolationAction::BlockAndTerminate) {
+                shared.trigger_termination();
             }
-        };
+            // Caller validation: CONNECT parsing accepts other numeric versions;
+            // only HTTP/1.0 and HTTP/1.1 may receive a synthetic HTTP/1 response.
+            if classify_http_request(connect_req.header_bytes()) == Some(true) {
+                to_smoltcp
+                    .send(Bytes::from(http_forbidden_response(
+                        "Secret not permitted on this connection\n",
+                    )))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+                shared.proxy_wake.wake();
+            }
+            return Ok(());
+        }
+    };
 
     // Dial the proxy and forward the CONNECT request so it opens the tunnel.
     let mut proxy_stream = match preconnected_proxy {
@@ -902,12 +943,19 @@ async fn read_connect_response_headers(stream: &mut TcpStream) -> io::Result<(Ve
 fn sanitize_connect_headers<'a>(
     header_bytes: &'a [u8],
     secrets: &SecretsConfig,
+    metadata: Option<(&str, SocketAddr)>,
 ) -> Result<Cow<'a, [u8]>, SecretViolationAction> {
     if secrets.secrets.is_empty() {
         return Ok(Cow::Borrowed(header_bytes));
     }
 
-    let mut handler = SecretsHandler::new_plain_http_untrusted_metadata(secrets);
+    let mut handler = SecretsHandler::new_plain_http_untrusted_metadata(
+        secrets,
+        metadata.map_or("", |(host, _)| host),
+    );
+    if let Some((_, dst)) = metadata {
+        handler = handler.with_guest_dst(dst);
+    }
     handler.substitute(header_bytes)
 }
 
@@ -2126,7 +2174,7 @@ mod tests {
         let headers = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer $MSB_KEY\r\nUser-Agent: curl\r\n\r\n";
 
         assert_eq!(
-            sanitize_connect_headers(headers, &secrets),
+            sanitize_connect_headers(headers, &secrets, None),
             Err(SecretViolationAction::BlockAndLog)
         );
     }
@@ -2138,7 +2186,7 @@ mod tests {
         let headers = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer $MSB_KEY\r\n\r\n";
 
         assert_eq!(
-            sanitize_connect_headers(headers, &secrets),
+            sanitize_connect_headers(headers, &secrets, None),
             Err(SecretViolationAction::BlockAndTerminate)
         );
     }
@@ -2149,7 +2197,7 @@ mod tests {
         secrets.secrets[0].passthrough_hosts = vec![HostPattern::Any];
         let headers = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer $MSB_KEY\r\n\r\n";
 
-        let sanitized = sanitize_connect_headers(headers, &secrets).unwrap();
+        let sanitized = sanitize_connect_headers(headers, &secrets, None).unwrap();
 
         assert_eq!(sanitized.as_ref(), headers);
         assert!(
@@ -2164,7 +2212,7 @@ mod tests {
         let headers =
             b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nUser-Agent: curl\r\n\r\n";
 
-        let sanitized = sanitize_connect_headers(headers, &secrets).unwrap();
+        let sanitized = sanitize_connect_headers(headers, &secrets, None).unwrap();
 
         assert_eq!(sanitized.as_ref(), headers);
     }
@@ -2175,7 +2223,7 @@ mod tests {
         let headers = b"CONNECT $MSB_KEY:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
 
         assert_eq!(
-            sanitize_connect_headers(headers, &secrets),
+            sanitize_connect_headers(headers, &secrets, None),
             Err(SecretViolationAction::BlockAndLog)
         );
     }

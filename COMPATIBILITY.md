@@ -144,6 +144,17 @@ The subsequent unreleased generation-9 transport repair routes internal freeze/t
 
 ## 5. Launcher-to-Runtime Process Protocol
 
+Secret placeholder permission rejections now emit the additive
+`microsandbox::network::policy::rejection` metadata target at every diagnostic
+level, including off. Parsed HTTP/1 rejections receive a safe 403 only before
+any request bytes have been forwarded upstream on that connection; later
+rejections close without appending a response. Expect/100 Continue and upstream
+response delivery remain unchanged. SDK launch JSON, flags, agent/control
+protocols, persisted state and log paths/rotation are unchanged in both
+SDK/runtime directions. Old runtimes do not produce the new event. The exact
+[consumer contract](docs/observability/policy-rejections.md) specifies metadata,
+exclusions and validation.
+
 The OAuth `require_grant_marker` field and `X-Distributed-OAuth-Grant` header
 require a coordinated SDK/native-FFI/runtime deployment for callers enabling
 the policy. Older peers ignore the new field and cannot enforce it or select a

@@ -71,7 +71,7 @@ pub fn init_tracing(log_level: Option<LogLevel>, ansi: bool) {
 
 /// Install tracing for a sandbox subprocess whose stderr is its runtime log.
 /// With no requested diagnostic level, only policy denials and
-/// credential-shaped-response warnings remain visible.
+/// credential-shaped-response warnings and policy rejection metadata remain visible.
 pub fn init_sandbox_tracing(log_level: Option<LogLevel>) {
     let filter = sandbox_filter(log_level);
     tracing_subscriber::fmt()
@@ -82,7 +82,7 @@ pub fn init_sandbox_tracing(log_level: Option<LogLevel>) {
 }
 
 fn sandbox_filter(log_level: Option<LogLevel>) -> EnvFilter {
-    match log_level {
+    let filter = match log_level {
         Some(level) => EnvFilter::new(level.as_str())
             // oci_client logs auth tokens at debug level.
             .add_directive("oci_client=info".parse::<Directive>().unwrap()),
@@ -97,7 +97,13 @@ fn sandbox_filter(log_level: Option<LogLevel>) -> EnvFilter {
                     .parse::<Directive>()
                     .unwrap(),
             ),
-    }
+    };
+    // Policy rejection metadata is an operator event, independent of diagnostics.
+    filter.add_directive(
+        "microsandbox::network::policy::rejection=warn"
+            .parse::<Directive>()
+            .unwrap(),
+    )
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -133,6 +139,25 @@ mod tests {
     use clap::{Parser, Subcommand};
     use tracing::Level;
     use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn test_policy_rejection_survives_every_diagnostic_level() {
+        for level in [
+            None,
+            Some(LogLevel::Error),
+            Some(LogLevel::Warn),
+            Some(LogLevel::Info),
+            Some(LogLevel::Debug),
+            Some(LogLevel::Trace),
+        ] {
+            let subscriber = tracing_subscriber::registry().with(sandbox_filter(level));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    tracing::enabled!(target: "microsandbox::network::policy::rejection", Level::WARN)
+                );
+            });
+        }
+    }
 
     #[derive(Debug, Parser)]
     struct TestCli {

@@ -4,6 +4,7 @@
 //! with real secret values, but only when the destination host is allowed.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -29,6 +30,10 @@ const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 
 /// Maximum fixed-length HTTP body to buffer for body substitution.
 const MAX_HTTP_BODY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bounds for untrusted metadata in the canonical operator event (Unicode scalars).
+const MAX_EVENT_HOST_CHARS: usize = 253;
+const MAX_EVENT_ENV_CHARS: usize = 128;
 
 /// HTTP/2 client connection preface.
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -76,6 +81,8 @@ const HTTP2_FLAG_PRIORITY: u8 = 0x20;
 /// Created from [`SecretsConfig`] and the destination SNI. Determines which
 /// secrets are eligible for this connection based on host matching.
 pub struct SecretsHandler {
+    /// Protocol of the policy-rejected request, not an upstream I/O error.
+    rejected_protocol: Cell<Option<RequestProtocol>>,
     /// Whether the stream is known to be HTTP. TLS interception already
     /// identifies HTTP; raw TCP classifies its first flight once, so later
     /// ciphertext cannot be mistaken for fresh HTTP headers.
@@ -86,8 +93,8 @@ pub struct SecretsHandler {
     ineligible_for_substitution: Vec<IneligibleSecret>,
     /// Whether this connection is TLS-intercepted (not bypass).
     tls_intercepted: bool,
-    /// TLS SNI this handler was created for.
-    sni: String,
+    /// Bounded event host with configured placeholders and credentials withheld.
+    event_host: String,
     /// Original guest destination for this connection.
     guest_dst: Option<SocketAddr>,
     /// Longest raw or encoded placeholder representation. Sizes the
@@ -277,13 +284,10 @@ struct IneligibleSecret {
 struct SecretViolationReport {
     action: BlockingAction,
     env_var: String,
-    placeholder: String,
     protocol: RequestProtocol,
     location: RequestLocation,
     match_form: PlaceholderMatchForm,
     method: Option<String>,
-    path: Option<String>,
-    host: Option<String>,
     http2_stream_id: Option<u32>,
 }
 
@@ -291,8 +295,6 @@ struct SecretViolationReport {
 #[derive(Clone, Default)]
 struct RequestSummary {
     method: Option<String>,
-    path: Option<String>,
-    host: Option<String>,
 }
 
 /// Blocking action to take when an ineligible placeholder is detected.
@@ -618,8 +620,8 @@ impl SecretsHandler {
     /// This is used for proxy-owned CONNECT headers. Placeholders there are
     /// treated as violations according to their configured action unless a
     /// passthrough policy explicitly allows forwarding the placeholder.
-    pub(crate) fn new_plain_http_untrusted_metadata(config: &SecretsConfig) -> Self {
-        Self::new_inner(config, "", false, None, None, true)
+    pub(crate) fn new_plain_http_untrusted_metadata(config: &SecretsConfig, host: &str) -> Self {
+        Self::new_inner(config, host, false, None, None, true)
     }
 
     fn new_inner(
@@ -692,7 +694,7 @@ impl SecretsHandler {
                 .as_ref()
                 .unwrap_or(&config.violation_action);
             ineligible_for_substitution.push(IneligibleSecret {
-                env_var: secret.env_var.clone(),
+                env_var: safe_event_metadata(config, &secret.env_var, MAX_EVENT_ENV_CHARS),
                 placeholder: secret.placeholder.clone(),
                 action: BlockingAction::from_violation_action(action).unwrap_or_default(),
             });
@@ -708,11 +710,12 @@ impl SecretsHandler {
         });
 
         Self {
+            rejected_protocol: Cell::new(None),
             http_identified: tls_intercepted,
             eligible_for_substitution,
             ineligible_for_substitution,
             tls_intercepted,
-            sni: sni.to_string(),
+            event_host: safe_event_metadata(config, sni, MAX_EVENT_HOST_CHARS),
             guest_dst: None,
             max_detection_window_len,
             max_body_placeholder_len,
@@ -732,6 +735,11 @@ impl SecretsHandler {
     pub fn with_guest_dst(mut self, guest_dst: SocketAddr) -> Self {
         self.guest_dst = Some(guest_dst);
         self
+    }
+
+    /// Whether an actual placeholder policy rejection parsed an HTTP/1 request.
+    pub(crate) fn rejected_http1(&self) -> bool {
+        matches!(self.rejected_protocol.get(), Some(RequestProtocol::Http1))
     }
 
     /// Substitute secrets in plaintext data (guest → server direction).
@@ -1677,55 +1685,35 @@ impl SecretsHandler {
     }
 
     fn log_violation(&self, report: &SecretViolationReport) {
-        if matches!(report.action, BlockingAction::Block) {
-            return;
-        }
-
-        let host = report.host.as_deref().unwrap_or("");
-        let method = report.method.as_deref().unwrap_or("");
-        let path = report.path.as_deref().unwrap_or("");
-        let guest_dst = self
-            .guest_dst
-            .map(|dst| dst.to_string())
-            .unwrap_or_default();
-        let http2_stream_id = report
-            .http2_stream_id
-            .map(|id| id.to_string())
-            .unwrap_or_default();
-
-        match report.action {
-            BlockingAction::Block => {}
-            BlockingAction::BlockAndLog => tracing::warn!(
-                action = %report.action,
-                secret_env_var = %report.env_var,
-                placeholder = %report.placeholder,
-                protocol = %report.protocol,
-                sni = %self.sni,
-                host = %host,
-                method = %method,
-                path = %path,
-                location = %report.location,
-                match_form = %report.match_form,
-                guest_dst = %guest_dst,
-                http2_stream_id = %http2_stream_id,
-                "secret violation: placeholder detected where substitution or passthrough is not permitted"
-            ),
-            BlockingAction::BlockAndTerminate => tracing::error!(
-                action = %report.action,
-                secret_env_var = %report.env_var,
-                placeholder = %report.placeholder,
-                protocol = %report.protocol,
-                sni = %self.sni,
-                host = %host,
-                method = %method,
-                path = %path,
-                location = %report.location,
-                match_form = %report.match_form,
-                guest_dst = %guest_dst,
-                http2_stream_id = %http2_stream_id,
-                "secret violation: placeholder detected where substitution or passthrough is not permitted - terminating"
-            ),
-        }
+        let protocol =
+            if matches!(report.protocol, RequestProtocol::Http1) && report.method.is_none() {
+                RequestProtocol::Opaque
+            } else {
+                report.protocol
+            };
+        self.rejected_protocol.set(Some(protocol));
+        let host = if self.event_host.is_empty() {
+            self.guest_dst
+                .map(|dst| dst.ip().to_string())
+                .unwrap_or_default()
+        } else {
+            self.event_host.clone()
+        };
+        // Metadata only: JSON escaping prevents injected log lines; bounds
+        // limit untrusted host and environment names. Never include payloads.
+        let event = serde_json::json!({
+            "reason": "secret_not_permitted",
+            "host": host,
+            "dest_port": self.guest_dst.map(|dst| dst.port()),
+            "secret_env_var": report.env_var,
+            "protocol": protocol.to_string(),
+            "action": report.action.to_string(),
+            "location": report.location.to_string(),
+            "match_form": report.match_form.to_string(),
+            "http2_stream_id": report.http2_stream_id,
+        });
+        tracing::warn!(target: "microsandbox::network::policy::rejection",
+            policy_rejection = %event, "policy rejected request");
     }
 
     /// Returns the strongest blocking action for any placeholder appearing in data
@@ -2099,6 +2087,21 @@ impl Http2State {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Caller validation: metadata can itself contain a configured secret (for
+/// example, a CONNECT authority placeholder). Hosts are ASCII-lowercased before
+/// this check, so compare without ASCII case before allowing metadata into logs.
+fn safe_event_metadata(config: &SecretsConfig, value: &str, limit: usize) -> String {
+    let normalized = value.to_ascii_lowercase();
+    if config.secrets.iter().any(|secret| {
+        (!secret.placeholder.is_empty()
+            && normalized.contains(&secret.placeholder.to_ascii_lowercase()))
+            || (!secret.value.is_empty() && normalized.contains(&secret.value.to_ascii_lowercase()))
+    }) {
+        return String::new();
+    }
+    value.chars().take(limit).collect()
+}
+
 /// Returns true if `line` starts with the `Authorization:` header name
 /// (case-insensitive).
 fn is_authorization_header(line: &str) -> bool {
@@ -2436,18 +2439,6 @@ fn absolute_form_authority(target: &str) -> Result<Option<&str>, SecretViolation
     Ok(Some(authority))
 }
 
-fn redacted_request_path(target: &str) -> String {
-    let without_query = target.split_once('?').map_or(target, |(path, _)| path);
-    if let Some(scheme_end) = without_query.find("://") {
-        let after_scheme = &without_query[scheme_end + 3..];
-        if let Some(path_start) = after_scheme.find('/') {
-            return after_scheme[path_start..].to_string();
-        }
-        return "/".to_string();
-    }
-    without_query.to_string()
-}
-
 fn request_summary(headers: &str, protocol: RequestProtocol) -> RequestSummary {
     match protocol {
         RequestProtocol::Http1 => http1_request_summary(headers),
@@ -2461,19 +2452,16 @@ fn http1_request_summary(headers: &str) -> RequestSummary {
     let Some(request_line) = lines.next() else {
         return RequestSummary::default();
     };
-    let Some((method, target, _version)) = split_http_request_line(request_line) else {
+    let Some((method, _target, version)) = split_http_request_line(request_line) else {
         return RequestSummary::default();
     };
-
-    let host = lines
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| line.split_once(':'))
-        .find_map(|(name, value)| name.eq_ignore_ascii_case("host").then(|| value.trim()));
+    // Caller validation: HTTP-shaped opaque protocols must never receive a 403.
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return RequestSummary::default();
+    }
 
     RequestSummary {
         method: Some(method.to_string()),
-        path: Some(redacted_request_path(target)),
-        host: host.map(ToOwned::to_owned),
     }
 }
 
@@ -2482,10 +2470,6 @@ fn http2_request_summary(headers: &str) -> RequestSummary {
     for line in headers.split("\r\n").filter(|line| !line.is_empty()) {
         if let Some(value) = line.strip_prefix(":method: ") {
             summary.method = Some(value.to_string());
-        } else if let Some(value) = line.strip_prefix(":path: ") {
-            summary.path = Some(redacted_request_path(value));
-        } else if let Some(value) = line.strip_prefix(":authority: ") {
-            summary.host = Some(value.trim().to_string());
         }
     }
     summary
@@ -3249,13 +3233,10 @@ fn detect_blocking_action_in_fragments(
                 let report = SecretViolationReport {
                     action: secret.action,
                     env_var: secret.env_var.clone(),
-                    placeholder: secret.placeholder.clone(),
                     protocol,
                     location,
                     match_form,
                     method: summary.method.clone(),
-                    path: summary.path.clone(),
-                    host: summary.host.clone(),
                     http2_stream_id,
                 };
 
@@ -3434,12 +3415,6 @@ impl SecretViolationReport {
     fn apply_request_summary(&mut self, summary: &RequestSummary) {
         if self.method.is_none() {
             self.method = summary.method.clone();
-        }
-        if self.path.is_none() {
-            self.path = summary.path.clone();
-        }
-        if self.host.is_none() {
-            self.host = summary.host.clone();
         }
     }
 }
@@ -3969,15 +3944,12 @@ mod tests {
 
         assert_eq!(report.action, BlockingAction::BlockAndLog);
         assert_eq!(report.env_var, "OPENAI_API_KEY");
-        assert_eq!(report.placeholder, "$KEY");
         assert_eq!(report.location, RequestLocation::BasicAuth);
         assert!(matches!(
             report.match_form,
             PlaceholderMatchForm::BasicAuthDecoded
         ));
         assert_eq!(report.method.as_deref(), Some("POST"));
-        assert_eq!(report.path.as_deref(), Some("/v1/chat/completions"));
-        assert_eq!(report.host.as_deref(), Some("evil.example.com"));
     }
 
     #[test]
@@ -4008,8 +3980,6 @@ mod tests {
             PlaceholderMatchForm::PercentDecoded
         ));
         assert_eq!(report.method.as_deref(), Some("GET"));
-        assert_eq!(report.path.as_deref(), Some("/leak"));
-        assert_eq!(report.host.as_deref(), Some("evil.example.com"));
     }
 
     #[test]
@@ -4920,8 +4890,6 @@ mod tests {
             PlaceholderMatchForm::BasicAuthDecoded
         ));
         assert_eq!(report.method.as_deref(), Some("POST"));
-        assert_eq!(report.path.as_deref(), Some("/upload"));
-        assert_eq!(report.host.as_deref(), Some("evil.com"));
     }
 
     #[test]
