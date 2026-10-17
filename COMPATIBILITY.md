@@ -89,6 +89,8 @@ Sources and checks:
 
 Required review should include golden encoded payload bytes when serialization changes. Schema snapshots protect the protocol inventory, but they do not freeze every payload's encoded representation.
 
+PTY exec retains a guest-side slave descriptor until the direct child has exited and queued output has been read. Descendants holding the terminal continue to keep the output stream open. This prevents last-slave closure from discarding the output tail before `core.exec.exited`; it changes guest-local descriptor ownership, not message bytes, capabilities, launch inputs, or persisted state. Older hosts consume the same output and exit messages, and newer hosts continue to accept the existing sequence from older agents. Already-running guests retain their existing agent implementation until restarted.
+
 ## 2. Bootstrap, Init, and Guest Runtime Contract
 
 The first current-protocol host frame is `core.bootstrap` with message ID zero and no flags. The guest then reports resolved init state, the relay installs identity mappings, the host acknowledges init, and only then may the guest become ready.

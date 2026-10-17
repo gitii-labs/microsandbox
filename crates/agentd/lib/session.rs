@@ -6,6 +6,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::ptr;
@@ -954,6 +955,7 @@ impl ExecSession {
         workload_placement: Option<WorkloadPlacement>,
     ) -> AgentdResult<Self> {
         let (master, slave) = open_pty()?;
+        let exit_signal = UnixStream::pair()?;
 
         // Set initial window size.
         let ws = libc::winsize {
@@ -977,10 +979,9 @@ impl ExecSession {
         cmd.command
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave));
+            .stderr(Stdio::from(slave.try_clone()?));
 
-        // `spawn_process` drops the command and with it the parent's slave
-        // fds, so the master reads EIO once the session's processes close theirs.
+        // Retain the slave until the reader has drained queued output after exit.
         let SpawnedProcess { exit_watcher, .. } = spawn_process(cmd, process_manager)?;
         let process_identity = exit_watcher.identity();
 
@@ -995,7 +996,14 @@ impl ExecSession {
         })?;
 
         // Spawn background reader task.
-        tokio::spawn(pty_reader_task(id, reader_fd, exit_watcher, tx));
+        tokio::spawn(pty_reader_task(
+            id,
+            reader_fd,
+            slave,
+            exit_watcher,
+            tx,
+            exit_signal,
+        ));
 
         Ok(Self {
             process_identity,
@@ -1761,15 +1769,24 @@ fn write_nonblocking_fd(fd: RawFd, data: &[u8]) -> std::io::Result<usize> {
     }
 }
 
-fn wait_fd_readable(fd: RawFd) -> AgentdResult<()> {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+/// Wait for PTY output or closure of the process-exit notification socket.
+fn wait_pty_readable(fd: RawFd, exit: Option<RawFd>) -> AgentdResult<bool> {
+    let mut pollfds = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            // poll ignores -1 after the exit notification has been consumed.
+            fd: exit.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
 
     loop {
-        let ret = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -1781,24 +1798,32 @@ fn wait_fd_readable(fd: RawFd) -> AgentdResult<()> {
             continue;
         }
         // Always retry read on HUP/ERR too: a PTY may still contain final output before EIO.
-        return Ok(());
+        return Ok(pollfds[1].revents != 0);
     }
 }
 
-/// Background task that reads from a PTY master fd and sends output events.
+/// Drain PTY output before releasing the retained slave and reporting exit.
+/// Closing the last slave can discard output still queued for the master.
+/// After the direct child exits, EAGAIN marks the point at which its queued
+/// output has been drained; descendants retain their own slave descriptors.
 async fn pty_reader_task(
     id: u32,
     master_fd: OwnedFd,
+    slave_fd: OwnedFd,
     exit_watcher: ProcessExitWatcher,
     tx: SessionOutputSender,
+    exit_signal: (UnixStream, UnixStream),
 ) {
+    let (exit_read, exit_write) = exit_signal;
     let tx_output = tx.clone();
     let runtime_handle = tokio::runtime::Handle::current();
-    let read_result = tokio::task::spawn_blocking(move || {
+    let reader = tokio::task::spawn_blocking(move || {
         // PTY masters are safer with a dedicated blocking read loop than with
         // edge-driven readiness. Fast writers followed by process exit can
         // strand the tail behind a missed wakeup/HUP transition.
         let raw = master_fd.as_raw_fd();
+        let mut slave = Some(slave_fd);
+        let mut exited = false;
         // The duplicated master shares O_NONBLOCK with stdin. Never clear that flag here:
         // a blocked write would otherwise strand lifecycle handling on the agent actor.
 
@@ -1830,20 +1855,23 @@ async fn pty_reader_task(
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
                 Some(libc::EAGAIN) => {
-                    if wait_fd_readable(raw).is_err() {
-                        break;
+                    if exited {
+                        drop(slave.take());
+                    }
+                    match wait_pty_readable(raw, (!exited).then(|| exit_read.as_raw_fd())) {
+                        Ok(exit_ready) => exited |= exit_ready,
+                        Err(_) => break,
                     }
                 }
                 Some(libc::EIO) => break,
                 _ => break,
             }
         }
-    })
-    .await;
-
-    let _ = read_result;
-
+    });
     let code = exit_watcher.await;
+    // Wake an idle reader without a timer, including a child that wrote nothing.
+    drop(exit_write);
+    let _ = reader.await;
     let _ = tx.send(id, SessionOutput::Exited(code)).await;
 }
 
@@ -2598,6 +2626,49 @@ mod tests {
             (after.rlim_cur, after.rlim_max),
             (baseline.rlim_cur, baseline.rlim_max)
         );
+    }
+
+    #[tokio::test]
+    async fn test_pty_exit_retains_output_tail() {
+        const OUTPUT_BYTES: usize = 13954;
+        for attempt in 0..100 {
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let req = ExecRequest {
+                cmd: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("stty -opost; head -c {OUTPUT_BYTES} /dev/zero"),
+                ],
+                env: vec!["PATH=/usr/local/bin:/usr/bin:/bin".to_string()],
+                cwd: None,
+                user: None,
+                tty: true,
+                rows: 30,
+                cols: 100,
+                rlimits: Vec::new(),
+            };
+            let session = ExecSession::spawn(7, &req, tx, None, SecurityProfile::Default, None)
+                .expect("spawn pty session");
+            let result = time::timeout(Duration::from_secs(10), async {
+                let mut stdout = Vec::new();
+                while let Some(envelope) = rx.recv().await {
+                    match envelope.output {
+                        SessionOutput::Stdout(data) => stdout.extend(data),
+                        SessionOutput::Exited(code) => return (code, stdout),
+                        _ => {}
+                    }
+                }
+                panic!("session ended without exit");
+            })
+            .await;
+            if result.is_err() {
+                let _ = session.send_signal(libc::SIGKILL);
+            }
+            let (code, stdout) = result.expect("pty session timed out");
+            assert_eq!(code, 0, "attempt {attempt}");
+            assert_eq!(stdout.len(), OUTPUT_BYTES, "attempt {attempt}");
+            assert!(stdout.iter().all(|byte| *byte == 0));
+        }
     }
 
     #[tokio::test]
