@@ -166,14 +166,14 @@ jobs:
           echo "MICROSANDBOX_FFI_PATH=$PWD/target/ci/libmicrosandbox_go_ffi.so" >> "$GITHUB_ENV"
           echo "MSB_HOME=$(mktemp -d /tmp/msb-host-alias-XXXXXX)" >> "$GITHUB_ENV"
       - name: Prove Rust SDK dual-family routing and original-destination policy
-        env:
-          MSB_TEST_ISOLATE_HOME: "1"
+        shell: bash
         run: |
           cargo test --locked --profile ci -p microsandbox --features ssh --test host_access \
             registered_host_alias_ipv4_port_supports_both_guest_families_and_host_policy \
             -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/host-alias-rust.log"
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/host-alias-rust.log"
       - name: Prove Go SDK dual-family routing and original-destination policy
+        shell: bash
         run: |
           go -C sdk/go test -v -tags "integration microsandbox_ffi_path" \
             -run '^TestHostAliasIPv4PortsBothGuestFamilies$' -count=1 -timeout 10m \
