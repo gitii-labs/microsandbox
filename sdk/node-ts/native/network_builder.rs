@@ -284,6 +284,21 @@ impl JsNetworkBuilder {
         Ok(self)
     }
 
+    /// Route a host-alias TCP port only to host IPv4 loopback for either guest gateway family.
+    #[napi(js_name = "hostAliasIPv4Port")]
+    pub fn host_alias_ipv4_port(&mut self, port: f64) -> Result<&Self> {
+        let port = crate::numeric::safe_integer(port, "hostAliasIPv4Port")?;
+        let port = u16::try_from(port)
+            .ok()
+            .and_then(std::num::NonZeroU16::new)
+            .ok_or_else(|| {
+                napi::Error::from_reason("hostAliasIPv4Port must be between 1 and 65535")
+            })?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.host_alias_ipv4_port(port));
+        Ok(self)
+    }
+
     /// Require hostname-based policy allows to use inspectable application authority.
     #[napi]
     pub fn strict(&mut self, enabled: bool) -> &Self {

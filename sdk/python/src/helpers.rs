@@ -218,6 +218,7 @@ pub(crate) fn restore_builder_from_args(
             "captured_volumes",
             "ports",
             "tcp_accept_queue_size",
+            "host_alias_ipv4_ports",
             "vsock",
             "external_mount_policy",
             "dangerously_inherit_resources",
@@ -362,6 +363,14 @@ pub(crate) fn restore_builder_from_args(
     }
     if let Some(size) = extract_opt::<u32>(kwargs, "tcp_accept_queue_size")? {
         builder = builder.tcp_accept_queue_size(size);
+    }
+    for port in extract_opt::<Vec<u16>>(kwargs, "host_alias_ipv4_ports")?.unwrap_or_default() {
+        let port = std::num::NonZeroU16::new(port).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "host-alias IPv4 ports must be between 1 and 65535",
+            )
+        })?;
+        builder = builder.host_alias_ipv4_port(port);
     }
     if let Some(vsock) = kwargs.get_item("vsock")?.filter(|v| !v.is_none()) {
         builder = apply_vsock_routes(builder, &vsock)?;
@@ -1572,6 +1581,14 @@ fn apply_network(
     }
     if let Some(size) = extract_opt::<u32>(net, "tcp_accept_queue_size")? {
         builder = builder.network(|n| n.tcp_accept_queue_size(size));
+    }
+    for port in extract_opt::<Vec<u16>>(net, "host_alias_ipv4_ports")?.unwrap_or_default() {
+        let port = std::num::NonZeroU16::new(port).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "host-alias IPv4 ports must be between 1 and 65535",
+            )
+        })?;
+        builder = builder.network(|n| n.host_alias_ipv4_port(port));
     }
 
     // Strict hostname policy.

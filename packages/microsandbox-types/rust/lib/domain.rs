@@ -745,6 +745,10 @@ pub struct NetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_accept_queue_size: Option<u32>,
 
+    /// Host-alias TCP ports routed exclusively to host IPv4 loopback by local runtimes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_alias_ipv4_ports: Vec<std::num::NonZeroU16>,
+
     /// Local network rate limits. Missing means unlimited in both directions.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[config_patch(nested)]
@@ -2017,6 +2021,7 @@ impl Default for NetworkSpec {
             max_tcp_connections: None,
             max_udp_connections: None,
             tcp_accept_queue_size: None,
+            host_alias_ipv4_ports: Vec::new(),
             rate_limiter: None,
             nat64_prefixes: default_nat64_prefixes(),
             trust_host_cas: false,

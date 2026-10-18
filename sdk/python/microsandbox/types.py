@@ -1802,6 +1802,8 @@ class Network:
     tcp_accept_queue_size: int | None = field(default=None, kw_only=True)
     """Accept-queue depth for published TCP port listeners, 1 to 2147483647.
     Defaults to 1024; the host kernel clamps it to its own ``somaxconn``."""
+    host_alias_ipv4_ports: tuple[int, ...] = field(default=(), kw_only=True)
+    """Host-alias TCP ports routed only to IPv4 loopback for either guest gateway family."""
     rate_limiter: NetworkRateLimiter | None = None
     """Local egress and ingress rate limits. ``None`` means unlimited."""
     secret_violation_action: ViolationAction = ViolationAction.BLOCK_AND_LOG
@@ -1875,6 +1877,8 @@ class Network:
             d["max_udp_connections"] = self.max_udp_connections
         if self.tcp_accept_queue_size is not None:
             d["tcp_accept_queue_size"] = self.tcp_accept_queue_size
+        if self.host_alias_ipv4_ports:
+            d["host_alias_ipv4_ports"] = list(self.host_alias_ipv4_ports)
         if self.rate_limiter is not None:
             if not isinstance(self.rate_limiter, NetworkRateLimiter):
                 raise TypeError("Network.rate_limiter must be NetworkRateLimiter or None")

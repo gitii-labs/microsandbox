@@ -4,7 +4,7 @@
 //! for sandbox networking. Designed for the smoltcp in-process engine.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
 use microsandbox_types::{
@@ -68,6 +68,11 @@ pub struct NetworkConfig {
     /// Host → guest port mappings.
     #[serde(default)]
     pub ports: Vec<PublishedPort>,
+
+    /// Host-alias TCP ports routed exclusively to `127.0.0.1`, for either guest gateway family.
+    /// Does not grant policy access, change DNS, or affect UDP or non-gateway destinations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_alias_ipv4_ports: Vec<NonZeroU16>,
 
     /// Egress/ingress policy rules.
     #[serde(default)]
@@ -321,6 +326,7 @@ impl Default for NetworkConfig {
             enabled: true,
             interface: InterfaceOverrides::default(),
             ports: Vec::new(),
+            host_alias_ipv4_ports: Vec::new(),
             policy: NetworkPolicy::default(),
             dns: DnsConfig::default(),
             tls: TlsConfig::default(),
@@ -406,6 +412,37 @@ mod tests {
     use crate::dns::Nameserver;
     use crate::policy::{Destination, NetworkPolicy, Rule};
     use crate::proxy::OutboundProxy;
+
+    #[test]
+    fn host_alias_ipv4_ports_validate_and_survive_saved_config_round_trip() {
+        let config = NetworkBuilder::new()
+            .host_alias_ipv4_port(std::num::NonZeroU16::new(12345).unwrap())
+            .build()
+            .unwrap();
+        let saved = serde_json::to_value(config).unwrap();
+        assert_eq!(saved["host_alias_ipv4_ports"], serde_json::json!([12345]));
+        let spec: microsandbox_types::NetworkSpec = serde_json::from_value(saved).unwrap();
+        let restored: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(spec).unwrap()).unwrap();
+        assert_eq!(restored.host_alias_ipv4_ports[0].get(), 12345);
+        let resolved = restored
+            .resolve(&crate::config::EnvNetworkSecretResolver)
+            .unwrap();
+        let resolved: super::ResolvedNetworkConfig =
+            serde_json::from_value(serde_json::to_value(resolved).unwrap()).unwrap();
+        assert_eq!(resolved.config().host_alias_ipv4_ports[0].get(), 12345);
+        assert!(
+            serde_json::to_value(NetworkConfig::default())
+                .unwrap()
+                .get("host_alias_ipv4_ports")
+                .is_none()
+        );
+        for invalid in [0, 65536, -1] {
+            let saved = serde_json::json!({"host_alias_ipv4_ports": [invalid]});
+            assert!(serde_json::from_value::<NetworkConfig>(saved.clone()).is_err());
+            assert!(serde_json::from_value::<microsandbox_types::NetworkSpec>(saved).is_err());
+        }
+    }
 
     #[test]
     fn strict_defaults_and_explicit_opt_out_survive_wire_round_trips() {

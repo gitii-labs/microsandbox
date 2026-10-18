@@ -88,6 +88,15 @@ impl LaunchContract {
             require_tcp_accept_queue_size(msb_path).await?;
         }
 
+        if self.machine && !network.host_alias_ipv4_ports.is_empty() {
+            require_capability(
+                msb_path,
+                |capabilities| capabilities.host_alias_ipv4_ports,
+                "port-scoped host-alias IPv4 targets",
+            )
+            .await?;
+        }
+
         if self.machine
             && matches!(
                 network.outbound_proxy,
@@ -134,6 +143,9 @@ impl LaunchContract {
         }
         if network.tcp_accept_queue_size.is_some() {
             return unsupported("TCP accept queue size");
+        }
+        if !network.host_alias_ipv4_ports.is_empty() {
+            return unsupported("port-scoped host-alias IPv4 targets");
         }
         if let Some(limit) = network.max_tcp_connections {
             let Some(cap) = limit.cap() else {
@@ -902,6 +914,58 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(all(unix, feature = "net"))]
+    #[tokio::test]
+    async fn host_alias_ipv4_ports_require_explicit_runtime_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let network = microsandbox_network::config::NetworkBuilder::new()
+            .host_alias_ipv4_port(std::num::NonZeroU16::new(12345).unwrap())
+            .build()
+            .unwrap();
+        let machine = LaunchContract {
+            patch: 18,
+            machine: true,
+        };
+        let old = script(
+            dir.path(),
+            "old-runtime",
+            "printf '%s' '{\"protocols\":[2,1]}'",
+        );
+        let error = machine
+            .require_network_capabilities(&old, &network)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("upgrade msb"));
+        assert!(error.contains("host-alias"));
+        let current = script(
+            dir.path(),
+            "current-runtime",
+            "printf '%s' '{\"protocols\":[2,1],\"host_alias_ipv4_ports\":true}'",
+        );
+        machine
+            .require_network_capabilities(&current, &network)
+            .await
+            .unwrap();
+        let legacy = LaunchContract {
+            patch: 18,
+            machine: false,
+        };
+        assert!(
+            legacy
+                .validate_network(
+                    &network,
+                    microsandbox_types::DeploymentProfile::SingleTenant
+                )
+                .is_err()
+        );
+        // Existing workflows do not probe at all when no ports are registered.
+        machine
+            .require_network_capabilities(&dir.path().join("absent"), &Default::default())
+            .await
+            .unwrap();
     }
 
     /// The check create runs before `replace` touches its target: refuse a v0.7.x-shaped

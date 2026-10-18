@@ -614,6 +614,9 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     if config.spec.network.tcp_accept_queue_size.is_some() {
         return Err(unsupported("network.tcp_accept_queue_size"));
     }
+    if !config.spec.network.host_alias_ipv4_ports.is_empty() {
+        return Err(unsupported("network.host_alias_ipv4_ports"));
+    }
 
     if config
         .spec
@@ -1734,6 +1737,13 @@ mod tests {
         config.spec.network.tcp_accept_queue_size = Some(4096);
 
         assert_unsupported_config_field(config, "network.tcp_accept_queue_size");
+    }
+
+    #[test]
+    fn cloud_create_request_rejects_host_alias_ipv4_ports() {
+        let mut config = base_cloud_config();
+        config.spec.network.host_alias_ipv4_ports = vec![std::num::NonZeroU16::new(12345).unwrap()];
+        assert_unsupported_config_field(config, "network.host_alias_ipv4_ports");
     }
 
     #[test]

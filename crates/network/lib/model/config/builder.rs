@@ -144,6 +144,13 @@ impl HttpBuilder {
 }
 
 impl NetworkBuilder {
+    /// Route a host-alias TCP port exclusively to `127.0.0.1` for both guest gateway families.
+    /// Policy still evaluates the original guest destination. Other ports retain family fallback.
+    pub fn host_alias_ipv4_port(mut self, port: std::num::NonZeroU16) -> Self {
+        self.config.host_alias_ipv4_ports.push(port);
+        self
+    }
+
     /// Start building a network configuration with defaults.
     pub fn new() -> Self {
         Self {

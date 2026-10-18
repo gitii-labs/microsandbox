@@ -20,6 +20,7 @@ jobs:
       - run: rustfmt --edition 2024 --check crates/agentd/lib/tcp.rs crates/agentd/lib/agent.rs crates/protocol/lib/tcp.rs crates/protocol/lib/message.rs
   transport-and-ssh:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
@@ -43,6 +44,10 @@ jobs:
       - run: cargo test --locked -p microsandbox-network --lib
       - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::ssh
       - run: cargo test --locked -p microsandbox --features ssh --lib sandbox::tcp
+      - name: Check host-alias launch, restore, cloud, and CLI configuration
+        run: |
+          cargo test --locked -p microsandbox --features ssh --lib host_alias_ipv4
+          cargo test --locked -p microsandbox-cli --lib network_config_host_alias_ipv4_ports
       - name: Exercise stop ownership and process-exit barriers
         run: |
           cargo test --locked -p microsandbox --features ssh --lib -- \
@@ -61,9 +66,129 @@ jobs:
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib queued_reservations_survive
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib channels::tests
       - run: cargo check --locked --manifest-path sdk/go/native/Cargo.toml
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+      - name: Check Node host-alias builders against the checkout native binding
+        working-directory: sdk/node-ts
+        run: |
+          npm ci
+          npm run build:native:debug
+          npm run build:ts
+          npx vitest run tests/unit/builders.test.ts -t 'port-scoped host-alias'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: true
+          cache-dependency-glob: sdk/python/uv.lock
+      - name: Check Python host-alias configuration against the checkout native binding
+        working-directory: sdk/python
+        run: |
+          uv sync --group dev --no-install-project
+          uv run --no-sync maturin develop
+          uv run --no-sync pytest tests/test_host_alias_ipv4_ports.py
       - run: cargo clippy --keep-going --locked -p microsandbox-agent-client -p microsandbox-runtime -p microsandbox --features microsandbox/ssh,microsandbox-agent-client/uds --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
       - run: rustfmt --edition 2024 --config skip_children=true --check vendor/russh/src/server/mod.rs vendor/russh/src/server/session.rs vendor/russh/src/server/encrypted.rs vendor/russh/src/client/mod.rs vendor/russh/src/client/session.rs vendor/russh/src/client/encrypted.rs vendor/russh/src/channels/mod.rs vendor/russh/src/channels/io/tx.rs vendor/russh/src/lib_inner.rs
+  host-alias-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      LIBKRUNFW_VERSION: "5.6.1"
+      LIBKRUNFW_ABI: "5"
+      MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}/build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Require KVM on the Linux runner
+        run: |
+          if [ ! -c /dev/kvm ]; then
+            echo '::error::The Linux host-alias live tests require /dev/kvm on this runner'
+            exit 1
+          fi
+          sudo chmod a+rw /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: 1.94.0
+          targets: x86_64-unknown-linux-musl
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: stable
+          cache: false
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: host-alias-live
+          cache-bin: false
+          cache-on-failure: true
+      - name: Install runtime and kernel build dependencies
+        run: scripts/ci/install-apt-packages.sh musl-tools libcap-ng-dev flex bison libelf-dev bc python3-pyelftools
+      - name: Check out the candidate firmware source
+        id: firmware
+        run: |
+          git submodule update --init --depth 1 vendor/libkrunfw
+          echo "sha=$(git rev-parse HEAD:vendor/libkrunfw)" >> "$GITHUB_OUTPUT"
+      - name: Cache the candidate firmware
+        id: kernel
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+          key: host-alias-kernel-linux-x86_64-${{ steps.firmware.outputs.sha }}
+      - name: Prepare verified kernel source
+        if: steps.kernel.outputs.cache-hit != 'true'
+        uses: ./.github/actions/cache-libkrunfw-kernel
+      - name: Build candidate firmware
+        if: steps.kernel.outputs.cache-hit != 'true'
+        working-directory: vendor/libkrunfw
+        run: make -j"$(nproc)"
+      - name: Build and stage the candidate guest agent and firmware
+        run: |
+          cargo build --locked --profile ci -p microsandbox-agentd --target x86_64-unknown-linux-musl
+          mkdir -p build
+          cp target/x86_64-unknown-linux-musl/ci/agentd build/agentd
+          touch build/agentd
+          program_headers=$(readelf -lW build/agentd)
+          if grep -q INTERP <<< "$program_headers"; then
+            echo '::error::The candidate guest agent must not need a dynamic loader'
+            exit 1
+          fi
+          cp vendor/libkrunfw/libkrunfw.so.$LIBKRUNFW_VERSION build/
+          ln -sf libkrunfw.so.$LIBKRUNFW_VERSION build/libkrunfw.so.$LIBKRUNFW_ABI
+          ln -sf libkrunfw.so.$LIBKRUNFW_ABI build/libkrunfw.so
+      - name: Build the candidate runtime and Go FFI
+        run: |
+          cargo build --locked --profile ci --no-default-features --features net,ssh,embed-binaries -p microsandbox-cli
+          cp target/ci/msb build/msb
+          cargo build --locked --profile ci -p microsandbox-go
+      - name: Select only candidate artifacts and an isolated test home
+        run: |
+          echo "MSB_PATH=$PWD/build/msb" >> "$GITHUB_ENV"
+          echo "MSB_LIBKRUNFW_PATH=$PWD/build/libkrunfw.so" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD/build" >> "$GITHUB_ENV"
+          echo "MICROSANDBOX_FFI_PATH=$PWD/target/ci/libmicrosandbox_go_ffi.so" >> "$GITHUB_ENV"
+          echo "MSB_HOME=$(mktemp -d /tmp/msb-host-alias-XXXXXX)" >> "$GITHUB_ENV"
+      - name: Prove Rust SDK dual-family routing and original-destination policy
+        shell: bash
+        run: |
+          cargo test --locked --profile ci -p microsandbox --features ssh --test host_access \
+            registered_host_alias_ipv4_port_supports_both_guest_families_and_host_policy \
+            -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/host-alias-rust.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/host-alias-rust.log"
+      - name: Prove Go SDK dual-family routing and original-destination policy
+        shell: bash
+        run: |
+          go -C sdk/go test -v -tags "integration microsandbox_ffi_path" \
+            -run '^TestHostAliasIPv4PortsBothGuestFamilies$' -count=1 -timeout 10m \
+            ./integration 2>&1 | tee "$RUNNER_TEMP/host-alias-go.log"
+          grep -F -- '--- PASS: TestHostAliasIPv4PortsBothGuestFamilies (' "$RUNNER_TEMP/host-alias-go.log"
+      - name: Upload focused guest-test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: host-alias-live-logs
+          path: |
+            ${{ runner.temp }}/host-alias-*.log
+            ${{ env.MSB_HOME }}/sandboxes/*/logs/runtime.log
+          if-no-files-found: ignore
   go-sdk:
     runs-on: ubuntu-latest
     defaults:

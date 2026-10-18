@@ -351,6 +351,20 @@ impl JsRestoreBuilder {
         Ok(self)
     }
 
+    /// Route a host-alias TCP port only to host IPv4 loopback for either guest gateway family.
+    #[napi(js_name = "hostAliasIPv4Port")]
+    pub fn host_alias_ipv4_port(&mut self, port: f64) -> Result<&Self> {
+        let port = crate::numeric::safe_integer(port, "hostAliasIPv4Port")?;
+        let port = u16::try_from(port)
+            .ok()
+            .and_then(std::num::NonZeroU16::new)
+            .ok_or_else(|| {
+                napi::Error::from_reason("hostAliasIPv4Port must be between 1 and 65535")
+            })?;
+        self.inner = Some(self.take_inner()?.host_alias_ipv4_port(port));
+        Ok(self)
+    }
+
     /// Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port.
     #[napi]
     pub fn vsock(&mut self, host_path: String, port: f64) -> Result<&Self> {

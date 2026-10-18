@@ -742,6 +742,14 @@ fn run_c(
 // msb_free_string
 // ---------------------------------------------------------------------------
 
+/// Capability marker: this native SDK preserves explicit host-alias IPv4 TCP ports.
+#[unsafe(no_mangle)]
+pub extern "C" fn msb_supports_host_alias_ipv4_ports() {}
+
+/// Capability marker: this native SDK accepts validated guest interface overrides.
+#[unsafe(no_mangle)]
+pub extern "C" fn msb_supports_network_interface_overrides() {}
+
 /// Free a C string previously returned as an error from any `msb_*` function.
 /// Safe to call with a null pointer (no-op).
 ///
@@ -971,6 +979,10 @@ struct NetworkOpts {
     port_bindings: Vec<PortBindingOpts>,
     /// Accept-queue depth for published TCP port listeners.
     tcp_accept_queue_size: Option<u32>,
+    /// Explicit host-alias ports; serde rejects zero and out-of-range values before side effects.
+    #[serde(default)]
+    host_alias_ipv4_ports: Vec<std::num::NonZeroU16>,
+    interface: Option<microsandbox_network::config::InterfaceOverrides>,
     /// IPv4 pool used to derive per-sandbox /30 guest subnets.
     ipv4_pool: Option<String>,
     /// IPv6 pool used to derive per-sandbox /64 guest prefixes.
@@ -1454,6 +1466,9 @@ fn apply_network(
         builder = builder.network(|n| n.policy(policy));
     }
 
+    if let Some(ref interface) = net.interface {
+        builder = builder.network(|n| n.interface(interface.clone()));
+    }
     if let Some(ref raw) = net.ipv4_pool {
         let pool: ipnetwork::Ipv4Network = raw
             .parse()
@@ -1564,6 +1579,9 @@ fn apply_network(
     }
     if let Some(size) = net.tcp_accept_queue_size {
         builder = builder.network(move |n| n.tcp_accept_queue_size(size));
+    }
+    for port in net.host_alias_ipv4_ports.iter().copied() {
+        builder = builder.network(move |n| n.host_alias_ipv4_port(port));
     }
 
     // Strict hostname policy.
@@ -7940,6 +7958,61 @@ mod tests {
         };
         let config = builder.build().await.unwrap();
         assert_eq!(config.spec.network.tcp_accept_queue_size, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn host_alias_ipv4_ports_reach_config_and_reject_invalid_ports() {
+        let net: super::NetworkOpts = serde_json::from_value(serde_json::json!({
+            "host_alias_ipv4_ports": [12345]
+        }))
+        .unwrap();
+        let builder = microsandbox::Sandbox::builder("explicit-host-port").image("alpine");
+        let Ok(builder) = super::apply_network(builder, &net) else {
+            panic!("valid port rejected")
+        };
+        let config = builder.build().await.unwrap();
+        assert_eq!(config.spec.network.host_alias_ipv4_ports[0].get(), 12345);
+        for invalid in [0, 65536, -1] {
+            assert!(
+                serde_json::from_value::<super::NetworkOpts>(serde_json::json!({
+                    "host_alias_ipv4_ports": [invalid]
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn network_interface_overrides_reach_the_runtime_config() {
+        let net: super::NetworkOpts = serde_json::from_value(serde_json::json!({
+            "interface": {"ipv4_address": "172.16.0.2", "ipv6_address": "fd42:6d73:62::2"},
+            "ipv4_pool": "172.16.0.0/12"
+        }))
+        .unwrap();
+        let builder = microsandbox::Sandbox::builder("dual-stack-interface").image("alpine");
+        let Ok(builder) = super::apply_network(builder, &net) else {
+            panic!("valid interface rejected")
+        };
+        let config = builder.build().await.unwrap();
+        let interface = config.spec.network.interface.unwrap();
+        assert_eq!(interface.ipv4_address.unwrap().to_string(), "172.16.0.2");
+        assert_eq!(
+            interface.ipv6_address.unwrap().to_string(),
+            "fd42:6d73:62::2"
+        );
+        assert_eq!(interface.ipv4_pool.unwrap().to_string(), "172.16.0.0/12");
+        for interface in [
+            serde_json::json!({"ipv4_address": "::1"}),
+            serde_json::json!({"ipv6_address": "127.0.0.1"}),
+            serde_json::json!({"ipv6_address": "not-an-address"}),
+        ] {
+            assert!(
+                serde_json::from_value::<super::NetworkOpts>(
+                    serde_json::json!({"interface": interface})
+                )
+                .is_err()
+            );
+        }
     }
 
     use super::*;

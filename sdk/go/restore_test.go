@@ -119,6 +119,26 @@ func TestRestoreTCPAcceptQueueSizeReachesFFI(t *testing.T) {
 	}
 }
 
+func TestRestoreHostAliasIPv4PortsReachesFFI(t *testing.T) {
+	var config RestoreConfig
+	WithRestoreHostAliasIPv4Ports(12345)(&config)
+	options := buildFFIRestoreOptions("saved", config)
+	if len(options.HostAliasIPv4Ports) != 1 || options.HostAliasIPv4Ports[0] != 12345 {
+		t.Fatalf("host alias ports lost: %#v", options.HostAliasIPv4Ports)
+	}
+	ports := []uint16{23456}
+	WithRestoreHostAliasIPv4Ports(ports...)(&config)
+	ports[0] = 34567
+	options = buildFFIRestoreOptions("saved", config)
+	if len(options.HostAliasIPv4Ports) != 1 || options.HostAliasIPv4Ports[0] != 23456 {
+		t.Fatalf("replacement must copy only the requested ports: %#v", options.HostAliasIPv4Ports)
+	}
+	WithRestoreHostAliasIPv4Ports()(&config)
+	if options := buildFFIRestoreOptions("saved", config); len(options.HostAliasIPv4Ports) != 0 {
+		t.Fatalf("empty replacement must clear ports: %#v", options.HostAliasIPv4Ports)
+	}
+}
+
 func TestRestoreRejectsDuplicateTCPAliasesBeforeFFI(t *testing.T) {
 	// Matching values are also ambiguous: reject both spellings instead of
 	// letting option order silently select which limit reaches the runtime.

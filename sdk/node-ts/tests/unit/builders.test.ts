@@ -1006,6 +1006,23 @@ describe("TCP accept queue size", () => {
   });
 });
 
+describe("port-scoped host-alias IPv4 targets", () => {
+  it("preserves registered ports in network and sandbox configuration", async () => {
+    expect(new NetworkBuilder().build().hostAliasIpv4Ports).toBeUndefined();
+    expect(new NetworkBuilder().hostAliasIPv4Port(12345).build().hostAliasIpv4Ports).toEqual([12345]);
+    const config = await Sandbox.builder("x").image("alpine")
+      .network(n => n.hostAliasIPv4Port(12345)).build();
+    expect(config.network.hostAliasIpv4Ports).toEqual([12345]);
+  });
+
+  it("rejects zero, out-of-range, and fractional ports without truncation", () => {
+    for (const port of [0, -1, 65536, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => new NetworkBuilder().hostAliasIPv4Port(port)).toThrow(/hostAliasIPv4Port/);
+      expect(() => Sandbox.restore("saved").hostAliasIPv4Port(port)).toThrow(/hostAliasIPv4Port/);
+    }
+  });
+});
+
 describe("NetworkBuilder HTTP denial messages", () => {
   it("requires an explicit opt-in and preserves settings across callbacks", () => {
     expect(new NetworkBuilder().build().http.denyResponse).toBe(false);
