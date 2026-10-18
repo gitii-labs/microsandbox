@@ -305,7 +305,6 @@ impl LaunchContract {
             if let Some(fields) = network.as_object_mut() {
                 fields.remove("max_udp_connections");
                 fields.remove("tcp_accept_queue_size");
-                fields.remove("host_alias_ipv4_ports");
             }
             // Pin the previous default at the boundary; omission on the current contract
             // intentionally has a different meaning and must not broaden an old launch.
