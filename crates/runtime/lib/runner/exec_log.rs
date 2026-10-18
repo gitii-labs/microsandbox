@@ -14,7 +14,8 @@
 //! `design/runtime/sandbox-logs.md` D3a for the rationale.
 //!
 //! The writer is a thin wrapper around [`crate::logging::RotatingLog`]:
-//! disk size is bounded at 10 MiB × 3 rotated files (40 MiB ceiling).
+//! files rotate at 10 MiB through `exec.log.1`..`exec.log.4`, and older
+//! files are kept as compressed archives that the embedder prunes.
 
 use std::path::Path;
 use std::sync::Mutex;

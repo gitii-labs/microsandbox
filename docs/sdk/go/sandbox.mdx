@@ -1604,6 +1604,25 @@ Hand off PID 1 inside the guest to a custom init binary after agentd finishes bo
   </div>
 </div>
 
+#### <span className="msb-recv"></span><span className="msb-hn">WithLogDir()</span>
+
+<Tooltip tip="Not accepted on microsandbox cloud; log files are local to the host."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```go
+func WithLogDir(dir string) SandboxOption
+```
+
+Write the sandbox's log files to `dir` instead of `<sandbox-dir>/logs`. Creation creates the directory if needed and makes `<sandbox-dir>/logs` a symlink to it, so log readers, `msb logs` and later starts use it. Removing the sandbox removes only the symlink; the directory and its files stay with the caller. A relative path resolves against the working directory at creation. The directory must be outside microsandbox storage and the sandbox's mount sources, and only one running sandbox can use it at a time. Not supported on Windows. See [Logs](/sandboxes/logs#choose-the-log-directory).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>dir</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Host directory for the log files.</div>
+  </div>
+</div>
+
 #### <span className="msb-recv"></span><span className="msb-hn">WithLogLevel()</span>
 
 ```go
@@ -2949,6 +2968,7 @@ The full configuration of a sandbox. Most callers build a sandbox via `CreateSan
 | SecurityProfile | [`SecurityProfile`](#securityprofile) | In-guest security profile |
 | Hostname | `string` | Guest hostname |
 | User | `string` | Default guest user |
+| LogDir | `string` | Host directory for log files instead of `<sandbox-dir>/logs` |
 | Replace | `bool` | Replace existing sandbox with same name |
 | ReplaceWithTimeout | `*time.Duration` | Timeout between SIGTERM and SIGKILL (implies `Replace`) |
 | Env | `map[string]string` | Environment variables |

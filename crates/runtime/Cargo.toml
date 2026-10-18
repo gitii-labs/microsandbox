@@ -19,6 +19,7 @@ runner = [
     "dep:bytes",
     "dep:crossbeam-queue",
     "dep:clap",
+    "dep:flate2",
     "dep:hex",
     "dep:microsandbox-image",
     "dep:microsandbox-agent-client",
@@ -45,6 +46,7 @@ chrono.workspace = true
 clap = { workspace = true, features = ["derive"], optional = true }
 hex = { workspace = true, optional = true }
 crossbeam-queue = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 libc.workspace = true
 microsandbox-agent-client = { workspace = true, optional = true }
 microsandbox-db.workspace = true

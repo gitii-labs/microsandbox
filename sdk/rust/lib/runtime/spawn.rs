@@ -427,6 +427,28 @@ pub async fn spawn_sandbox(
         &config.spec.name,
     )?;
 
+    // A caller-chosen log directory is linked from `<sandbox>/logs`. Report a removed target
+    // by name instead of the bare "File exists" that creating through the dangling link gives.
+    if let Ok(target) = tokio::fs::read_link(&log_dir).await
+        && let Err(error) = tokio::fs::metadata(&log_dir).await
+    {
+        return Err(MicrosandboxError::Runtime(
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "log directory {} linked from {} is missing; recreate it to start the sandbox",
+                    target.display(),
+                    log_dir.display()
+                )
+            } else {
+                format!(
+                    "cannot access log directory {} linked from {}: {error}",
+                    target.display(),
+                    log_dir.display()
+                )
+            },
+        ));
+    }
+
     // Create directories concurrently.
     tokio::try_join!(
         tokio::fs::create_dir_all(&log_dir),

@@ -1842,6 +1842,7 @@ type CreateOptions struct {
 	DeploymentProfile    string               `json:"deployment_profile,omitempty"`
 	Hostname             string               `json:"hostname,omitempty"`
 	User                 string               `json:"user,omitempty"`
+	LogDir               string               `json:"log_dir,omitempty"`
 	Replace              bool                 `json:"replace,omitempty"`
 	ReplaceWithTimeoutMs *uint64              `json:"replace_with_timeout_ms,omitempty"`
 	Env                  map[string]string    `json:"env,omitempty"`

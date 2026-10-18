@@ -721,6 +721,8 @@ fn run(
     let startup_writer = startup_writer
         .map(|writer| failure_channel.retain(writer))
         .transpose()?;
+    // Held until the process exits: one runtime writes a log directory at a time.
+    let _log_dir_lock = super::logging::lock_log_dir(&config.log_dir)?;
     setup_log_capture(&config.log_dir, config.forward_output)?;
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
@@ -2813,8 +2815,12 @@ fn build_vm(
     });
 
     // Console — ring-buffer-based custom backend for agent protocol, plus
-    // console output routed to kernel.log for kernel/init logs.
-    let kernel_log_path = config.log_dir.join("kernel.log");
+    // console output routed to kernel.log for kernel/init logs. libkrun truncates kernel.log
+    // when it opens the console, so keep the previous boot's output as an archive first.
+    if let Err(error) = super::logging::archive_kernel_log(&config.log_dir) {
+        tracing::warn!(%error, "failed to archive kernel.log; the previous boot's output may be truncated or left uncompressed");
+    }
+    let kernel_log_path = config.log_dir.join(super::logging::KERNEL_LOG_FILENAME);
     #[cfg(unix)]
     {
         builder = builder.console(|c| {

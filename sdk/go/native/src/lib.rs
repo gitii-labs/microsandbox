@@ -1162,6 +1162,8 @@ struct SandboxCreateOpts {
     ephemeral: bool,
     hostname: Option<String>,
     user: Option<String>,
+    /// Host directory for the sandbox's log files instead of `<sandbox>/logs`.
+    log_dir: Option<String>,
     security_profile: Option<String>,
     deployment_profile: Option<String>,
     #[serde(default)]
@@ -2550,6 +2552,9 @@ pub unsafe extern "C" fn msb_sandbox_create(
             }
             if let Some(u) = opts.user {
                 builder = builder.user(u);
+            }
+            if let Some(dir) = opts.log_dir {
+                builder = builder.log_dir(dir);
             }
             if let Some(profile) = security_profile {
                 builder = builder.security(profile);

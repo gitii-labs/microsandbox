@@ -16,12 +16,14 @@
 //!
 //! - `exec.log` + rotated siblings (`exec.log.1` ... `exec.log.4`):
 //!   JSON Lines, captured stdout / stderr / pty output written by
-//!   the runtime relay tap. Rotates at 10 MiB per file, retains up
-//!   to four historical files on disk (~40 MiB ceiling).
+//!   the runtime relay tap. Rotates at 10 MiB per file; files older
+//!   than `exec.log.4` move to compressed archives
+//!   (`exec.log.<UTC timestamp>.gz`) that readers do not open.
 //! - `runtime.log`: plain text, runtime diagnostics. Only read when
-//!   `System` is in the requested sources. Does not rotate.
+//!   `System` is in the requested sources. Only the live file is read.
 //! - `kernel.log`: plain text, guest kernel console. Only read when
-//!   `System` is in the requested sources. Does not rotate.
+//!   `System` is in the requested sources. Replaced on every boot;
+//!   the previous boot's file is archived.
 //!
 //! Adding a new log file type is one entry in `LOG_FILES`.
 //!
@@ -44,11 +46,11 @@
 //! the producer wrote to the now-rotated file before transitioning
 //! to the new active file.
 //!
-//! However, the producer caps disk retention at four rotated files
-//! (~40 MiB). If a consumer falls behind enough that the inode it
-//! was reading rotates past that retention window before the
-//! stream catches up, the file is overwritten and lost. When that
-//! happens, the stream yields
+//! However, readers only walk four rotated files (~40 MiB). If a
+//! consumer falls behind enough that the inode it was reading
+//! rotates past `exec.log.4` before the stream catches up, the file
+//! moves to an archive the stream does not read. When that happens,
+//! the stream yields
 //! [`crate::MicrosandboxError::MissedRotation`]
 //! and ends. Hard-fail by design — restart from
 //! [`LogStreamStart::Beginning`], [`LogStreamStart::Since`] with

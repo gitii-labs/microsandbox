@@ -8,6 +8,7 @@
 #[cfg(all(test, unix))]
 mod archive_tests;
 mod cleanup;
+mod log_dir;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,7 @@ use crate::sandbox::{
 };
 use crate::timing::{self, TARGET};
 use cleanup::CreationCleanup;
+use log_dir::{link_log_dir, prepare_log_dir};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -436,6 +438,17 @@ impl LocalBackend {
         };
         if enforce {
             super::super::host_paths::check_bind_roots_do_not_follow_symlinks(&config)?;
+        }
+        // Mount sources are final here. Check and create the caller's log directory before OCI
+        // storage is written; restored and branched child storage is still guard-owned, so an
+        // unusable directory cannot leave a partial sandbox directory behind.
+        if let Some(log_dir) = &config.log_dir {
+            prepare_log_dir(
+                &config,
+                &self.sandboxes_dir(),
+                &self.config().volumes_dir(),
+                log_dir,
+            )?;
         }
 
         // Archive descriptors are resolved here, after the builder's initial validation.
@@ -842,6 +855,17 @@ impl LocalBackend {
             // awaited cleanup can prove the name is free before a CLI caller exits.
             drop(lifecycle_guard);
             return Err(creation_cleanup.finish_owned_failure(error).await);
+        }
+
+        if let Some(log_dir) = &config.log_dir
+            && let Err(error) = link_log_dir(&sandbox_dir, log_dir)
+        {
+            rollback_created_named_volumes(self, &created_named_volumes).await;
+            if has_owned_volumes {
+                drop(lifecycle_guard);
+                return Err(creation_cleanup.finish_owned_failure(error).await);
+            }
+            return Err(error);
         }
 
         // Claim the persisted identity in Starting state. Running is published only after the
