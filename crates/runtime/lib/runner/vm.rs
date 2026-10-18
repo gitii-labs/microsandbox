@@ -2816,7 +2816,7 @@ fn build_vm(
     // console output routed to kernel.log for kernel/init logs. libkrun truncates kernel.log
     // when it opens the console, so keep the previous boot's output as an archive first.
     if let Err(error) = super::logging::archive_kernel_log(&config.log_dir) {
-        tracing::warn!(%error, "failed to archive the previous kernel.log; it will be truncated");
+        tracing::warn!(%error, "failed to archive kernel.log; the previous boot's output may be truncated or left uncompressed");
     }
     let kernel_log_path = config.log_dir.join(super::logging::KERNEL_LOG_FILENAME);
     #[cfg(unix)]

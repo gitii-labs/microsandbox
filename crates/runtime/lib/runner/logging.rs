@@ -120,7 +120,11 @@ impl RotatingLog {
         let path = log_dir.join(&file_name);
         let written = path.metadata().map(|m| m.len()).unwrap_or(0);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let archiver = LogArchiver::start(log_dir, &file_name);
+        // This runs on the thread that drains the runtime's stderr, so a failure cannot be
+        // logged here without risking a blocked pipe. Archives then stay uncompressed until
+        // the next runtime start compresses them.
+        let archiver =
+            LogArchiver::start(log_dir, &file_name).unwrap_or_else(|_| LogArchiver::disabled());
 
         Ok(Self {
             log_dir: log_dir.to_path_buf(),
@@ -172,35 +176,26 @@ impl RotatingLog {
 impl LogArchiver {
     /// Start the archiver thread for `<log_dir>/<file_name>` and queue one
     /// pass for archives left by a previous process.
-    ///
-    /// When the thread cannot be started, archives stay uncompressed.
-    pub(crate) fn start(log_dir: &Path, file_name: &str) -> Self {
+    pub(crate) fn start(log_dir: &Path, file_name: &str) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let log_dir = log_dir.to_path_buf();
         let worker_file_name = file_name.to_string();
         let worker = std::thread::Builder::new()
             .name(format!("log-archive-{file_name}"))
-            .spawn(move || run_archiver(&log_dir, &worker_file_name, &receiver));
-        match worker {
-            Ok(worker) => {
-                let archiver = Self {
-                    sender: Some(sender),
-                    worker: Some(worker),
-                };
-                archiver.compress();
-                archiver
-            }
-            Err(error) => {
-                tracing::warn!(
-                    file = file_name,
-                    %error,
-                    "failed to start the log archive thread; archives stay uncompressed"
-                );
-                Self {
-                    sender: None,
-                    worker: None,
-                }
-            }
+            .spawn(move || run_archiver(&log_dir, &worker_file_name, &receiver))?;
+        let archiver = Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        };
+        archiver.compress();
+        Ok(archiver)
+    }
+
+    /// An archiver without a thread: archives stay uncompressed and reports are dropped.
+    fn disabled() -> Self {
+        Self {
+            sender: None,
+            worker: None,
         }
     }
 
@@ -257,13 +252,22 @@ impl RotatingLog {
         }
 
         // Rename current log to .log.1
-        fs::rename(&self.path, rotated_path(&self.path, 1))?;
+        let newest = rotated_path(&self.path, 1);
+        fs::rename(&self.path, &newest)?;
 
-        // Open a fresh log file
-        self.file = OpenOptions::new()
+        // Open a fresh log file. If that fails, move the current file back so the retained
+        // handle keeps writing to the live path instead of a file that later rotations archive.
+        self.file = match OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)?;
+            .open(&self.path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                fs::rename(&newest, &self.path)?;
+                return Err(error.into());
+            }
+        };
         self.written = 0;
 
         if archived.is_some() {
@@ -298,7 +302,7 @@ pub(crate) fn archive_kernel_log(log_dir: &Path) -> io::Result<LogArchiver> {
     if has_content {
         archive_file(log_dir, KERNEL_LOG_FILENAME, &path, Utc::now())?;
     }
-    Ok(LogArchiver::start(log_dir, KERNEL_LOG_FILENAME))
+    LogArchiver::start(log_dir, KERNEL_LOG_FILENAME)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -603,6 +607,44 @@ mod tests {
         archived.sort();
         let expected: Vec<Vec<u8>> = (0..total - 5).map(line).collect();
         assert_eq!(archived, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rotation_keeps_appending_to_the_live_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RotatingLog::new(dir.path(), "runtime", LINE_BYTES).unwrap();
+        log.write(&line(0)).unwrap();
+
+        // A read-only directory refuses every rename, so rotation fails.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let denied = fs::rename(dir.path().join("runtime.log"), dir.path().join("probe")).is_err();
+        if denied {
+            log.write(&line(1)).unwrap();
+            log.write(&line(2)).unwrap();
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        // Root ignores directory permissions; nothing to check without a failing rename.
+        if !denied {
+            return;
+        }
+
+        let mut expected = line(0);
+        expected.extend(line(1));
+        expected.extend(line(2));
+        assert_eq!(fs::read(dir.path().join("runtime.log")).unwrap(), expected);
+        assert_eq!(names(dir.path()), ["runtime.log"]);
+
+        // The retry happens once another full file has been written after the failure.
+        log.write(&line(3)).unwrap();
+        log.finish();
+        assert_eq!(fs::read(dir.path().join("runtime.log")).unwrap(), line(3));
+        assert_eq!(
+            fs::read(dir.path().join("runtime.log.1")).unwrap(),
+            expected
+        );
     }
 
     #[test]
