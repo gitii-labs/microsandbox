@@ -1,17 +1,27 @@
 //! Integration tests for the `host.microsandbox.internal` alias.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use ipnetwork::{IpNetwork, Ipv4Network};
 use microsandbox::{NetworkPolicy, Sandbox};
+use microsandbox_network::config::InterfaceOverrides;
 use microsandbox_network::policy::{Action, Destination, DestinationGroup, Rule};
 use test_utils::msb_test;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+// Documented slot-zero guest addresses. Explicit overrides enable both families without host
+// external routes; each sandbox has an isolated stack, and its real gateways are read from the guest.
+const HOST_ALIAS_GUEST_IPV4: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
+const HOST_ALIAS_GUEST_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd42, 0x6d73, 0x62, 0, 0, 0, 0, 2);
 
 //--------------------------------------------------------------------------------------------------
 // Host HTTP fixture
@@ -114,6 +124,12 @@ async fn read_gateway_ip(sb: &Sandbox) -> String {
         .shell("awk '/^nameserver /{print $2; exit}' /etc/resolv.conf")
         .await
         .expect("read resolv.conf");
+    assert!(
+        out.status().success,
+        "read resolv.conf failed: {:?}, stderr: {}",
+        out.status(),
+        out.stderr().unwrap()
+    );
     out.stdout().expect("utf8").trim().to_owned()
 }
 
@@ -125,6 +141,12 @@ async fn read_gateway_ipv6(sb: &Sandbox) -> String {
         )
         .await
         .expect("read host alias IPv6");
+    assert!(
+        out.status().success,
+        "read host alias IPv6 failed: {:?}, stderr: {}",
+        out.status(),
+        out.stderr().unwrap()
+    );
     out.stdout().expect("utf8").trim().to_owned()
 }
 
@@ -248,23 +270,50 @@ async fn registered_host_alias_ipv4_port_supports_both_guest_families_and_host_p
             .replace()
             .network(|n| {
                 n.policy(policy)
-                    .ipv4_pool("172.16.0.0/12".parse().unwrap())
-                    .ipv6_pool("fd42:6d73:62::/48".parse().unwrap())
+                    .interface(InterfaceOverrides {
+                        ipv4_address: Some(HOST_ALIAS_GUEST_IPV4),
+                        ipv6_address: Some(HOST_ALIAS_GUEST_IPV6),
+                        ..Default::default()
+                    })
                     .host_alias_ipv4_port(std::num::NonZeroU16::new(port).unwrap())
             })
             .create()
             .await
             .expect("create explicit dual-stack sandbox");
+        let network = sb.shell("command -v awk && command -v ip && command -v wget && ip addr show dev eth0 && ip -4 route show default && ip -6 route show default && cat /etc/hosts")
+            .await.expect("inspect guest network");
+        assert!(
+            network.status().success,
+            "guest network inspection failed: {:?}, stdout: {}, stderr: {}",
+            network.status(),
+            network.stdout().unwrap(),
+            network.stderr().unwrap()
+        );
+        let network_state = network.stdout().unwrap();
+        assert!(
+            network_state.contains(&format!("inet {HOST_ALIAS_GUEST_IPV4}/")),
+            "guest IPv4 address missing:\n{network_state}"
+        );
+        assert!(
+            network_state.contains(&format!("inet6 {HOST_ALIAS_GUEST_IPV6}/")),
+            "guest IPv6 address missing:\n{network_state}"
+        );
         let v4 = read_gateway_ip(&sb).await;
         let v6 = read_gateway_ipv6(&sb).await;
         assert!(
             v4.parse::<Ipv4Addr>().is_ok(),
-            "expected IPv4 gateway, got {v4}"
+            "expected IPv4 gateway, got {v4}; guest network:\n{network_state}"
         );
         assert!(
             v6.parse::<std::net::Ipv6Addr>().is_ok(),
-            "expected IPv6 gateway, got {v6}"
+            "expected IPv6 gateway, got {v6}; guest network:\n{network_state}"
         );
+        for gateway in [&v4, &v6] {
+            assert!(
+                network_state.contains(&format!("default via {gateway} ")),
+                "guest gateway route missing for {gateway}:\n{network_state}"
+            );
+        }
         for authority in [
             v4,
             format!("[{v6}]"),

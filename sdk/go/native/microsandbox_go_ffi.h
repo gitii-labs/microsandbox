@@ -16,6 +16,11 @@ typedef uint64_t Handle;
 void msb_supports_host_alias_ipv4_ports(void);
 
 /**
+ * Capability marker: this native SDK accepts validated guest interface overrides.
+ */
+void msb_supports_network_interface_overrides(void);
+
+/**
  * Free a C string previously returned as an error from any `msb_*` function.
  * Safe to call with a null pointer (no-op).
  *

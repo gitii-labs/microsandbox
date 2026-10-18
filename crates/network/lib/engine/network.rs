@@ -1321,6 +1321,60 @@ mod tests {
     }
 
     #[test]
+    fn explicit_dual_stack_addresses_override_missing_host_routes() {
+        let mut config = NetworkConfig::default();
+        config.interface.ipv4_pool = Some(default_guest_ipv4_pool());
+        config.interface.ipv6_pool = Some(default_guest_ipv6_pool());
+        let pool_only = SmoltcpNetwork::build(
+            resolved(config.clone()),
+            0,
+            DeploymentProfile::SingleTenant,
+            routes(true, false),
+        )
+        .unwrap()
+        .guest_bootstrap_network();
+        assert!(pool_only.ipv4.is_some());
+        assert!(
+            pool_only.ipv6.is_none(),
+            "a pool alone must not imply an active guest family"
+        );
+        let guest_ipv4 = derive_guest_ipv4(default_guest_ipv4_pool(), 0).unwrap();
+        let guest_ipv6 = derive_guest_ipv6(default_guest_ipv6_pool(), 0).unwrap();
+        config.interface.ipv4_address = Some(guest_ipv4);
+        config.interface.ipv6_address = Some(guest_ipv6);
+        for host_routes in [
+            routes(false, false),
+            routes(true, false),
+            routes(false, true),
+        ] {
+            let net = SmoltcpNetwork::build(
+                resolved(config.clone()),
+                0,
+                DeploymentProfile::SingleTenant,
+                host_routes,
+            )
+            .unwrap();
+            let bootstrap = net.guest_bootstrap_network();
+            let ipv4 = bootstrap.ipv4.expect("explicit IPv4 must be provisioned");
+            let ipv6 = bootstrap.ipv6.expect("explicit IPv6 must be provisioned");
+            assert_eq!(ipv4.address, guest_ipv4);
+            assert_eq!(ipv6.address, guest_ipv6);
+            assert_eq!(ipv4.gateway, gateway_from_guest_ipv4(guest_ipv4));
+            assert_eq!(ipv6.gateway, gateway_from_guest_ipv6(guest_ipv6));
+            assert!(
+                net.guest_env_vars()
+                    .iter()
+                    .any(|(key, _)| key == ENV_NET_IPV4)
+            );
+            assert!(
+                net.guest_env_vars()
+                    .iter()
+                    .any(|(key, _)| key == ENV_NET_IPV6)
+            );
+        }
+    }
+
+    #[test]
     fn published_ports_preserve_existing_address_families() {
         for (host_routes, explicit_address, profile, expected_ipv4, expected_ipv6) in [
             (

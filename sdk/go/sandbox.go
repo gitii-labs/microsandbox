@@ -461,6 +461,13 @@ func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 		TrustHostCAs:          n.TrustHostCAs,
 	}
 
+	if n.Interface != nil {
+		out.Interface = &ffi.NetworkInterfaceOptions{
+			IPv4Address: n.Interface.IPv4Address,
+			IPv6Address: n.Interface.IPv6Address,
+		}
+	}
+
 	if n.HTTP != nil {
 		out.HTTP = &ffi.HTTPConfig{DenyResponse: n.HTTP.DenyResponse, DenyMessage: n.HTTP.DenyMessage}
 	}

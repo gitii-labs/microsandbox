@@ -30,6 +30,13 @@ Local SDK APIs:
 - Python: `Network(host_alias_ipv4_ports=(port,))`.
 - CLI network JSON: `{"host_alias_ipv4_ports": [12345]}` via `--net-conf`.
 
+Address pools select where active guest families allocate addresses; a pool alone
+does not enable a family without a host route. Explicit guest interface addresses
+enable the selected families independently of external host routing. Rust exposes
+`NetworkBuilder.interface(InterfaceOverrides { ... })`; Go exposes
+`NetworkConfig.Interface` with `NetworkInterfaceOverrides.IPv4Address` and
+`IPv6Address`. Go requires a native SDK supporting guest interface overrides.
+
 The mapping is saved with sandbox network configuration and retained on restart
 and ordinary source-config branches. Snapshot archives do not capture network
 configuration: restore uses the destination's list rather than inheriting source

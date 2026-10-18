@@ -1220,6 +1220,10 @@ type NetworkConfig struct {
 	// for both guest gateway families. Ports must be nonzero. Policy is unchanged.
 	HostAliasIPv4Ports []uint16
 
+	// Interface replaces guest interface overrides. Explicit addresses enable their
+	// families even when the host has no external route. Pool fields below apply afterward.
+	Interface *NetworkInterfaceOverrides
+
 	// IPv4Pool is used to derive per-sandbox /30 guest subnets.
 	// Defaults to "172.16.0.0/12".
 	IPv4Pool string
@@ -1252,6 +1256,15 @@ type NetworkConfig struct {
 
 	// HTTP configures HTTP denial responses.
 	HTTP *HTTPConfig
+}
+
+// NetworkInterfaceOverrides supplies explicit addresses on the guest's isolated network.
+// Empty addresses use normal slot-derived, host-route-dependent family selection.
+type NetworkInterfaceOverrides struct {
+	// IPv4Address is a guest IPv4 address without a CIDR prefix.
+	IPv4Address string
+	// IPv6Address is a guest IPv6 address without a CIDR prefix.
+	IPv6Address string
 }
 
 // HTTPConfig configures HTTP denial responses.

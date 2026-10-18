@@ -1064,6 +1064,20 @@ func TestFFIWireShape_HostAliasIPv4Ports(t *testing.T) {
 	}
 }
 
+func TestFFIWireShape_NetworkInterfaceOverrides(t *testing.T) {
+	omitted := marshalCreateOptions(t, WithNetwork(&NetworkConfig{}))["network"].(map[string]any)
+	if _, present := omitted["interface"]; present {
+		t.Fatal("unset interface reached the wire")
+	}
+	got := marshalCreateOptions(t, WithNetwork(&NetworkConfig{
+		Interface: &NetworkInterfaceOverrides{IPv4Address: "172.16.0.2", IPv6Address: "fd42:6d73:62::2"},
+	}))["network"].(map[string]any)
+	iface, ok := got["interface"].(map[string]any)
+	if !ok || iface["ipv4_address"] != "172.16.0.2" || iface["ipv6_address"] != "fd42:6d73:62::2" {
+		t.Fatalf("guest interface lost: %#v", got["interface"])
+	}
+}
+
 func TestBuildFFINetworkRateLimiters(t *testing.T) {
 	out := buildFFINetwork(&NetworkConfig{
 		RateLimiter: &NetworkRateLimiterConfig{

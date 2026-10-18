@@ -404,6 +404,13 @@ editing: configured sandboxes must be managed by a supporting SDK. Rust direct
 struct literals for `NetworkConfig` or `NetworkSpec` must initialize the added
 field or use `..Default::default()`; builders using defaults are unchanged.
 
+Go's optional `NetworkConfig.Interface` carries guest addresses through the existing
+validated runtime interface wire type. Explicit addresses enable their families even
+without external host routes; allocation pools alone do not. The optional
+`msb_supports_network_interface_overrides` native symbol prevents older native SDKs
+from silently dropping the supplied interface. No runtime or snapshot format changes
+are needed for these already-supported interface overrides.
+
 Strict hostname policy is enabled by default. The v0.6.0–v0.6.17 launch gate rejects strict policies containing outbound hostname allow rules, including domain suffixes and rules applying in both directions. Policies without those rules retain their existing behavior on older runtimes because strict enforcement is unused. Explicit `strict: false` remains supported.
 
 Observable network behavior is an effective compatibility contract. It includes default MTU, sandbox-slot address derivation, IPv4 subnet sizing, guest and gateway offsets, IPv6 prefixes, deterministic MAC addresses, interface name `eth0`, `host.microsandbox.internal`, DNS UDP and TCP behavior, DNS-over-TLS, TLS interception and trust paths, published-port binding, TCP half-close, UDP peer lifetime, destination policy, and host-side secret placeholder substitution.
