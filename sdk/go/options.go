@@ -847,8 +847,10 @@ func WithReplace() SandboxOption {
 // symlink to it, so Logs, LogStream, `msb logs` and later starts all use dir,
 // including from SDK releases that predate this option. Removing the sandbox
 // removes the symlink and leaves dir and its files in place; the caller owns
-// their cleanup. Give each sandbox its own directory. Not supported on Windows
-// or by cloud backends.
+// their cleanup. Creation rejects a directory that overlaps microsandbox
+// storage or the sandbox's mount sources, and a runtime refuses to start while
+// another running sandbox uses the directory. Not supported on Windows or by
+// cloud backends.
 func WithLogDir(dir string) SandboxOption {
 	return func(o *SandboxConfig) { o.LogDir = dir }
 }

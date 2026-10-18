@@ -504,7 +504,9 @@ impl SandboxBuilder {
     /// `<sandbox>/logs` a symlink to it, so `msb logs`, the SDK log readers and
     /// later starts all use `dir`. Removing the sandbox removes the symlink
     /// and leaves `dir` and its files in place; the caller owns their cleanup.
-    /// Give each sandbox its own directory. Not supported on Windows or by
+    /// Creation rejects a directory that overlaps microsandbox storage or the
+    /// sandbox's mount sources, and a runtime refuses to start while another
+    /// running sandbox uses the directory. Not supported on Windows or by
     /// cloud backends.
     pub fn log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.log_dir = Some(Some(dir.into()));

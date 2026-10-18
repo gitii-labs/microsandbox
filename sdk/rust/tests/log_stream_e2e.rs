@@ -222,6 +222,27 @@ async fn log_dir_receives_logs_and_survives_removal() {
         .exec("sh", ["-c", &format!("echo {marker}")])
         .await
         .expect("exec");
+
+    // A second sandbox cannot write the same log directory while the first runs.
+    let shared = Sandbox::builder("log-stream-e2e-log-dir-shared")
+        .image(ALPINE)
+        .cpus(1)
+        .memory(512)
+        .log_dir(&log_dir)
+        .replace()
+        .create()
+        .await;
+    let error = shared
+        .err()
+        .expect("second runtime on one log dir must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("in use by another sandbox runtime"),
+        "{error}"
+    );
+    let _ = Sandbox::remove("log-stream-e2e-log-dir-shared").await;
+
     sandbox.stop().await.expect("stop");
     drop(sandbox);
 
@@ -243,22 +264,41 @@ async fn log_dir_receives_logs_and_survives_removal() {
         "marker from the first boot missing after restart"
     );
 
-    // The first boot's kernel output survives the restart as an archive.
+    // The first boot's kernel output survives the restart as an archive, compressed or not
+    // yet compressed when the restarted runtime exited. In-progress `.gz.partial` files are
+    // not archives.
     let kernel_archives: Vec<_> = std::fs::read_dir(&log_dir)
         .expect("list log dir")
-        .map(|entry| {
-            entry
-                .expect("entry")
-                .file_name()
-                .into_string()
-                .expect("utf-8")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            name.starts_with("kernel.log.") && name.contains('T') && !name.ends_with(".partial")
         })
-        .filter(|name| name.starts_with("kernel.log.") && name.contains('T'))
         .collect();
     assert_eq!(
         kernel_archives.len(),
         1,
         "kernel archives: {kernel_archives:?}"
+    );
+    let archived = if kernel_archives[0]
+        .extension()
+        .is_some_and(|ext| ext == "gz")
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(
+                std::fs::File::open(&kernel_archives[0]).expect("open archive"),
+            ),
+            &mut bytes,
+        )
+        .expect("decompress archive");
+        bytes
+    } else {
+        std::fs::read(&kernel_archives[0]).expect("read archive")
+    };
+    assert_eq!(
+        archived, kernel_first_boot,
+        "archive differs from the first boot's kernel.log"
     );
 
     // A removed log directory is reported by name instead of being recreated elsewhere.
