@@ -273,16 +273,23 @@ impl SharedState {
     }
 
     /// Returns `true` when any resolved hostname for `addr` satisfies `predicate`.
-    pub fn any_resolved_hostname(
+    pub fn any_resolved_hostname(&self, addr: IpAddr, predicate: impl FnMut(&str) -> bool) -> bool {
+        self.any_resolved_hostname_at(addr, Instant::now(), predicate)
+    }
+
+    /// Returns `true` when any resolved hostname for `addr` that has not
+    /// expired at `now` satisfies `predicate`.
+    pub(crate) fn any_resolved_hostname_at(
         &self,
         addr: IpAddr,
+        now: Instant,
         mut predicate: impl FnMut(&str) -> bool,
     ) -> bool {
         let addr = normalize_ip_addr(addr);
 
         self.resolved_hostnames
             .read()
-            .member_matches(&addr, Instant::now(), |key| predicate(&key.hostname))
+            .member_matches(&addr, now, |key| predicate(&key.hostname))
     }
 
     /// Best-effort expiry maintenance for resolved hostnames.
