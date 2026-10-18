@@ -20,6 +20,14 @@ mod tests;
 /// Do not call this when reopening existing saved state: legacy relative paths keep
 /// their previous interpretation and must not be rewritten during restart.
 pub(crate) fn resolve_host_paths(config: &mut SandboxConfig) -> MicrosandboxResult<()> {
+    // A caller-chosen log directory is linked from the sandbox directory with a symlink,
+    // which Windows only permits with elevated privileges or developer mode.
+    #[cfg(windows)]
+    if config.log_dir.is_some() {
+        return Err(MicrosandboxError::InvalidConfig(
+            "log_dir is not supported on Windows".into(),
+        ));
+    }
     // Restore sources are operation-only paths too. They can be consumed after
     // snapshot preparation or a background task has yielded.
     if !config.local_restore_paths_resolved {
@@ -140,6 +148,9 @@ pub(crate) fn resolve_patch_paths(patch: &mut crate::SandboxConfigPatch) -> Micr
     if patch.spec.patches.is_some() {
         patch.spec.patches = Some(config.spec.patches);
     }
+    if patch.log_dir.is_some() {
+        patch.log_dir = Some(config.log_dir);
+    }
     if let Some(tls) = &mut patch.spec.network.tls
         && let Some(resolved) = config.spec.network.tls
     {
@@ -224,6 +235,11 @@ fn visit_host_paths(
                 | Patch::Append { .. } => {}
             }
         }
+    }
+
+    // The log directory is linked from the sandbox directory during creation.
+    if let Some(path) = &mut config.log_dir {
+        visit(path, "log directory")?;
     }
 
     // TLS files are reopened on every boot too. A different cwd must not select

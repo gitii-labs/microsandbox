@@ -198,6 +198,77 @@ async fn log_stream_resume_from_cursor_excludes_replayed_entries() {
     );
 }
 
+/// Caller-chosen log directory: logs land there, a restart keeps the
+/// previous boot's kernel.log as an archive, readers see the files through
+/// `<sandbox>/logs`, and removing the sandbox leaves the directory.
+#[cfg(unix)]
+#[msb_test]
+async fn log_dir_receives_logs_and_survives_removal() {
+    let name = "log-stream-e2e-log-dir";
+    let marker = "log-e2e-log-dir-marker-5d1c";
+    let chosen = tempfile::tempdir().expect("log dir");
+    let log_dir = chosen.path().join("topic");
+
+    let sandbox = Sandbox::builder(name)
+        .image(ALPINE)
+        .cpus(1)
+        .memory(512)
+        .log_dir(&log_dir)
+        .replace()
+        .create()
+        .await
+        .expect("create sandbox");
+    sandbox
+        .exec("sh", ["-c", &format!("echo {marker}")])
+        .await
+        .expect("exec");
+    sandbox.stop().await.expect("stop");
+    drop(sandbox);
+
+    let kernel_first_boot = std::fs::read(log_dir.join("kernel.log")).expect("kernel.log");
+    assert!(
+        !kernel_first_boot.is_empty(),
+        "first boot wrote no kernel output"
+    );
+
+    let restarted = Sandbox::start(name).await.expect("restart");
+    let entries = restarted
+        .logs(&LogOptions::default())
+        .await
+        .expect("read logs");
+    restarted.stop().await.expect("stop restarted");
+    drop(restarted);
+    assert!(
+        entries.iter().any(|e| contains(e, marker)),
+        "marker from the first boot missing after restart"
+    );
+
+    // The first boot's kernel output survives the restart as an archive.
+    let kernel_archives: Vec<_> = std::fs::read_dir(&log_dir)
+        .expect("list log dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8")
+        })
+        .filter(|name| name.starts_with("kernel.log.") && name.contains('T'))
+        .collect();
+    assert_eq!(
+        kernel_archives.len(),
+        1,
+        "kernel archives: {kernel_archives:?}"
+    );
+
+    Sandbox::remove(name).await.expect("remove");
+    let exec_log = std::fs::read_to_string(log_dir.join("exec.log")).expect("exec.log kept");
+    assert!(
+        exec_log.contains(marker),
+        "exec.log lost the marker after removal"
+    );
+}
+
 fn contains(entry: &microsandbox::logs::LogEntry, needle: &str) -> bool {
     std::str::from_utf8(&entry.data)
         .map(|s| s.contains(needle))

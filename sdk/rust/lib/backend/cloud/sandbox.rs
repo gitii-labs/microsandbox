@@ -394,6 +394,13 @@ impl TryFrom<SandboxConfig> for CloudCreateBody {
                 UnsupportedReason::ConfigField("forked"),
             ));
         }
+        if config.log_dir.is_some() {
+            // Log placement is a local host-filesystem choice with no cloud representation.
+            return Err(MicrosandboxError::unsupported(
+                Operation::SandboxCreate,
+                UnsupportedReason::ConfigField("log_dir"),
+            ));
+        }
         if config.replace_existing {
             return Err(MicrosandboxError::unsupported(
                 Operation::SandboxCreate,
@@ -1578,6 +1585,14 @@ mod tests {
         });
 
         assert_unsupported_config_field(config, "named volume inline create");
+    }
+
+    #[test]
+    fn cloud_create_rejects_log_dir_before_sending_request() {
+        let mut config = base_cloud_config();
+        config.log_dir = Some("/var/log/sandbox".into());
+
+        assert_unsupported_config_field(config, "log_dir");
     }
 
     #[test]

@@ -199,6 +199,16 @@ pub struct SandboxConfig {
     #[config_patch(nullable)]
     pub slug: Option<String>,
 
+    /// Host directory that holds this sandbox's log files (local backend only).
+    ///
+    /// Local creation makes `<sandbox>/logs` a symlink to this directory, so log
+    /// readers and later starts follow it and removing the sandbox leaves the
+    /// directory in place. The symlink is the durable record; this create-time
+    /// option is not persisted.
+    #[serde(skip)]
+    #[config_patch(nullable)]
+    pub(crate) log_dir: Option<PathBuf>,
+
     /// Manifest digest for the resolved OCI image.
     ///
     /// Set at create time. Used by spawn to derive VMDK and fsmeta paths
@@ -1125,6 +1135,7 @@ impl Default for SandboxConfig {
             replace_existing: false,
             replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
             slug: None,
+            log_dir: None,
             manifest_digest: None,
             snapshot_reference: None,
             local_restore_paths_resolved: false,

@@ -317,6 +317,21 @@ func TestFFIWireShape_WithBindRootfs(t *testing.T) {
 	}
 }
 
+func TestFFIWireShape_WithLogDir(t *testing.T) {
+	got := marshalCreateOptions(t, WithImage("python:3.12"), WithLogDir("/var/log/topic-a"))
+	if v := mustField(t, got, "log_dir"); v != "/var/log/topic-a" {
+		t.Fatalf("log_dir = %v, want %q", v, "/var/log/topic-a")
+	}
+}
+
+func TestFFIWireShape_WithoutLogDirOmitsField(t *testing.T) {
+	// Older native libraries reject unknown fields, so an unset option must not be sent.
+	got := marshalCreateOptions(t, WithImage("python:3.12"))
+	if _, present := got["log_dir"]; present {
+		t.Fatal("log_dir must not appear in payload when unset")
+	}
+}
+
 func TestFFIWireShape_WithRootDiskManaged(t *testing.T) {
 	got := marshalCreateOptions(t, WithImage("python:3.12"), WithRootDisk(RootDisk.Managed(8192)))
 	rd := mustField(t, got, "root_disk").(map[string]any)

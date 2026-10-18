@@ -45,7 +45,10 @@ type SandboxConfig struct {
 	DeploymentProfile DeploymentProfile
 	Hostname          string
 	User              string
-	Replace           bool
+	// LogDir is the host directory for the sandbox's log files instead of
+	// <sandbox>/logs. Set it with WithLogDir.
+	LogDir  string
+	Replace bool
 	// ReplaceWithTimeout, if non-nil, sets a specific timeout between
 	// SIGTERM and SIGKILL when replacing an existing sandbox. nil means
 	// "use the runtime default" (10s when Replace is set). Setting this
@@ -834,6 +837,20 @@ func WithUser(user string) SandboxOption {
 // timeout or skip SIGTERM entirely.
 func WithReplace() SandboxOption {
 	return func(o *SandboxConfig) { o.Replace = true }
+}
+
+// WithLogDir writes the sandbox's log files to dir instead of
+// <sandbox>/logs (local backend only).
+//
+// A relative path resolves against the process working directory when the
+// sandbox is created. Creation creates dir if needed and makes <sandbox>/logs a
+// symlink to it, so Logs, LogStream, `msb logs` and later starts all use dir,
+// including from SDK releases that predate this option. Removing the sandbox
+// removes the symlink and leaves dir and its files in place; the caller owns
+// their cleanup. Give each sandbox its own directory. Not supported on Windows
+// or by cloud backends.
+func WithLogDir(dir string) SandboxOption {
+	return func(o *SandboxConfig) { o.LogDir = dir }
 }
 
 // WithReplaceWithTimeout is like WithReplace but with a caller-specified

@@ -189,6 +189,83 @@ async fn log_stream_includes_rotated_exec_files() {
     assert_eq!(entries[1].data.as_ref(), b"from active");
 }
 
+/// Rotation archives (`<file>.<UTC timestamp>[.gz]`) sit beside the numbered
+/// chain. Readers walk only the live file and `.1..=.4`, so archives stay invisible.
+#[tokio::test]
+async fn log_stream_ignores_rotation_archives() {
+    let name = "log-stream-archives";
+    let log_dir = make_log_dir(name);
+    write_lines(
+        &log_dir.join("exec.log.4"),
+        &[jsonl(
+            "2026-05-01T08:00:00.000Z",
+            "stdout",
+            "oldest in chain",
+            1,
+        )],
+    );
+    write_lines(
+        &log_dir.join("exec.log"),
+        &[jsonl(
+            "2026-05-01T09:00:00.000Z",
+            "stdout",
+            "from active",
+            1,
+        )],
+    );
+    write_lines(
+        &log_dir.join("exec.log.20260501T075900Z"),
+        &[jsonl("2026-05-01T07:59:00.000Z", "stdout", "archived", 1)],
+    );
+    std::fs::write(
+        log_dir.join("exec.log.20260501T075800Z.gz"),
+        b"\x1f\x8bnot text",
+    )
+    .expect("write compressed archive");
+    std::fs::write(
+        log_dir.join("kernel.log.20260501T075800Z"),
+        "archived kernel\n",
+    )
+    .expect("write kernel archive");
+
+    let entries = logs::read_logs(
+        name,
+        &LogOptions {
+            sources: vec![LogSource::Stdout, LogSource::System],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("read logs");
+
+    let data: Vec<&[u8]> = entries.iter().map(|entry| entry.data.as_ref()).collect();
+    assert_eq!(data, [&b"oldest in chain"[..], &b"from active"[..]]);
+}
+
+/// A caller-chosen log directory is linked from `<sandbox>/logs`; readers
+/// resolve the deterministic path and follow the symlink.
+#[cfg(unix)]
+#[tokio::test]
+async fn log_stream_follows_a_linked_log_directory() {
+    let name = "log-stream-linked-dir";
+    let sandbox_dir = msb_home().path().join("sandboxes").join(name);
+    let chosen = msb_home().path().join("node-logs").join(name);
+    std::fs::create_dir_all(&sandbox_dir).expect("create sandbox dir");
+    std::fs::create_dir_all(&chosen).expect("create chosen log dir");
+    std::os::unix::fs::symlink(&chosen, sandbox_dir.join("logs")).expect("link log dir");
+    write_lines(
+        &chosen.join("exec.log"),
+        &[jsonl("2026-05-01T09:00:00.000Z", "stdout", "linked", 1)],
+    );
+
+    let entries = logs::read_logs(name, &LogOptions::default())
+        .await
+        .expect("read logs");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].data.as_ref(), b"linked");
+}
+
 #[tokio::test]
 async fn log_stream_resume_from_cursor_continues_after_seen_entries() {
     let name = "log-stream-resume";

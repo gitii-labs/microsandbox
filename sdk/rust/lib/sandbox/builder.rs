@@ -496,6 +496,21 @@ impl SandboxBuilder {
         self
     }
 
+    /// Write this sandbox's log files to `dir` instead of `<sandbox>/logs`
+    /// (local backend only).
+    ///
+    /// A relative path resolves against the current working directory when
+    /// the sandbox is created. Creation creates `dir` if needed and makes
+    /// `<sandbox>/logs` a symlink to it, so `msb logs`, the SDK log readers and
+    /// later starts all use `dir`. Removing the sandbox removes the symlink
+    /// and leaves `dir` and its files in place; the caller owns their cleanup.
+    /// Give each sandbox its own directory. Not supported on Windows or by
+    /// cloud backends.
+    pub fn log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.log_dir = Some(Some(dir.into()));
+        self
+    }
+
     /// Replace an existing sandbox with the same name during create.
     ///
     /// If a sandbox with this name is already active, microsandbox stops

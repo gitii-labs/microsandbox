@@ -174,6 +174,7 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 		DeploymentProfile: string(o.DeploymentProfile),
 		Hostname:          o.Hostname,
 		User:              o.User,
+		LogDir:            o.LogDir,
 		Replace:           o.Replace,
 		Env:               o.Env,
 		Labels:            o.Labels,

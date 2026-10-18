@@ -844,6 +844,17 @@ impl LocalBackend {
             return Err(creation_cleanup.finish_owned_failure(error).await);
         }
 
+        if let Some(log_dir) = &config.log_dir
+            && let Err(error) = link_log_dir(&sandbox_dir, log_dir)
+        {
+            rollback_created_named_volumes(self, &created_named_volumes).await;
+            if has_owned_volumes {
+                drop(lifecycle_guard);
+                return Err(creation_cleanup.finish_owned_failure(error).await);
+            }
+            return Err(error);
+        }
+
         // Claim the persisted identity in Starting state. Running is published only after the
         // guest agent and all create-time validation are ready for callers.
         let write_db = db.write();
@@ -2208,6 +2219,41 @@ fn relay_readiness_timeout(
     ))
 }
 
+/// Make `<sandbox_dir>/logs` a symlink to the caller-chosen `log_dir`.
+///
+/// Every reader and later start reaches the logs through the deterministic
+/// `<sandbox_dir>/logs` path, including releases that predate this option, so
+/// the symlink is the durable record of the choice. Removing the sandbox
+/// directory unlinks the symlink without following it.
+#[cfg(unix)]
+fn link_log_dir(sandbox_dir: &Path, log_dir: &Path) -> MicrosandboxResult<()> {
+    if log_dir.starts_with(sandbox_dir) {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "log directory {} must be outside the sandbox directory {}",
+            log_dir.display(),
+            sandbox_dir.display()
+        )));
+    }
+    std::fs::create_dir_all(log_dir).map_err(|error| {
+        crate::MicrosandboxError::InvalidConfig(format!(
+            "cannot create log directory {}: {error}",
+            log_dir.display()
+        ))
+    })?;
+    std::fs::create_dir_all(sandbox_dir)?;
+    std::os::unix::fs::symlink(log_dir, sandbox_dir.join("logs"))?;
+    Ok(())
+}
+
+/// Caller-chosen log directories are rejected on Windows during path resolution.
+#[cfg(not(unix))]
+fn link_log_dir(_sandbox_dir: &Path, log_dir: &Path) -> MicrosandboxResult<()> {
+    Err(crate::MicrosandboxError::InvalidConfig(format!(
+        "log directory {} is not supported on this platform",
+        log_dir.display()
+    )))
+}
+
 /// Derive a stable, filesystem-safe transition-lock path for one sandbox name.
 fn sandbox_transition_lock_path(run_dir: &Path, name: &str) -> PathBuf {
     microsandbox_runtime::ipc::sandbox_transition_lock_path(run_dir, name)
@@ -2279,9 +2325,9 @@ mod tests {
     use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
     use tempfile::tempdir;
 
-    #[cfg(unix)]
-    use super::sandbox_runtime_endpoint_is_live;
     use super::{ChildStageGuard, sandbox_entity, sandbox_label_entity};
+    #[cfg(unix)]
+    use super::{link_log_dir, sandbox_runtime_endpoint_is_live};
     use crate::backend::{Backend, LocalBackend};
     use crate::runtime::SpawnMode;
     use crate::sandbox::{
@@ -2502,6 +2548,53 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(marker).unwrap(), "existing state");
         assert!(backend.db.get().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_dir_link_routes_logs_and_survives_sandbox_removal() {
+        let directory = tempdir().unwrap();
+        let sandbox_dir = directory.path().join("sandboxes/topic");
+        let log_dir = directory.path().join("node/logs/topic");
+
+        link_log_dir(&sandbox_dir, &log_dir).unwrap();
+        // Writers and readers use the deterministic path; the bytes land in the chosen directory.
+        fs::write(sandbox_dir.join("logs/runtime.log"), b"boot\n").unwrap();
+        assert_eq!(fs::read(log_dir.join("runtime.log")).unwrap(), b"boot\n");
+        assert_eq!(fs::read_link(sandbox_dir.join("logs")).unwrap(), log_dir);
+
+        super::remove_dir_if_exists(&sandbox_dir).unwrap();
+
+        assert!(!sandbox_dir.exists());
+        assert_eq!(fs::read(log_dir.join("runtime.log")).unwrap(), b"boot\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_dir_link_rejects_a_directory_inside_the_sandbox() {
+        let directory = tempdir().unwrap();
+        let sandbox_dir = directory.path().join("sandboxes/topic");
+
+        let error = link_log_dir(&sandbox_dir, &sandbox_dir.join("logs")).unwrap_err();
+
+        assert!(error.to_string().contains("outside the sandbox directory"));
+        assert!(!sandbox_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_dir_link_refuses_an_existing_logs_entry() {
+        let directory = tempdir().unwrap();
+        let sandbox_dir = directory.path().join("sandboxes/topic");
+        fs::create_dir_all(sandbox_dir.join("logs")).unwrap();
+        fs::write(sandbox_dir.join("logs/runtime.log"), b"old").unwrap();
+
+        link_log_dir(&sandbox_dir, &directory.path().join("elsewhere")).unwrap_err();
+
+        assert_eq!(
+            fs::read(sandbox_dir.join("logs/runtime.log")).unwrap(),
+            b"old"
+        );
     }
 
     #[test]

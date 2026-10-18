@@ -211,6 +211,7 @@ fn persisted_sources_survive_a_different_restart_directory() {
     std::env::set_current_dir(&first).unwrap();
     let mut builder = crate::Sandbox::builder("early-mapping");
     builder.config = config_with_host_inputs(None).into();
+    builder.config.log_dir = Some(Some("sandbox-logs".into()));
     let backend = crate::backend::LocalBackend::builder()
         .home(base.join("home"))
         .build_lazy()
@@ -224,6 +225,11 @@ fn persisted_sources_survive_a_different_restart_directory() {
     // a same-type serde round trip, so stored absolute inputs remain admitted.
     std::env::set_current_dir(&second).unwrap();
     let restored = serde_json::from_str::<SandboxConfig>(&stored).unwrap();
+    // The log directory is not serialized; creation links it from the captured builder value.
+    assert_eq!(
+        builder.config.clone().into_config().log_dir,
+        Some(first.join("sandbox-logs"))
+    );
     let expected = config_with_host_inputs(Some(&first));
     // The same boundary is called before restore/branch preparation and before
     // progress tasks are spawned; delayed work must retain its original mappings.
@@ -500,6 +506,35 @@ fn restore_paths_are_captured_but_snapshot_names_and_ids_are_not() {
         super::resolve_snapshot_reference(&mut resolved).unwrap();
         assert_eq!(resolved, reference);
     }
+}
+
+#[test]
+fn resolves_a_relative_log_directory_without_following_symlinks() {
+    let mut config = SandboxConfig {
+        log_dir: Some("logs/../topic".into()),
+        ..Default::default()
+    };
+
+    resolve_host_paths(&mut config).unwrap();
+
+    assert_eq!(
+        config.log_dir,
+        Some(std::env::current_dir().unwrap().join("logs/../topic"))
+    );
+}
+
+#[test]
+fn capturing_builder_paths_resolves_only_a_present_log_directory() {
+    let mut patch = crate::SandboxConfigPatch::new();
+    super::resolve_patch_paths(&mut patch).unwrap();
+    assert!(patch.log_dir.is_none());
+
+    patch.log_dir = Some(Some("topic-logs".into()));
+    super::resolve_patch_paths(&mut patch).unwrap();
+    assert_eq!(
+        patch.log_dir,
+        Some(Some(std::path::absolute("topic-logs").unwrap()))
+    );
 }
 
 #[test]
