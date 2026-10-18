@@ -80,7 +80,7 @@ Even without rebinding, a time-of-check to time-of-use race exists: an allowed d
 
 Domain-based rules close this with a pin set of observed DNS answers. A connection matches a domain rule only if its destination IP was actually returned as an answer to a DNS query for that domain *from this sandbox*. A guest that hard-codes an IP it never resolved through the interceptor can't slip past a domain allowlist. The same pin set gates [secret injection](/security/secrets).
 
-Each pinned IP lasts 10 minutes after the last answer that contained it, or for the DNS TTL when that is longer, so clients that cache answers beyond their TTL keep working. During that window an IP the domain has since moved away from still counts as the domain's for domain rules, secret injection and denial reports.
+Each pinned IP lasts 10 minutes after the last answer that contained it, or for the DNS TTL when that is longer, so clients that cache answers beyond their TTL keep working. During that window an IP the domain has since moved away from still counts as the domain's for domain rules, secret injection, OAuth grants and denial reports. Intercepted HTTPS still verifies the upstream certificate for the requested name unless upstream verification is disabled.
 
 ## SNI spoofing
 

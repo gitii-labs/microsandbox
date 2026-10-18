@@ -951,7 +951,7 @@ fn extract_addrs_and_ttl(
             }
 
             if let RData::CNAME(CNAME(canonical)) = &record.data {
-                let record_ttl = dns_record_ttl(record.ttl);
+                let record_ttl = Duration::from_secs(u64::from(record.ttl));
                 ttl = Some(ttl.map_or(record_ttl, |current| current.min(record_ttl)));
                 changed |= eligible_names.insert(normalize_dns_name(&canonical.to_string()));
             }
@@ -971,7 +971,7 @@ fn extract_addrs_and_ttl(
             _ => continue,
         };
         addrs.push(addr);
-        let record_ttl = dns_record_ttl(record.ttl);
+        let record_ttl = Duration::from_secs(u64::from(record.ttl));
         ttl = Some(ttl.map_or(record_ttl, |current| current.min(record_ttl)));
     }
 
@@ -980,10 +980,6 @@ fn extract_addrs_and_ttl(
     } else {
         ttl.map(|ttl| (addrs, ttl))
     }
-}
-
-fn dns_record_ttl(ttl: u32) -> Duration {
-    Duration::from_secs(u64::from(ttl))
 }
 
 fn normalize_dns_name(name: &str) -> String {
@@ -1289,7 +1285,7 @@ mod tests {
     #[tokio::test]
     async fn domain_binding_survives_later_servfail() {
         let answer = Ipv4Addr::new(93, 184, 216, 34);
-        let (mut forwarder, _, _, resolved_until) = resolve_with_ttl(answer, 1).await;
+        let (mut forwarder, _, resolved_from, _) = resolve_with_ttl(answer, 1).await;
         let failing = servfail_udp().await;
         let config = Arc::clone(&forwarder.config);
         Arc::get_mut(&mut forwarder)
@@ -1315,7 +1311,7 @@ mod tests {
 
         assert!(forwarder.shared.any_resolved_hostname_at(
             IpAddr::V4(answer),
-            resolved_until + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME - BINDING_PROBE_MARGIN,
+            resolved_from + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME - BINDING_PROBE_MARGIN,
             |host| host == "example.com"
         ));
     }
