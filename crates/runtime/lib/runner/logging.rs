@@ -7,6 +7,8 @@
 //! `<file>.<UTC timestamp>.gz`. microsandbox never deletes archives; the embedder
 //! owns their retention.
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -46,6 +48,9 @@ const PARTIAL_EXTENSION: &str = "partial";
 /// it opens the console at VM start.
 pub(crate) const KERNEL_LOG_FILENAME: &str = "kernel.log";
 
+/// Lock file a runtime holds for its lifetime so two runtimes never write one log directory.
+pub(crate) const LOG_DIR_LOCK_FILENAME: &str = "log-dir.lock";
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -79,6 +84,10 @@ pub struct RotatingLog {
 
     /// Whether the last rotation failed; only the first failure in a row is reported.
     rotation_failed: bool,
+
+    /// Make the next rotations fail, to test the failure path as any user.
+    #[cfg(test)]
+    fail_rotation: bool,
 }
 
 /// Background thread that compresses the archives of one log file.
@@ -119,7 +128,7 @@ impl RotatingLog {
         let file_name = format!("{prefix}.log");
         let path = log_dir.join(&file_name);
         let written = path.metadata().map(|m| m.len()).unwrap_or(0);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_append(&path)?;
         // This runs on the thread that drains the runtime's stderr, so a failure cannot be
         // logged here without risking a blocked pipe. Archives then stay uncompressed until
         // the next runtime start compresses them.
@@ -135,6 +144,8 @@ impl RotatingLog {
             written,
             archiver,
             rotation_failed: false,
+            #[cfg(test)]
+            fail_rotation: false,
         })
     }
 
@@ -236,6 +247,10 @@ impl LogArchiver {
 impl RotatingLog {
     fn rotate(&mut self) -> RuntimeResult<()> {
         self.file.flush()?;
+        #[cfg(test)]
+        if self.fail_rotation {
+            return Err(io::Error::other("injected rotation failure").into());
+        }
 
         // Move the oldest numbered file out of the chain before it would be overwritten.
         let oldest = rotated_path(&self.path, OLDEST_ROTATED_INDEX);
@@ -257,11 +272,7 @@ impl RotatingLog {
 
         // Open a fresh log file. If that fails, move the current file back so the retained
         // handle keeps writing to the live path instead of a file that later rotations archive.
-        self.file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        self.file = match open_append(&self.path) {
             Ok(file) => file,
             Err(error) => {
                 fs::rename(&newest, &self.path)?;
@@ -292,9 +303,15 @@ impl RotatingLog {
 /// An empty or missing file is left alone. The returned archiver compresses
 /// the archive, and any archive a previous process left uncompressed, in the
 /// background; dropping it does not cancel that work.
+/// libkrun follows symlinks when it opens `kernel.log`, so a symlink in its place
+/// is removed rather than archived; its target is never opened.
 pub(crate) fn archive_kernel_log(log_dir: &Path) -> io::Result<LogArchiver> {
     let path = log_dir.join(KERNEL_LOG_FILENAME);
     let has_content = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&path)?;
+            false
+        }
         Ok(metadata) => metadata.is_file() && metadata.len() > 0,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
@@ -305,9 +322,43 @@ pub(crate) fn archive_kernel_log(log_dir: &Path) -> io::Result<LogArchiver> {
     LogArchiver::start(log_dir, KERNEL_LOG_FILENAME)
 }
 
+/// Take the exclusive lock on `log_dir` that a runtime holds for its lifetime.
+///
+/// The returned file holds the lock until it is closed. Only one runtime may
+/// write a log directory: two writers would rotate and compress each other's
+/// files. A caller-chosen log directory can be shared by mistake, so a second
+/// runtime is refused instead of corrupting the first one's logs.
+pub(crate) fn lock_log_dir(log_dir: &Path) -> crate::RuntimeResult<File> {
+    fs::create_dir_all(log_dir)?;
+    let path = log_dir.join(LOG_DIR_LOCK_FILENAME);
+    let file = microsandbox_utils::process_lock::open_lock_file(&path)?;
+    if !microsandbox_utils::process_lock::try_lock_exclusive(&file)? {
+        // Name the resolved directory too: a caller-chosen one is reached through a symlink.
+        let resolved = fs::canonicalize(log_dir)?;
+        return Err(crate::RuntimeError::Custom(format!(
+            "log directory {} ({}) is in use by another sandbox runtime; give each sandbox its own log directory",
+            log_dir.display(),
+            resolved.display()
+        )));
+    }
+    Ok(file)
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+/// Open `path` for appending, creating it, without following a final symlink.
+fn open_append(path: &Path) -> io::Result<File> {
+    open_no_follow(OpenOptions::new().create(true).append(true), path)
+}
+
+/// Open `path` with `options`, refusing a final symlink on Unix.
+fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path)
+}
 
 /// Path of the numbered rotation `index` of `path`.
 fn rotated_path(path: &Path, index: u32) -> PathBuf {
@@ -466,12 +517,11 @@ fn compress_archive(archive: &Path) -> io::Result<()> {
     }
 
     let partial = partial_path(archive);
-    let mut source = File::open(archive)?;
-    let output = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&partial)?;
+    let mut source = open_no_follow(OpenOptions::new().read(true), archive)?;
+    let output = open_no_follow(
+        OpenOptions::new().write(true).create(true).truncate(true),
+        &partial,
+    )?;
     let mut encoder = GzEncoder::new(output, Compression::default());
     io::copy(&mut source, &mut encoder)?;
     let output = encoder.finish()?;
@@ -609,28 +659,15 @@ mod tests {
         assert_eq!(archived, expected);
     }
 
-    #[cfg(unix)]
     #[test]
     fn failed_rotation_keeps_appending_to_the_live_file() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let mut log = RotatingLog::new(dir.path(), "runtime", LINE_BYTES).unwrap();
         log.write(&line(0)).unwrap();
 
-        // A read-only directory refuses every rename, so rotation fails.
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
-        let denied = fs::rename(dir.path().join("runtime.log"), dir.path().join("probe")).is_err();
-        if denied {
-            log.write(&line(1)).unwrap();
-            log.write(&line(2)).unwrap();
-        }
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        // Root ignores directory permissions; nothing to check without a failing rename.
-        if !denied {
-            return;
-        }
-
+        log.fail_rotation = true;
+        log.write(&line(1)).unwrap();
+        log.write(&line(2)).unwrap();
         let mut expected = line(0);
         expected.extend(line(1));
         expected.extend(line(2));
@@ -638,6 +675,7 @@ mod tests {
         assert_eq!(names(dir.path()), ["runtime.log"]);
 
         // The retry happens once another full file has been written after the failure.
+        log.fail_rotation = false;
         log.write(&line(3)).unwrap();
         log.finish();
         assert_eq!(fs::read(dir.path().join("runtime.log")).unwrap(), line(3));
@@ -645,6 +683,49 @@ mod tests {
             fs::read(dir.path().join("runtime.log.1")).unwrap(),
             expected
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_in_the_log_directory_are_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("authorized_keys");
+        fs::write(&target, b"keep").unwrap();
+
+        // A planted live log is refused instead of appended through.
+        std::os::unix::fs::symlink(&target, dir.path().join("runtime.log")).unwrap();
+        assert!(RotatingLog::new(dir.path(), "runtime", LINE_BYTES).is_err());
+
+        // A planted kernel.log is unlinked before libkrun would truncate its target.
+        std::os::unix::fs::symlink(&target, dir.path().join(KERNEL_LOG_FILENAME)).unwrap();
+        archive_kernel_log(dir.path()).unwrap().finish();
+        assert!(fs::symlink_metadata(dir.path().join(KERNEL_LOG_FILENAME)).is_err());
+
+        // A planted archive is not compressed, and its target is not read or removed.
+        let archive = dir.path().join("exec.log.20261018T143005Z");
+        std::os::unix::fs::symlink(&target, &archive).unwrap();
+        compress_archives(dir.path(), "exec.log");
+        assert!(!compressed_path(&archive).exists());
+
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_second_runtime_cannot_take_the_log_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_log_dir(dir.path()).unwrap();
+
+        let error = lock_log_dir(dir.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("in use by another sandbox runtime")
+        );
+
+        // Closing the first holder releases the directory.
+        drop(held);
+        lock_log_dir(dir.path()).unwrap();
     }
 
     #[test]

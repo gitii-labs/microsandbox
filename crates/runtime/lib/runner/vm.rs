@@ -721,6 +721,8 @@ fn run(
     let startup_writer = startup_writer
         .map(|writer| failure_channel.retain(writer))
         .transpose()?;
+    // Held until the process exits: one runtime writes a log directory at a time.
+    let _log_dir_lock = super::logging::lock_log_dir(&config.log_dir)?;
     setup_log_capture(&config.log_dir, config.forward_output)?;
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
