@@ -138,7 +138,8 @@ jobs:
         uses: ./.github/actions/cache-libkrunfw-kernel
       - name: Build candidate firmware
         if: steps.kernel.outputs.cache-hit != 'true'
-        run: make -C vendor/libkrunfw -j"$(nproc)"
+        working-directory: vendor/libkrunfw
+        run: make -j"$(nproc)"
       - name: Build and stage the candidate guest agent and firmware
         run: |
           cargo build --locked --profile ci -p microsandbox-agentd --target x86_64-unknown-linux-musl
