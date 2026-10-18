@@ -52,6 +52,9 @@ pub const PARENT_WATCH_DETACH: u8 = 1;
 /// Side-effect-free response to `msb __launch-protocol`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LaunchCapabilities {
+    /// Host-alias TCP ports can explicitly select IPv4 loopback without family fallback.
+    #[serde(default)]
+    pub host_alias_ipv4_ports: bool,
     /// Supported wire generations: 1 is the v0.6.17 boot contract; 2 adds explicit intent.
     pub protocols: Vec<u32>,
     /// Relaxed captured-object checks can independently require destination backing.

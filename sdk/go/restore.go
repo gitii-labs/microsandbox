@@ -50,6 +50,10 @@ type RestoreConfig struct {
 	// TCPAcceptQueueSize sets the accept-queue depth for the child's published TCP
 	// listeners, 1 to 2147483647. Nil keeps the default, 1024.
 	TCPAcceptQueueSize *uint32
+
+	// HostAliasIPv4Ports selects IPv4 loopback for the child's host-alias TCP ports.
+	// Ports must be nonzero; both guest gateway families remain available.
+	HostAliasIPv4Ports []uint16
 	Vsock              []VsockRoute
 }
 
@@ -111,6 +115,14 @@ func WithRestoreMaxUDPConnections(count uint) RestoreOption {
 // listeners, 1 to 2147483647. The host kernel clamps it to its somaxconn.
 func WithRestoreTCPAcceptQueueSize(size uint32) RestoreOption {
 	return func(o *RestoreConfig) { o.TCPAcceptQueueSize = &size }
+}
+
+// WithRestoreHostAliasIPv4Ports routes these host-alias TCP ports only to host IPv4 loopback.
+// Ports must be nonzero; policy still evaluates the original guest destination.
+// Replaces the destination list; repeated options use the last list. Empty means none.
+// Snapshot archives do not supply this setting. The child saves it for restart.
+func WithRestoreHostAliasIPv4Ports(ports ...uint16) RestoreOption {
+	return func(o *RestoreConfig) { o.HostAliasIPv4Ports = append([]uint16(nil), ports...) }
 }
 
 // WithRestoreDisableNetwork disables networking; full restore rejects removing a captured NIC.
@@ -206,7 +218,8 @@ func buildFFIRestoreOptions[T SnapshotSeed](snapshot T, config RestoreConfig) ff
 		AllowMissingResources:       config.AllowMissingResources,
 		Volumes:                     resources.Volumes, CapturedVolumes: config.CapturedVolumes,
 		Ports: buildFFIPortBindings(config.Ports), TCPAcceptQueueSize: config.TCPAcceptQueueSize,
-		Vsock: buildFFIVsockRoutes(config.Vsock),
+		HostAliasIPv4Ports: config.HostAliasIPv4Ports,
+		Vsock:              buildFFIVsockRoutes(config.Vsock),
 	}
 }
 

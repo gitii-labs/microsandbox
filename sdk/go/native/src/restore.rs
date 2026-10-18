@@ -54,6 +54,8 @@ struct RestoreOptions {
     ports: Vec<PortBindingOpts>,
     tcp_accept_queue_size: Option<u32>,
     #[serde(default)]
+    host_alias_ipv4_ports: Vec<std::num::NonZeroU16>,
+    #[serde(default)]
     vsock: Vec<VsockRouteOpts>,
 }
 
@@ -166,6 +168,9 @@ fn builder(name: String, opts: &RestoreOptions) -> Result<RestoreBuilder, FfiErr
     }
     if let Some(size) = opts.tcp_accept_queue_size {
         builder = builder.tcp_accept_queue_size(size);
+    }
+    for port in opts.host_alias_ipv4_ports.iter().copied() {
+        builder = builder.host_alias_ipv4_port(port);
     }
     for route in &opts.vsock {
         builder = match route.socket_type.as_str() {
@@ -298,6 +303,24 @@ mod tests {
         .unwrap();
         assert_eq!(options.tcp_accept_queue_size, Some(4096));
         assert!(builder("destination".into(), &options).is_ok());
+    }
+
+    #[test]
+    fn restore_host_alias_ipv4_ports_are_typed_and_preserved() {
+        let options: RestoreOptions = serde_json::from_value(serde_json::json!({
+            "snapshot": "saved", "host_alias_ipv4_ports": [12345]
+        }))
+        .unwrap();
+        assert_eq!(options.host_alias_ipv4_ports[0].get(), 12345);
+        assert!(builder("destination".into(), &options).is_ok());
+        for invalid in [0, 65536, -1] {
+            assert!(
+                serde_json::from_value::<RestoreOptions>(serde_json::json!({
+                    "snapshot": "saved", "host_alias_ipv4_ports": [invalid]
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -129,6 +129,8 @@ export interface NetworkConfig {
   readonly maxUdpConnections?: number | null;
   /** Accept-queue depth for published TCP port listeners. Absent means the default, 1024. */
   readonly tcpAcceptQueueSize?: number | null;
+  /** Host-alias TCP ports routed only to host IPv4 loopback for either guest gateway family. */
+  readonly hostAliasIpv4Ports?: readonly number[];
   readonly strict: boolean;
   readonly rateLimiter: NetworkRateLimiterConfig | null;
   readonly interface?: {

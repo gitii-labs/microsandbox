@@ -537,6 +537,8 @@ export declare class NetworkBuilder {
    * 1024; the host kernel clamps it to its own somaxconn.
    */
   tcpAcceptQueueSize(size: number): this
+  /** Route a host-alias TCP port only to host IPv4 loopback for either guest gateway family. */
+  hostAliasIPv4Port(port: number): this
   /** Require hostname-based policy allows to use inspectable application authority. */
   strict(enabled: boolean): this
   /** Set the IPv4 pool used for per-sandbox /30 guest subnets. */
@@ -819,6 +821,8 @@ export declare class RestoreBuilder {
   portUdpBind(bind: string, hostPort: number, guestPort: number): this
   /** Set the accept-queue depth for the child's published TCP listeners, 1..=2147483647. */
   tcpAcceptQueueSize(size: number): this
+  /** Route a host-alias TCP port only to host IPv4 loopback for either guest gateway family. */
+  hostAliasIPv4Port(port: number): this
   /** Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port. */
   vsock(hostPath: string, port: number): this
   /** Expose a host Unix datagram socket on a guest-to-host vsock port. */

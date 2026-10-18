@@ -404,6 +404,7 @@ impl SmoltcpNetwork {
             gateway_mac: self.gateway_mac,
             guest_mac: self.guest_mac,
             gateway: self.gateway_ips(),
+            host_alias_ipv4_ports: self.config.config().host_alias_ipv4_ports.clone(),
             guest_ipv4: self.guest_ipv4,
             guest_ipv6: self.guest_ipv6,
             mtu: self.mtu as usize,

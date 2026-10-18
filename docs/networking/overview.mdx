@@ -7,6 +7,44 @@ icon: "network-wired"
 
 All sandbox traffic flows through a host-controlled networking stack. From inside the VM it looks like a normal network interface; from the host side, every packet is checked against policy before it leaves.
 
+## Port-scoped host-alias targets
+
+For a host service bound only to `127.0.0.1:P`, register `P` in the local network
+configuration's `host_alias_ipv4_ports` list. Connections to either guest gateway
+address on that TCP port then dial **only** `127.0.0.1:P`. They never try `::1`,
+including after connection failure. This avoids needing to allocate matching IPv4
+and IPv6 host listeners atomically.
+
+The setting applies to plain TCP, intercepted TLS, and HTTP CONNECT. It does not
+grant access: policy still evaluates the original guest destination. The
+`host.microsandbox.internal` A/AAAA answers and application authority are unchanged.
+Other alias ports retain their existing family preference and fallback; external
+destinations and UDP are unaffected. Ports must be integers from 1 to 65535. No
+arbitrary target address or translated port is accepted.
+
+Local SDK APIs:
+
+- Rust: `network(|n| n.host_alias_ipv4_port(NonZeroU16::new(port).unwrap()))`.
+- Go: `NetworkConfig{HostAliasIPv4Ports: []uint16{port}}`.
+- TypeScript: `.network(n => n.hostAliasIPv4Port(port))`.
+- Python: `Network(host_alias_ipv4_ports=(port,))`.
+- CLI network JSON: `{"host_alias_ipv4_ports": [12345]}` via `--net-conf`.
+
+The mapping is saved with sandbox network configuration and retained on restart
+and ordinary source-config branches. Snapshot archives do not capture network
+configuration: restore uses the destination's list rather than inheriting source
+ports. Restore builders expose the Rust and TypeScript methods; Go restore accepts
+`WithRestoreHostAliasIPv4Ports(ports...)`, and Python restore accepts
+`host_alias_ipv4_ports`. The Go option replaces the destination list; repeated options
+use the last list, and empty or omitted means no registrations. The restored child
+saves the selected list for restart. Host applications outside the sandbox are unchanged.
+Managed cloud creation rejects this local-only setting.
+
+An explicit mapping requires a runtime advertising `host_alias_ipv4_ports`; Go
+also requires a native SDK with that capability. Older peers are refused before
+launch instead of silently reverting to family fallback. Use a supporting SDK to
+read or modify configured sandboxes; older SDKs cannot preserve this new field.
+
 ## Defaults
 
 By default, sandboxes can reach the public internet but cannot reach private networks, loopback, link-local addresses, or cloud metadata endpoints. Only published ports accept inbound traffic.

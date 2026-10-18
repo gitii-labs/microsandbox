@@ -1216,6 +1216,10 @@ type NetworkConfig struct {
 	// 1 to 2147483647. Nil keeps the default, 1024; the host kernel clamps it to its somaxconn.
 	TCPAcceptQueueSize *uint32
 
+	// HostAliasIPv4Ports routes these host-alias TCP ports only to 127.0.0.1,
+	// for both guest gateway families. Ports must be nonzero. Policy is unchanged.
+	HostAliasIPv4Ports []uint16
+
 	// IPv4Pool is used to derive per-sandbox /30 guest subnets.
 	// Defaults to "172.16.0.0/12".
 	IPv4Pool string

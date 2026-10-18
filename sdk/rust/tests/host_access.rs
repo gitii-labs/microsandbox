@@ -221,6 +221,86 @@ async fn host_alias_reachable_by_hostname_and_gateway_ip() {
     teardown(sb, name).await;
 }
 
+/// Explicit port targets retain both guest families and cannot bypass host policy.
+#[msb_test]
+async fn registered_host_alias_ipv4_port_supports_both_guest_families_and_host_policy() {
+    let server = HostHttp::start("explicit ipv4 target")
+        .await
+        .expect("IPv4-only listener");
+    let port = server.port();
+    let mut allow_original_destination = allow_host_only_policy();
+    allow_original_destination.rules.insert(
+        0,
+        Rule::deny_egress(Destination::Cidr("127.0.0.1/32".parse().unwrap())),
+    );
+    for (name, policy, allowed) in [
+        (
+            "host-alias-explicit-allow",
+            allow_original_destination,
+            true,
+        ),
+        ("host-alias-explicit-deny", deny_host_group_policy(), false),
+    ] {
+        let sb = Sandbox::builder(name)
+            .image("mirror.gcr.io/library/alpine")
+            .cpus(1)
+            .memory(256)
+            .replace()
+            .network(|n| {
+                n.policy(policy)
+                    .ipv4_pool("172.16.0.0/12".parse().unwrap())
+                    .ipv6_pool("fd42:6d73:62::/48".parse().unwrap())
+                    .host_alias_ipv4_port(std::num::NonZeroU16::new(port).unwrap())
+            })
+            .create()
+            .await
+            .expect("create explicit dual-stack sandbox");
+        let v4 = read_gateway_ip(&sb).await;
+        let v6 = read_gateway_ipv6(&sb).await;
+        assert!(
+            v4.parse::<Ipv4Addr>().is_ok(),
+            "expected IPv4 gateway, got {v4}"
+        );
+        assert!(
+            v6.parse::<std::net::Ipv6Addr>().is_ok(),
+            "expected IPv6 gateway, got {v6}"
+        );
+        for authority in [
+            v4,
+            format!("[{v6}]"),
+            "host.microsandbox.internal".to_owned(),
+        ] {
+            let out = sb
+                .shell(format!(
+                    "wget -qO- --timeout=5 'http://{authority}:{port}/'; echo status=$?"
+                ))
+                .await
+                .expect("request host alias");
+            let stdout = out.stdout().unwrap();
+            if allowed {
+                assert!(
+                    stdout.contains("explicit ipv4 target"),
+                    "wrong service: {stdout}"
+                );
+                assert!(
+                    stdout.trim_end().ends_with("status=0"),
+                    "connection failed: {stdout}"
+                );
+            } else {
+                assert!(
+                    !stdout.contains("explicit ipv4 target"),
+                    "denied service was reached: {stdout}"
+                );
+                assert!(
+                    !stdout.trim_end().ends_with("status=0"),
+                    "host policy bypassed: {stdout}"
+                );
+            }
+        }
+        teardown(sb, name).await;
+    }
+}
+
 /// An IPv6 host-alias choice must still reach a service bound only on IPv4 loopback.
 #[msb_test]
 async fn host_alias_ipv6_falls_back_to_ipv4_only_listener() {

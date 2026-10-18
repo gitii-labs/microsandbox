@@ -143,6 +143,16 @@ impl RestoreBuilder {
         self
     }
 
+    /// Add a destination host-alias TCP port routed only to IPv4 loopback for either guest family.
+    /// Snapshot archives do not supply network settings; this list is saved with the restored child.
+    #[cfg(feature = "net")]
+    pub fn host_alias_ipv4_port(mut self, port: std::num::NonZeroU16) -> Self {
+        self.inner = self
+            .inner
+            .network(|network| network.host_alias_ipv4_port(port));
+        self
+    }
+
     /// Set the destination host's concurrent TCP connection limit; zero explicitly means unlimited.
     /// The limit is applied before disk boot or full-restore network activation.
     #[cfg(feature = "net")]
@@ -548,6 +558,25 @@ mod tests {
         );
         let invalid = Sandbox::restore("saved").tcp_accept_queue_size(0);
         assert!(invalid.inner.build_error.is_some());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn destination_host_alias_ipv4_port_reaches_network_config() {
+        let restore = Sandbox::restore("saved")
+            .host_alias_ipv4_port(std::num::NonZeroU16::new(12345).unwrap());
+        assert_eq!(
+            config(&restore).spec.network.host_alias_ipv4_ports[0].get(),
+            12345
+        );
+        assert_eq!(
+            config(&restore)
+                .local_network_config()
+                .unwrap()
+                .host_alias_ipv4_ports[0]
+                .get(),
+            12345
+        );
     }
 
     #[test]

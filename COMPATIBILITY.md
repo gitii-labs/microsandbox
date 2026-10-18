@@ -384,6 +384,26 @@ Normal x86 boot now declares `krun.poweroff=i8042` in libkrun's default kernel c
 
 ## 13. Networking, DNS, Published Ports, and Secret Substitution
 
+The optional `host_alias_ipv4_ports` network list selects only `127.0.0.1:P` for
+gateway-bound TCP port P, independently of guest address family. Empty lists are
+omitted, preserving previous serialized configuration and routing behavior. Ports
+are nonzero `u16` values; no host address or translated port is accepted. Policy
+continues to use the original guest destination. DNS, UDP, external destinations,
+and unregistered ports retain their contracts. Plain TCP, TLS interception, and
+CONNECT share target selection, with no alternate-family fallback for registered
+ports. Saved/resolved configuration retains the list across restart and ordinary
+source-config branches. Snapshot archives do not capture network settings; restore
+uses and saves the destination's explicitly supplied list, empty by default.
+
+SDK launches require the `host_alias_ipv4_ports` capability for nonempty lists;
+previous launch contracts refuse them. The Go loader additionally requires the
+optional `msb_supports_host_alias_ipv4_ports` native symbol before sending the new
+JSON key. Existing requests without the field work with older peers. Managed cloud
+rejects the local-only setting. Older SDKs can discard unknown saved fields when
+editing: configured sandboxes must be managed by a supporting SDK. Rust direct
+struct literals for `NetworkConfig` or `NetworkSpec` must initialize the added
+field or use `..Default::default()`; builders using defaults are unchanged.
+
 Strict hostname policy is enabled by default. The v0.6.0–v0.6.17 launch gate rejects strict policies containing outbound hostname allow rules, including domain suffixes and rules applying in both directions. Policies without those rules retain their existing behavior on older runtimes because strict enforcement is unused. Explicit `strict: false` remains supported.
 
 Observable network behavior is an effective compatibility contract. It includes default MTU, sandbox-slot address derivation, IPv4 subnet sizing, guest and gateway offsets, IPv6 prefixes, deterministic MAC addresses, interface name `eth0`, `host.microsandbox.internal`, DNS UDP and TCP behavior, DNS-over-TLS, TLS interception and trust paths, published-port binding, TCP half-close, UDP peer lifetime, destination policy, and host-side secret placeholder substitution.

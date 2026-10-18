@@ -449,6 +449,7 @@ func buildFFINetwork(n *NetworkConfig) *ffi.NetworkOptions {
 		Ports:                 n.Ports,
 		PortBindings:          buildFFIPortBindings(n.PortBindings),
 		TCPAcceptQueueSize:    n.TCPAcceptQueueSize,
+		HostAliasIPv4Ports:    n.HostAliasIPv4Ports,
 		IPv4Pool:              n.IPv4Pool,
 		IPv6Pool:              n.IPv6Pool,
 		NAT64Prefixes:         n.NAT64Prefixes,

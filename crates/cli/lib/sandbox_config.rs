@@ -404,6 +404,7 @@ struct NetworkConfigInput {
     max_tcp_connections: Option<usize>,
     max_udp_connections: Option<usize>,
     tcp_accept_queue_size: Option<u32>,
+    host_alias_ipv4_ports: Option<Vec<std::num::NonZeroU16>>,
     #[config_patch(nested)]
     http: Option<HttpInput>,
 }
@@ -1759,6 +1760,9 @@ fn materialize_network_patch(
         microsandbox_network::config::TcpAcceptQueueSize::try_from(size)?;
         patch = patch.tcp_accept_queue_size(size);
     }
+    if let Some(ports) = input.host_alias_ipv4_ports {
+        patch = patch.host_alias_ipv4_ports(ports);
+    }
     if let Some(http) = input.http {
         let mut value = HttpConfigPatch::new();
         if let Some(enabled) = http.deny_response {
@@ -1882,6 +1886,28 @@ mod tests {
             assert!(
                 error.to_string().contains("TCP accept queue size"),
                 "{invalid}: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn network_config_host_alias_ipv4_ports_are_validated_and_materialized() {
+        let input: NetworkInput = serde_json::from_value(serde_json::json!({
+            "host_alias_ipv4_ports": [12345]
+        }))
+        .unwrap();
+        let mut network = microsandbox_types::NetworkSpec::default();
+        materialize_network_patch(Some(&input), None, None)
+            .unwrap()
+            .apply_to(&mut network);
+        assert_eq!(network.host_alias_ipv4_ports[0].get(), 12345);
+        for invalid in [0, 65536, -1] {
+            assert!(
+                serde_json::from_value::<NetworkInput>(serde_json::json!({
+                    "host_alias_ipv4_ports": [invalid]
+                }))
+                .is_err()
             );
         }
     }

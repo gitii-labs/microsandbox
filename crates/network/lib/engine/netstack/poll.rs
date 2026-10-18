@@ -112,6 +112,8 @@ pub struct PollLoopConfig {
     /// is `Some` when that family is active for this sandbox (host has a
     /// route, or the user supplied an explicit address).
     pub gateway: GatewayIps,
+    /// TCP ports whose gateway destinations select only host IPv4 loopback.
+    pub host_alias_ipv4_ports: Vec<std::num::NonZeroU16>,
     /// Guest IPv4 address. `None` when IPv4 is inactive for this sandbox.
     pub guest_ipv4: Option<Ipv4Addr>,
     /// Guest IPv6 address. `None` when IPv6 is inactive for this sandbox.
@@ -573,7 +575,11 @@ pub fn smoltcp_poll_loop(
                     .contains(&conn.dst.port())
             {
                 // TLS-intercepted port — spawn TLS MITM proxy.
-                let connect_target = resolve_tcp_host_target(conn.dst, config.gateway);
+                let connect_target = resolve_tcp_host_target(
+                    conn.dst,
+                    config.gateway,
+                    &config.host_alias_ipv4_ports,
+                );
                 let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                     &outbound_proxy,
                     conn.dst,
@@ -645,7 +651,8 @@ pub fn smoltcp_poll_loop(
                 continue;
             }
             // Plain TCP proxy.
-            let connect_target = resolve_tcp_host_target(conn.dst, config.gateway);
+            let connect_target =
+                resolve_tcp_host_target(conn.dst, config.gateway, &config.host_alias_ipv4_ports);
             let connection_outbound_proxy = ResolvedOutboundProxy::select_for_destination(
                 &outbound_proxy,
                 conn.dst,
@@ -889,9 +896,21 @@ fn handle_reassembled_udp_datagram(
 ///
 /// A guest connection to either gateway family first dials the matching host
 /// loopback address, then may fall back to the other loopback family. Regular
-/// outbound destinations have no fallback.
-fn resolve_tcp_host_target(dst: SocketAddr, gateway: GatewayIps) -> UpstreamTcpTarget {
+/// outbound destinations have no fallback. Registered host-alias ports instead
+/// select only IPv4 loopback, regardless of the guest gateway family.
+fn resolve_tcp_host_target(
+    dst: SocketAddr,
+    gateway: GatewayIps,
+    ipv4_ports: &[std::num::NonZeroU16],
+) -> UpstreamTcpTarget {
     let port = dst.port();
+    // Explicit port selection applies only to gateway destinations; it cannot redirect external traffic.
+    if (gateway.ipv4.map(IpAddr::V4) == Some(dst.ip())
+        || gateway.ipv6.map(IpAddr::V6) == Some(dst.ip()))
+        && ipv4_ports.iter().any(|registered| registered.get() == port)
+    {
+        return UpstreamTcpTarget::direct(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+    }
     match dst.ip() {
         IpAddr::V4(v4) if gateway.ipv4 == Some(v4) => UpstreamTcpTarget::with_fallback(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
@@ -1514,6 +1533,7 @@ mod tests {
 
         let shared = Arc::new(SharedState::new(4));
         let poll_config = PollLoopConfig {
+            host_alias_ipv4_ports: Vec::new(),
             gateway_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             guest_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
             gateway: GatewayIps {
@@ -1601,6 +1621,7 @@ mod tests {
     fn gateway_icmp_echo_respects_deny_policy() {
         let shared = SharedState::new(4);
         let poll_config = PollLoopConfig {
+            host_alias_ipv4_ports: Vec::new(),
             gateway_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             guest_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
             gateway: GatewayIps {
@@ -1642,6 +1663,7 @@ mod tests {
         let guest = Ipv4Addr::new(100, 96, 0, 2);
         shared.set_gateway_ips(Some(gateway), None);
         let config = PollLoopConfig {
+            host_alias_ipv4_ports: Vec::new(),
             gateway_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             gateway: GatewayIps {
@@ -1681,12 +1703,105 @@ mod tests {
     }
 
     #[test]
+    fn registered_host_alias_port_never_selects_occupied_ipv6_loopback() {
+        // Own only one listener: no attempt to allocate an atomic pair of loopback ports.
+        let alternate = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let port = alternate.local_addr().unwrap().port();
+        let registered = [std::num::NonZeroU16::new(port).unwrap()];
+        let gateway = test_gateway();
+        for ip in [
+            IpAddr::V4(gateway.ipv4.unwrap()),
+            IpAddr::V6(gateway.ipv6.unwrap()),
+        ] {
+            assert_eq!(
+                resolve_tcp_host_target(SocketAddr::new(ip, port), gateway, &registered),
+                UpstreamTcpTarget::direct(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+            );
+        }
+        alternate.set_nonblocking(true).unwrap();
+        assert_eq!(
+            alternate.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn registered_host_alias_port_does_not_redirect_external_or_inactive_gateway_destinations() {
+        let registered = [std::num::NonZeroU16::new(8080).unwrap()];
+        let gateway = test_gateway();
+        for dst in ["198.51.100.1:8080", "[2001:db8::1]:8080"] {
+            let dst = dst.parse().unwrap();
+            assert_eq!(
+                resolve_tcp_host_target(dst, gateway, &registered),
+                UpstreamTcpTarget::direct(dst)
+            );
+        }
+        let dst = SocketAddr::new(IpAddr::V6(gateway.ipv6.unwrap()), 8080);
+        assert_eq!(
+            resolve_tcp_host_target(
+                dst,
+                GatewayIps {
+                    ipv6: None,
+                    ..gateway
+                },
+                &registered
+            ),
+            UpstreamTcpTarget::direct(dst)
+        );
+    }
+
+    #[test]
+    fn registered_host_alias_port_keeps_unregistered_family_fallback() {
+        let gateway = test_gateway();
+        let registered = [std::num::NonZeroU16::new(8080).unwrap()];
+        for ip in [
+            IpAddr::V4(gateway.ipv4.unwrap()),
+            IpAddr::V6(gateway.ipv6.unwrap()),
+        ] {
+            let dst = SocketAddr::new(ip, 8081);
+            assert_eq!(
+                resolve_tcp_host_target(dst, gateway, &registered),
+                resolve_tcp_host_target(dst, gateway, &[])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_host_alias_target_failure_is_terminal() {
+        // A bound, non-listening IPv4 socket reserves the port and deterministically refuses TCP.
+        let reserved =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        reserved
+            .bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())
+            .unwrap();
+        let port = reserved.local_addr().unwrap().as_socket().unwrap().port();
+        let gateway = test_gateway();
+        let target = resolve_tcp_host_target(
+            SocketAddr::new(IpAddr::V6(gateway.ipv6.unwrap()), port),
+            gateway,
+            &[std::num::NonZeroU16::new(port).unwrap()],
+        );
+        assert_eq!(
+            target,
+            UpstreamTcpTarget::direct(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        );
+        let state = crate::tcp::connection::ProxyConnectState::new();
+        let shared = SharedState::new(4);
+        let error = target.connect(&state, &shared, None).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            state.status(),
+            crate::tcp::connection::ProxyConnectStatus::UpstreamConnectFailed
+        );
+    }
+
+    #[test]
     fn resolve_tcp_host_target_ipv4_can_fall_back_to_ipv6() {
         let gw = test_gateway();
         let dst = SocketAddr::new(IpAddr::V4(gw.ipv4.unwrap()), 8080);
 
         assert_eq!(
-            resolve_tcp_host_target(dst, gw),
+            resolve_tcp_host_target(dst, gw, &[]),
             UpstreamTcpTarget::with_fallback(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
@@ -1700,7 +1815,7 @@ mod tests {
         let dst = SocketAddr::new(IpAddr::V6(gw.ipv6.unwrap()), 8080);
 
         assert_eq!(
-            resolve_tcp_host_target(dst, gw),
+            resolve_tcp_host_target(dst, gw, &[]),
             UpstreamTcpTarget::with_fallback(
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
@@ -1713,7 +1828,7 @@ mod tests {
         let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443);
 
         assert_eq!(
-            resolve_tcp_host_target(dst, test_gateway()),
+            resolve_tcp_host_target(dst, test_gateway(), &[]),
             UpstreamTcpTarget::direct(dst)
         );
     }
@@ -1760,7 +1875,7 @@ mod tests {
     fn outbound_proxy_is_skipped_for_host_destination() {
         let gw = test_gateway();
         let guest_dst = SocketAddr::new(IpAddr::V4(gw.ipv4.unwrap()), 8080);
-        let connect_target = resolve_tcp_host_target(guest_dst, gw);
+        let connect_target = resolve_tcp_host_target(guest_dst, gw, &[]);
         let proxy = Some(Arc::new(ResolvedOutboundProxy::Socks5 {
             address: "192.0.2.1:1080".parse().unwrap(),
             credentials: None,
@@ -1780,7 +1895,7 @@ mod tests {
     fn outbound_proxy_is_preserved_for_external_destination() {
         let gw = test_gateway();
         let guest_dst = "198.51.100.10:443".parse().unwrap();
-        let connect_target = resolve_tcp_host_target(guest_dst, gw);
+        let connect_target = resolve_tcp_host_target(guest_dst, gw, &[]);
         let proxy = Some(Arc::new(ResolvedOutboundProxy::Socks5 {
             address: "192.0.2.1:1080".parse().unwrap(),
             credentials: None,
@@ -1823,6 +1938,7 @@ mod tests {
 
         let shared = Arc::new(SharedState::new(4));
         let poll_config = PollLoopConfig {
+            host_alias_ipv4_ports: Vec::new(),
             gateway_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
             guest_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
             gateway: GatewayIps {
@@ -1912,6 +2028,7 @@ mod tests {
 
     fn leak_poll_config() -> PollLoopConfig {
         PollLoopConfig {
+            host_alias_ipv4_ports: Vec::new(),
             gateway_mac: GATEWAY_MAC,
             guest_mac: GUEST_MAC,
             gateway: GatewayIps {

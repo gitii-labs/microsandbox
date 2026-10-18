@@ -1050,6 +1050,20 @@ func TestFFIWireShape_TCPAcceptQueueSize(t *testing.T) {
 	}
 }
 
+func TestFFIWireShape_HostAliasIPv4Ports(t *testing.T) {
+	omitted := marshalCreateOptions(t, WithNetwork(&NetworkConfig{}))["network"].(map[string]any)
+	if value, present := omitted["host_alias_ipv4_ports"]; present {
+		t.Fatalf("empty ports reached the wire as %#v", value)
+	}
+	got := marshalCreateOptions(t, WithNetwork(&NetworkConfig{
+		HostAliasIPv4Ports: []uint16{12345},
+	}))["network"].(map[string]any)
+	ports, ok := got["host_alias_ipv4_ports"].([]any)
+	if !ok || len(ports) != 1 || ports[0] != float64(12345) {
+		t.Fatalf("host_alias_ipv4_ports = %#v", got["host_alias_ipv4_ports"])
+	}
+}
+
 func TestBuildFFINetworkRateLimiters(t *testing.T) {
 	out := buildFFINetwork(&NetworkConfig{
 		RateLimiter: &NetworkRateLimiterConfig{

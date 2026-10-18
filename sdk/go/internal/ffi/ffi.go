@@ -98,6 +98,7 @@ static const char *dlerror(void) {
 // Keep in sync with sdk/go/native/src/lib.rs and microsandbox_go_ffi.h.
 // ---------------------------------------------------------------------------
 typedef void     (*msb_free_string_fn)(char *ptr);
+typedef void     (*msb_supports_host_alias_ipv4_ports_fn)(void);
 typedef void     (*msb_set_sdk_msb_path_fn)(const char *path);
 typedef uint64_t (*msb_cancel_alloc_fn)(void);
 typedef void     (*msb_cancel_trigger_fn)(uint64_t id);
@@ -273,6 +274,7 @@ typedef void (*msb_agent_free_bytes_fn)(uint8_t *ptr, size_t len);
 // Function pointer globals — NULL until load_microsandbox() succeeds.
 // ---------------------------------------------------------------------------
 static msb_free_string_fn        ptr_msb_free_string        = NULL;
+static msb_supports_host_alias_ipv4_ports_fn ptr_msb_supports_host_alias_ipv4_ports = NULL;
 static msb_set_sdk_msb_path_fn   ptr_msb_set_sdk_msb_path   = NULL;
 static msb_cancel_alloc_fn       ptr_msb_cancel_alloc       = NULL;
 static msb_cancel_trigger_fn     ptr_msb_cancel_trigger     = NULL;
@@ -493,6 +495,7 @@ const char *load_microsandbox(const char *path) {
 		return load_error;
 	}
 	RESOLVE(msb_free_string);
+	RESOLVE_OPTIONAL(msb_supports_host_alias_ipv4_ports);
 	RESOLVE(msb_set_sdk_msb_path);
 	RESOLVE(msb_cancel_alloc);
 	RESOLVE(msb_cancel_trigger);
@@ -800,6 +803,7 @@ char *call_msb_sandbox_branch(uint64_t cancel_id, uint64_t handle, const char *s
 }
 bool has_branch_integrity(void) { return ptr_msb_sandbox_branch_with_options != NULL; }
 bool has_guest_flush(void) { return ptr_msb_sandbox_pause_with_guest_flush != NULL; }
+bool has_host_alias_ipv4_ports(void) { return ptr_msb_supports_host_alias_ipv4_ports != NULL; }
 char *call_msb_sandbox_pause_with_guest_flush(uint64_t cancel_id, uint64_t handle, const char *source, const char *expected_id, const char *policy, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_pause_with_guest_flush ? ptr_msb_sandbox_pause_with_guest_flush(cancel_id, handle, source, expected_id, policy, buf, buf_len) : NULL;
 }
@@ -1958,6 +1962,7 @@ type NetworkOptions struct {
 	Ports                 map[uint16]uint16          `json:"ports,omitempty"`
 	PortBindings          []PortBindingOptions       `json:"port_bindings,omitempty"`
 	TCPAcceptQueueSize    *uint32                    `json:"tcp_accept_queue_size,omitempty"`
+	HostAliasIPv4Ports    []uint16                   `json:"host_alias_ipv4_ports,omitempty"`
 	IPv4Pool              string                     `json:"ipv4_pool,omitempty"`
 	IPv6Pool              string                     `json:"ipv6_pool,omitempty"`
 	NAT64Prefixes         []string                   `json:"nat64_prefixes,omitempty"`
@@ -2194,6 +2199,11 @@ func createSandbox(ctx context.Context, name string, opts CreateOptions, connect
 	if err := ensureLoaded(); err != nil {
 		return nil, err
 	}
+	if opts.Network != nil {
+		if err := validateHostAliasIPv4Ports(opts.Network.HostAliasIPv4Ports, bool(C.has_host_alias_ipv4_ports())); err != nil {
+			return nil, err
+		}
+	}
 
 	optsJSON, err := json.Marshal(opts)
 	if err != nil {
@@ -2232,6 +2242,9 @@ func createSandbox(ctx context.Context, name string, opts CreateOptions, connect
 // RestoreSandbox uses the dedicated native restore entry point.
 func RestoreSandbox(ctx context.Context, name string, opts RestoreOptions) (*Sandbox, error) {
 	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	if err := validateHostAliasIPv4Ports(opts.HostAliasIPv4Ports, bool(C.has_host_alias_ipv4_ports())); err != nil {
 		return nil, err
 	}
 	if !bool(C.has_sandbox_restore()) {
