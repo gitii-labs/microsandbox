@@ -4,13 +4,28 @@
 //! Each key owns a set of members and a single TTL. A reverse index
 //! (member -> keys) answers "which keys currently contain this member?" in
 //! amortized O(1). Expiration uses a min-heap of versioned events so a
-//! stale timer cannot remove a newer replacement of the same key.
+//! stale timer cannot remove a newer replacement of the same key. Stale
+//! events are dropped by rebuilding the heap once they outnumber live
+//! keys, so frequent replacements cannot grow it beyond the live entries.
 
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// The expiry heap is rebuilt from live keys once it holds more than this
+/// many events per live key. Each rebuild drops at least half of the heap,
+/// so its cost is amortized over the replacements that made it stale.
+const HEAP_COMPACTION_RATIO: usize = 2;
+
+/// Heaps at or below this many events are never rebuilt, so a small index
+/// does not rebuild on every replacement.
+const HEAP_COMPACTION_MIN_EVENTS: usize = 64;
 
 /// TTL-indexed reverse map from keys to members and members back to keys.
 #[derive(Debug)]
@@ -96,12 +111,19 @@ where
             version,
             key,
         }));
+        self.compact_expirations();
     }
 
     /// Remove the entry for `key` if present.
     pub fn remove(&mut self, key: &K, now: Instant) {
         self.evict_expired(now);
         self.remove_key(key);
+    }
+
+    /// Expiry of the entry for `key`, if present. The entry may already be
+    /// expired but not yet evicted.
+    pub fn expires_at(&self, key: &K) -> Option<Instant> {
+        self.by_key.get(key).map(|entry| entry.expires_at)
     }
 
     /// Returns true if `member` is associated with any non-expired key that
@@ -135,6 +157,28 @@ where
                 self.remove_key(&expiry.key);
             }
         }
+    }
+
+    /// Rebuild the expiry heap from live keys when stale events dominate it.
+    fn compact_expirations(&mut self) {
+        let events = self.expirations.len();
+        if events <= HEAP_COMPACTION_MIN_EVENTS
+            || events <= self.by_key.len().saturating_mul(HEAP_COMPACTION_RATIO)
+        {
+            return;
+        }
+
+        let mut live = Vec::with_capacity(self.by_key.len());
+        for (key, entry) in &self.by_key {
+            live.push(Reverse(ExpiryEvent {
+                expires_at: entry.expires_at,
+                sequence: self.next_sequence,
+                version: entry.version,
+                key: key.clone(),
+            }));
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+        }
+        self.expirations = BinaryHeap::from(live);
     }
 
     fn remove_key(&mut self, key: &K) {
@@ -222,6 +266,44 @@ mod tests {
 
         assert!(!index.member_matches(&1, now + Duration::from_secs(6), |key| key == &"alpha"));
         assert!(index.member_matches(&2, now + Duration::from_secs(6), |key| key == &"alpha"));
+    }
+
+    #[test]
+    fn replacements_do_not_grow_the_expiry_heap() {
+        let mut index = TtlReverseIndex::<&str, i32>::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(600);
+
+        for _ in 0..HEAP_COMPACTION_MIN_EVENTS * 10 {
+            index.insert("alpha", [1], ttl, now);
+            index.insert("beta", [2], ttl, now);
+        }
+
+        assert!(index.expirations.len() <= HEAP_COMPACTION_MIN_EVENTS + 1);
+        assert!(index.member_matches(&1, now, |key| key == &"alpha"));
+        index.evict_expired(now + ttl);
+        assert!(index.by_key.is_empty());
+        assert!(index.by_member.is_empty());
+        assert!(index.expirations.is_empty());
+    }
+
+    #[test]
+    fn compaction_keeps_live_expiries() {
+        let mut index = TtlReverseIndex::<&str, i32>::default();
+        let now = Instant::now();
+        let short = Duration::from_secs(5);
+        let long = Duration::from_secs(600);
+
+        index.insert("short", [1], short, now);
+        for _ in 0..=HEAP_COMPACTION_MIN_EVENTS {
+            index.insert("long", [2], long, now);
+        }
+
+        index.evict_expired(now + short);
+        assert!(!index.member_matches(&1, now + short, |key| key == &"short"));
+        assert!(index.member_matches(&2, now + short, |key| key == &"long"));
+        index.evict_expired(now + long);
+        assert!(index.by_key.is_empty());
     }
 
     #[test]

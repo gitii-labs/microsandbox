@@ -58,14 +58,37 @@ use crate::policy::{Action, DomainName, NetworkPolicy, PolicyDenial};
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Policy grace floor for DNS-derived resolved hostnames.
+/// Minimum lifetime of the policy binding between a resolved address and
+/// the domain it was resolved for.
 ///
-/// This is intentionally **not** DNS semantics. Resolved-hostname
-/// lifetimes normally follow the upstream response TTL, but when that
-/// TTL is zero we keep the entry alive for a very short window so an
-/// immediate connect following a successful DNS lookup does not fail
-/// closed before the guest can use the answer.
-const RESOLVED_HOSTNAME_MIN_TTL_SECS: u32 = 1;
+/// This is **not** DNS semantics: the answer forwarded to the guest keeps
+/// the upstream TTL. It only controls how long `Domain` / `DomainSuffix`
+/// rules and domain-scoped secrets accept the address after a lookup.
+///
+/// Clients keep answers longer than their TTL. npm's HTTP agent
+/// (`@npmcli/agent`) caches every lookup for five minutes, and a host
+/// stub resolver such as systemd-resolved returns the remaining TTL of its
+/// own cache, which can be one second. A binding that followed that TTL
+/// expired while the client kept connecting to the cached address, and
+/// the connection was refused at SYN time. Ten minutes covers a
+/// five-minute client cache, including a connection opened just before
+/// that cache expires, with margin. A longer upstream TTL still wins.
+///
+/// Each address keeps its own expiry, and a later answer never shortens
+/// it, so a different address set, a shorter TTL or an answer without
+/// addresses does not end the binding of an address the guest may still
+/// hold.
+///
+/// Tradeoff: an address stays associated with the domain for ten minutes
+/// after the last answer that contained it, even if the domain has since
+/// moved to other addresses or stopped resolving. During that window,
+/// domain allow and deny rules (egress and ingress), the rebind-protection
+/// exemption, domain-scoped secrets and OAuth grants, and the hostname in
+/// denial reports keep treating the address as the domain's. Intercepted
+/// upstream TLS still verifies the server certificate for the requested
+/// name unless upstream verification is disabled. The index holds every
+/// address returned within the window.
+const RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// TTL for locally-synthesized `host.microsandbox.internal` answers. Short
 /// enough that the guest re-resolves often, long enough to avoid hammering
@@ -316,7 +339,6 @@ impl DnsForwarder {
                 ?family,
                 "DNS query family is inactive for this sandbox",
             );
-            self.shared.clear_resolved_hostname(&domain, family);
             return build_status_response(&query_msg, ResponseCode::NoError);
         }
 
@@ -387,14 +409,18 @@ impl DnsForwarder {
 
         // Cache the resolved addresses so policy `Domain` /
         // `DomainSuffix` rules can later match when the guest connects
-        // to one of them.
-        if let Some(family) = family_for_query_type(query_type) {
-            if let Some((addrs, ttl)) = extract_addrs_and_ttl(&response_msg, family, &domain) {
-                self.shared
-                    .cache_resolved_hostname(&domain, family, addrs, ttl);
-            } else {
-                self.shared.clear_resolved_hostname(&domain, family);
-            }
+        // to one of them. An answer without addresses (NXDOMAIN, NODATA,
+        // SERVFAIL) leaves earlier bindings to expire on their own: a
+        // client may still hold the earlier positive answer.
+        if let Some(family) = family_for_query_type(query_type)
+            && let Some((addrs, ttl)) = extract_addrs_and_ttl(&response_msg, family, &domain)
+        {
+            self.shared.cache_resolved_hostname(
+                &domain,
+                family,
+                addrs,
+                ttl.max(RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME),
+            );
         }
 
         // Preserve the guest's transaction id.
@@ -901,9 +927,7 @@ fn inactive_query_family(
 }
 
 /// Extract resolved IP addresses and the minimum TTL across answers of
-/// the requested family. Zero-TTL answers are floored to
-/// [`RESOLVED_HOSTNAME_MIN_TTL_SECS`] so an immediate connect following
-/// a successful lookup does not fail closed.
+/// the requested family, including the CNAME records leading to them.
 fn extract_addrs_and_ttl(
     response: &Message,
     family: ResolvedHostnameFamily,
@@ -928,7 +952,7 @@ fn extract_addrs_and_ttl(
             }
 
             if let RData::CNAME(CNAME(canonical)) = &record.data {
-                let record_ttl = dns_record_ttl(record.ttl);
+                let record_ttl = Duration::from_secs(u64::from(record.ttl));
                 ttl = Some(ttl.map_or(record_ttl, |current| current.min(record_ttl)));
                 changed |= eligible_names.insert(normalize_dns_name(&canonical.to_string()));
             }
@@ -948,7 +972,7 @@ fn extract_addrs_and_ttl(
             _ => continue,
         };
         addrs.push(addr);
-        let record_ttl = dns_record_ttl(record.ttl);
+        let record_ttl = Duration::from_secs(u64::from(record.ttl));
         ttl = Some(ttl.map_or(record_ttl, |current| current.min(record_ttl)));
     }
 
@@ -957,10 +981,6 @@ fn extract_addrs_and_ttl(
     } else {
         ttl.map(|ttl| (addrs, ttl))
     }
-}
-
-fn dns_record_ttl(ttl: u32) -> Duration {
-    Duration::from_secs(u64::from(ttl.max(RESOLVED_HOSTNAME_MIN_TTL_SECS)))
 }
 
 fn normalize_dns_name(name: &str) -> String {
@@ -1028,6 +1048,10 @@ mod tests {
     use hickory_net::proto::rr::{DNSClass, Name, RecordType};
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    /// Distance from a binding's expiry at which tests probe it.
+    const BINDING_PROBE_MARGIN: Duration = Duration::from_secs(1);
 
     fn make_query(name: &str, qtype: RecordType) -> Message {
         let mut msg = Message::new(0x4242, MessageType::Query, OpCode::Query);
@@ -1059,6 +1083,14 @@ mod tests {
     /// how many queries it received so a test can prove an upstream was
     /// never consulted.
     async fn responding_udp(answer_ip: Ipv4Addr) -> (SocketAddr, Arc<AtomicUsize>) {
+        responding_udp_with_ttl(answer_ip, 60).await
+    }
+
+    /// [`responding_udp`] with an explicit answer TTL in seconds.
+    async fn responding_udp_with_ttl(
+        answer_ip: Ipv4Addr,
+        ttl: u32,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1081,7 +1113,7 @@ mod tests {
                     resp.add_query(q.clone());
                     resp.answers.push(Record::from_rdata(
                         q.name().clone(),
-                        60,
+                        ttl,
                         RData::A(A::from(answer_ip)),
                     ));
                 }
@@ -1091,6 +1123,34 @@ mod tests {
             }
         });
         (addr, hits)
+    }
+
+    /// UDP server that answers every query with SERVFAIL.
+    async fn servfail_udp() -> SocketAddr {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok((len, from)) = sock.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let Ok(query) = Message::from_bytes(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.metadata.recursion_desired = query.metadata.recursion_desired;
+                resp.metadata.response_code = ResponseCode::ServFail;
+                if let Some(q) = query.queries.first() {
+                    resp.add_query(q.clone());
+                }
+                if let Ok(bytes) = resp.to_bytes() {
+                    let _ = sock.send_to(&bytes, from).await;
+                }
+            }
+        });
+        addr
     }
 
     /// Build a forwarder over `upstreams` with a short query timeout, as
@@ -1143,6 +1203,143 @@ mod tests {
             RData::A(a) => Some(Ipv4Addr::from(*a)),
             _ => None,
         })
+    }
+
+    /// Resolve `example.com` through the gateway path against an upstream
+    /// that answers `answer` with `ttl`. Returns the response the guest
+    /// receives and the instants bracketing the lookup.
+    async fn resolve_with_ttl(
+        answer: Ipv4Addr,
+        ttl: u32,
+    ) -> (Arc<DnsForwarder>, Message, Instant, Instant) {
+        let (upstream, _) = responding_udp_with_ttl(answer, ttl).await;
+        let forwarder = forwarder_over(&[upstream]).await;
+        let raw = make_query("example.com.", RecordType::A)
+            .to_bytes()
+            .expect("encode query");
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let resolved_from = Instant::now();
+        let bytes = forwarder
+            .forward(&raw, Some(gateway), Transport::Udp, None)
+            .await
+            .expect("forwarded response");
+        let resolved_until = Instant::now();
+
+        let response = Message::from_bytes(&bytes).expect("parse response");
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        (forwarder, response, resolved_from, resolved_until)
+    }
+
+    /// npm caches lookups for five minutes regardless of TTL, and the host
+    /// resolver can hand out a one-second remaining TTL. The policy binding
+    /// must outlive that TTL until the minimum lifetime, while the guest
+    /// still receives the upstream TTL.
+    #[tokio::test]
+    async fn domain_binding_outlives_short_dns_ttl() {
+        const DNS_TTL: Duration = Duration::from_secs(1);
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let (forwarder, response, resolved_from, resolved_until) =
+            resolve_with_ttl(answer, DNS_TTL.as_secs() as u32).await;
+
+        let answer_ttls: Vec<u32> = response.answers.iter().map(|record| record.ttl).collect();
+        assert_eq!(answer_ttls, vec![DNS_TTL.as_secs() as u32]);
+
+        let bound = |at: Instant| {
+            forwarder
+                .shared
+                .any_resolved_hostname_at(IpAddr::V4(answer), at, |host| host == "example.com")
+        };
+        assert!(bound(resolved_until + DNS_TTL + BINDING_PROBE_MARGIN));
+        assert!(bound(
+            resolved_from + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME - BINDING_PROBE_MARGIN
+        ));
+        assert!(!bound(
+            resolved_until + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME
+        ));
+    }
+
+    /// A zero TTL also gets the minimum binding lifetime, and the guest
+    /// still receives the zero TTL.
+    #[tokio::test]
+    async fn domain_binding_survives_zero_dns_ttl() {
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let (forwarder, response, resolved_from, resolved_until) =
+            resolve_with_ttl(answer, 0).await;
+
+        assert_eq!(response.answers.first().map(|record| record.ttl), Some(0));
+        let bound = |at: Instant| {
+            forwarder
+                .shared
+                .any_resolved_hostname_at(IpAddr::V4(answer), at, |host| host == "example.com")
+        };
+        assert!(bound(
+            resolved_from + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME - BINDING_PROBE_MARGIN
+        ));
+        assert!(!bound(
+            resolved_until + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME
+        ));
+    }
+
+    /// A transient SERVFAIL after a positive answer must not unbind the
+    /// address a client cached from that answer.
+    #[tokio::test]
+    async fn domain_binding_survives_later_servfail() {
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let (mut forwarder, _, resolved_from, _) = resolve_with_ttl(answer, 1).await;
+        let failing = servfail_udp().await;
+        let config = Arc::clone(&forwarder.config);
+        Arc::get_mut(&mut forwarder)
+            .expect("unique test forwarder")
+            .configured = ConfiguredResolver::Direct(vec![ConfiguredUpstream {
+            addr: failing,
+            udp: build_udp_client(failing, config.query_timeout)
+                .await
+                .expect("udp client"),
+            tcp: OnceCell::new(),
+        }]);
+
+        let raw = make_query("example.com.", RecordType::A)
+            .to_bytes()
+            .expect("encode query");
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+        let bytes = forwarder
+            .forward(&raw, Some(gateway), Transport::Udp, None)
+            .await
+            .expect("forwarded response");
+        let response = Message::from_bytes(&bytes).expect("parse response");
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+
+        assert!(forwarder.shared.any_resolved_hostname_at(
+            IpAddr::V4(answer),
+            resolved_from + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME - BINDING_PROBE_MARGIN,
+            |host| host == "example.com"
+        ));
+    }
+
+    /// An upstream TTL longer than the minimum lifetime still decides how
+    /// long the binding lasts.
+    #[tokio::test]
+    async fn domain_binding_follows_dns_ttl_longer_than_minimum() {
+        let dns_ttl = RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME * 2;
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let (forwarder, response, resolved_from, resolved_until) =
+            resolve_with_ttl(answer, dns_ttl.as_secs() as u32).await;
+
+        assert_eq!(
+            response.answers.first().map(|record| record.ttl),
+            Some(dns_ttl.as_secs() as u32)
+        );
+        let bound = |at: Instant| {
+            forwarder
+                .shared
+                .any_resolved_hostname_at(IpAddr::V4(answer), at, |host| host == "example.com")
+        };
+        assert!(bound(
+            resolved_until + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME
+        ));
+        assert!(bound(resolved_from + dns_ttl - BINDING_PROBE_MARGIN));
+        assert!(!bound(resolved_until + dns_ttl));
     }
 
     #[tokio::test]

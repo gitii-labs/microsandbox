@@ -177,6 +177,8 @@ Domain blocking and rebinding protection apply only to DNS traffic that microsan
 
 microsandbox records the IP addresses returned for each domain. A domain rule matches a later connection only when that sandbox resolved the domain to that IP.
 
+Each recorded IP stays bound to its domain for 10 minutes after the last answer that contained it, or for the DNS TTL when that is longer. A later answer with different IPs or a shorter TTL, or a failed lookup, does not remove or shorten earlier bindings. Clients that cache answers beyond their TTL, such as npm with its fixed 5-minute cache, can keep connecting to the cached IP. The TTL in the answer the guest receives is not changed.
+
 An application that connects directly to a hard-coded IP does not match a domain rule. Use an IP or CIDR rule for that traffic.
 
 ## Reference
