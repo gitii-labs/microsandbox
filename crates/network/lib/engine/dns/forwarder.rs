@@ -74,9 +74,10 @@ use crate::policy::{Action, DomainName, NetworkPolicy, PolicyDenial};
 /// five-minute client cache, including a connection opened just before
 /// that cache expires, with margin. A longer upstream TTL still wins.
 ///
-/// Each address keeps its own expiry, so a later answer with a different
-/// address set, or an answer without addresses, does not end the binding
-/// of an address the guest may still hold.
+/// Each address keeps its own expiry, and a later answer never shortens
+/// it, so a different address set, a shorter TTL or an answer without
+/// addresses does not end the binding of an address the guest may still
+/// hold.
 ///
 /// Tradeoff: an address stays associated with the domain for ten minutes
 /// after the last answer that contained it, even if the domain has since

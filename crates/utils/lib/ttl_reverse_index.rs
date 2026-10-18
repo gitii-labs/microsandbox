@@ -120,6 +120,12 @@ where
         self.remove_key(key);
     }
 
+    /// Expiry of the entry for `key`, if present. The entry may already be
+    /// expired but not yet evicted.
+    pub fn expires_at(&self, key: &K) -> Option<Instant> {
+        self.by_key.get(key).map(|entry| entry.expires_at)
+    }
+
     /// Returns true if `member` is associated with any non-expired key that
     /// satisfies `predicate`.
     pub fn member_matches(

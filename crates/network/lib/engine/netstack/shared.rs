@@ -254,7 +254,9 @@ impl SharedState {
     }
 
     /// Bind each address to a hostname within the given address family for
-    /// `ttl`. Addresses bound by earlier answers keep their own expiry.
+    /// at least `ttl`. A binding that already lasts longer keeps its expiry,
+    /// so a later answer with a shorter TTL never cuts it short. Addresses
+    /// bound by earlier answers keep their own expiry.
     pub fn cache_resolved_hostname(
         &self,
         domain: &str,
@@ -271,7 +273,10 @@ impl SharedState {
                 family,
                 addr,
             };
-            index.insert(key, [addr], ttl, now);
+            let remaining = index.expires_at(&key).map_or(Duration::ZERO, |expires_at| {
+                expires_at.saturating_duration_since(now)
+            });
+            index.insert(key, [addr], ttl.max(remaining), now);
         }
     }
 
@@ -464,6 +469,34 @@ mod tests {
             cached_from + second_ttl - Duration::from_secs(1)
         ));
         assert!(!bound(second, cached_until + second_ttl));
+    }
+
+    #[test]
+    fn resolved_hostnames_keep_longer_expiry_after_shorter_answer() {
+        let state = SharedState::new(4);
+        let addr: IpAddr = "192.0.2.1".parse().unwrap();
+        let long_ttl = Duration::from_secs(3600);
+        let short_ttl = Duration::from_secs(30);
+        let bound = |at| state.any_resolved_hostname_at(addr, at, |h| h == "example.com");
+
+        let cached_from = Instant::now();
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [addr],
+            long_ttl,
+        );
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [addr],
+            short_ttl,
+        );
+        let cached_until = Instant::now();
+
+        assert!(bound(cached_until + short_ttl));
+        assert!(bound(cached_from + long_ttl - Duration::from_secs(1)));
+        assert!(!bound(cached_until + long_ttl));
     }
 
     #[test]
