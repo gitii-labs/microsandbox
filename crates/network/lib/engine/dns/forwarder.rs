@@ -74,12 +74,19 @@ use crate::policy::{Action, DomainName, NetworkPolicy, PolicyDenial};
 /// five-minute client cache, including a connection opened just before
 /// that cache expires, with margin. A longer upstream TTL still wins.
 ///
+/// Each address keeps its own expiry, so a later answer with a different
+/// address set, or an answer without addresses, does not end the binding
+/// of an address the guest may still hold.
+///
 /// Tradeoff: an address stays associated with the domain for ten minutes
-/// after the guest last resolved it, even if the domain has moved to other
-/// addresses. Allow rules, domain-scoped secrets and OAuth grants keep
-/// accepting the address during that window, and deny rules keep matching
-/// it. Intercepted upstream TLS still verifies the server certificate for
-/// the requested name unless upstream verification is disabled.
+/// after the last answer that contained it, even if the domain has since
+/// moved to other addresses or stopped resolving. During that window,
+/// domain allow and deny rules (egress and ingress), the rebind-protection
+/// exemption, domain-scoped secrets and OAuth grants, and the hostname in
+/// denial reports keep treating the address as the domain's. Intercepted
+/// upstream TLS still verifies the server certificate for the requested
+/// name unless upstream verification is disabled. The index holds every
+/// address returned within the window.
 const RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// TTL for locally-synthesized `host.microsandbox.internal` answers. Short
@@ -331,7 +338,6 @@ impl DnsForwarder {
                 ?family,
                 "DNS query family is inactive for this sandbox",
             );
-            self.shared.clear_resolved_hostname(&domain, family);
             return build_status_response(&query_msg, ResponseCode::NoError);
         }
 
@@ -402,18 +408,18 @@ impl DnsForwarder {
 
         // Cache the resolved addresses so policy `Domain` /
         // `DomainSuffix` rules can later match when the guest connects
-        // to one of them.
-        if let Some(family) = family_for_query_type(query_type) {
-            if let Some((addrs, ttl)) = extract_addrs_and_ttl(&response_msg, family, &domain) {
-                self.shared.cache_resolved_hostname(
-                    &domain,
-                    family,
-                    addrs,
-                    ttl.max(RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME),
-                );
-            } else {
-                self.shared.clear_resolved_hostname(&domain, family);
-            }
+        // to one of them. An answer without addresses (NXDOMAIN, NODATA,
+        // SERVFAIL) leaves earlier bindings to expire on their own: a
+        // client may still hold the earlier positive answer.
+        if let Some(family) = family_for_query_type(query_type)
+            && let Some((addrs, ttl)) = extract_addrs_and_ttl(&response_msg, family, &domain)
+        {
+            self.shared.cache_resolved_hostname(
+                &domain,
+                family,
+                addrs,
+                ttl.max(RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME),
+            );
         }
 
         // Preserve the guest's transaction id.
@@ -1122,6 +1128,34 @@ mod tests {
         (addr, hits)
     }
 
+    /// UDP server that answers every query with SERVFAIL.
+    async fn servfail_udp() -> SocketAddr {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok((len, from)) = sock.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let Ok(query) = Message::from_bytes(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                resp.metadata.recursion_desired = query.metadata.recursion_desired;
+                resp.metadata.response_code = ResponseCode::ServFail;
+                if let Some(q) = query.queries.first() {
+                    resp.add_query(q.clone());
+                }
+                if let Ok(bytes) = resp.to_bytes() {
+                    let _ = sock.send_to(&bytes, from).await;
+                }
+            }
+        });
+        addr
+    }
+
     /// Build a forwarder over `upstreams` with a short query timeout, as
     /// the gateway path uses it. No microVM or host resolver involved.
     async fn forwarder_over(upstreams: &[SocketAddr]) -> Arc<DnsForwarder> {
@@ -1228,17 +1262,60 @@ mod tests {
         ));
     }
 
-    /// A zero TTL forbids caching on the guest side, but the address the
-    /// guest connects to right after the lookup is still bound.
+    /// A zero TTL also gets the minimum binding lifetime, and the guest
+    /// still receives the zero TTL.
     #[tokio::test]
     async fn domain_binding_survives_zero_dns_ttl() {
         let answer = Ipv4Addr::new(93, 184, 216, 34);
-        let (forwarder, response, _, resolved_until) = resolve_with_ttl(answer, 0).await;
+        let (forwarder, response, resolved_from, resolved_until) =
+            resolve_with_ttl(answer, 0).await;
 
         assert_eq!(response.answers.first().map(|record| record.ttl), Some(0));
+        let bound = |at: Instant| {
+            forwarder
+                .shared
+                .any_resolved_hostname_at(IpAddr::V4(answer), at, |host| host == "example.com")
+        };
+        assert!(bound(
+            resolved_from + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME - BINDING_PROBE_MARGIN
+        ));
+        assert!(!bound(
+            resolved_until + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME
+        ));
+    }
+
+    /// A transient SERVFAIL after a positive answer must not unbind the
+    /// address a client cached from that answer.
+    #[tokio::test]
+    async fn domain_binding_survives_later_servfail() {
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let (mut forwarder, _, _, resolved_until) = resolve_with_ttl(answer, 1).await;
+        let failing = servfail_udp().await;
+        let config = Arc::clone(&forwarder.config);
+        Arc::get_mut(&mut forwarder)
+            .expect("unique test forwarder")
+            .configured = ConfiguredResolver::Direct(vec![ConfiguredUpstream {
+            addr: failing,
+            udp: build_udp_client(failing, config.query_timeout)
+                .await
+                .expect("udp client"),
+            tcp: OnceCell::new(),
+        }]);
+
+        let raw = make_query("example.com.", RecordType::A)
+            .to_bytes()
+            .expect("encode query");
+        let gateway: IpAddr = "10.0.0.1".parse().unwrap();
+        let bytes = forwarder
+            .forward(&raw, Some(gateway), Transport::Udp, None)
+            .await
+            .expect("forwarded response");
+        let response = Message::from_bytes(&bytes).expect("parse response");
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+
         assert!(forwarder.shared.any_resolved_hostname_at(
             IpAddr::V4(answer),
-            resolved_until,
+            resolved_until + RESOLVED_HOSTNAME_MIN_BINDING_LIFETIME - BINDING_PROBE_MARGIN,
             |host| host == "example.com"
         ));
     }

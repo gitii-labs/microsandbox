@@ -388,7 +388,7 @@ Strict hostname policy is enabled by default. The v0.6.0–v0.6.17 launch gate r
 
 Observable network behavior is an effective compatibility contract. It includes default MTU, sandbox-slot address derivation, IPv4 subnet sizing, guest and gateway offsets, IPv6 prefixes, deterministic MAC addresses, interface name `eth0`, `host.microsandbox.internal`, DNS UDP and TCP behavior, DNS-over-TLS, TLS interception and trust paths, published-port binding, TCP half-close, UDP peer lifetime, destination policy, and host-side secret placeholder substitution.
 
-Resolved-hostname policy bindings last at least 10 minutes after a lookup, or the DNS TTL when longer, instead of following the TTL with a one-second floor. This is runtime-local policy state: DNS answers sent to the guest, launch JSON, protocols and persisted state are unchanged, so SDK/runtime compatibility is unaffected in both directions. Older runtimes keep TTL-bound bindings until upgraded and restarted.
+Resolved-hostname policy bindings last at least 10 minutes after an answer, or the DNS TTL when longer, instead of following the TTL with a one-second floor. Each address expires on its own: a later answer with a different address set, or an answer without addresses, no longer removes earlier addresses. This is runtime-local policy state: DNS answers sent to the guest, launch JSON, protocols and persisted state are unchanged, so SDK/runtime compatibility is unaffected in both directions. Older runtimes keep TTL-bound bindings until upgraded and restarted.
 
 Network idle sleep is bounded by the existing one-second cleanup deadline and any earlier stack or deferred-close deadline, with packet and proxy events still waking it immediately.
 

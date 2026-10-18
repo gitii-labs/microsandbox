@@ -78,7 +78,8 @@ pub struct SharedState {
     /// construction.
     policy_observer: RwLock<Option<Arc<dyn PolicyObserver>>>,
 
-    /// Resolved hostname index used to map destination IPs back to queried hostnames.
+    /// Resolved hostname index used to map destination IPs back to queried
+    /// hostnames. Each address binding expires on its own.
     resolved_hostnames: RwLock<TtlReverseIndex<ResolvedHostnameKey, IpAddr>>,
 
     /// Per-sandbox gateway IPv4. Set once at boot; used by
@@ -112,14 +113,17 @@ pub enum ResolvedHostnameFamily {
     Ipv6,
 }
 
-/// Composite cache key for a single DNS resolution.
+/// Cache key for one address resolved for a hostname.
 ///
-/// `family` partitions entries so that `A` and `AAAA` responses for the
-/// same hostname refresh independently instead of overwriting each other.
+/// Keying by address gives every binding its own expiry: a later answer
+/// with a different address set refreshes the addresses it contains and
+/// leaves the others to expire on their own, so a client that cached an
+/// earlier answer can still reach its address.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ResolvedHostnameKey {
     hostname: String,
     family: ResolvedHostnameFamily,
+    addr: IpAddr,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -249,7 +253,8 @@ impl SharedState {
         }
     }
 
-    /// Replace the resolved addresses for a hostname within the given address family.
+    /// Bind each address to a hostname within the given address family for
+    /// `ttl`. Addresses bound by earlier answers keep their own expiry.
     pub fn cache_resolved_hostname(
         &self,
         domain: &str,
@@ -258,18 +263,16 @@ impl SharedState {
         ttl: Duration,
     ) {
         let hostname = normalize_hostname(domain);
-        let key = ResolvedHostnameKey { hostname, family };
-        let addrs = addrs.into_iter().map(normalize_ip_addr);
-        self.resolved_hostnames
-            .write()
-            .insert(key, addrs, ttl, Instant::now());
-    }
-
-    /// Clear the resolved addresses for a hostname within the given address family.
-    pub fn clear_resolved_hostname(&self, domain: &str, family: ResolvedHostnameFamily) {
-        let hostname = normalize_hostname(domain);
-        let key = ResolvedHostnameKey { hostname, family };
-        self.resolved_hostnames.write().remove(&key, Instant::now());
+        let now = Instant::now();
+        let mut index = self.resolved_hostnames.write();
+        for addr in addrs.into_iter().map(normalize_ip_addr) {
+            let key = ResolvedHostnameKey {
+                hostname: hostname.clone(),
+                family,
+                addr,
+            };
+            index.insert(key, [addr], ttl, now);
+        }
     }
 
     /// Returns `true` when any resolved hostname for `addr` satisfies `predicate`.
@@ -426,6 +429,41 @@ mod tests {
         assert!(state.any_resolved_hostname(v4, |h| h == "example.com"));
         assert!(state.any_resolved_hostname(v6, |h| h == "example.com"));
         assert!(!state.any_resolved_hostname(v4, |h| h == "other.example"));
+    }
+
+    #[test]
+    fn resolved_hostnames_keep_addresses_missing_from_a_later_answer() {
+        let state = SharedState::new(4);
+        let first: IpAddr = "192.0.2.1".parse().unwrap();
+        let second: IpAddr = "192.0.2.2".parse().unwrap();
+        let first_ttl = Duration::from_secs(600);
+        let second_ttl = Duration::from_secs(1200);
+        let bound = |addr, at| state.any_resolved_hostname_at(addr, at, |h| h == "example.com");
+
+        let cached_from = Instant::now();
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [first],
+            first_ttl,
+        );
+        state.cache_resolved_hostname(
+            "example.com",
+            ResolvedHostnameFamily::Ipv4,
+            [second],
+            second_ttl,
+        );
+        let cached_until = Instant::now();
+
+        assert!(bound(first, cached_until));
+        assert!(bound(second, cached_until));
+        assert!(!bound(first, cached_until + first_ttl));
+        assert!(bound(second, cached_until + first_ttl));
+        assert!(bound(
+            second,
+            cached_from + second_ttl - Duration::from_secs(1)
+        ));
+        assert!(!bound(second, cached_until + second_ttl));
     }
 
     #[test]
