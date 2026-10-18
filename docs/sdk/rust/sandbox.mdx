@@ -1358,6 +1358,25 @@ Configure an explicit rootfs source. Use this for OCI-only settings such as the 
   </div>
 </div>
 
+#### <span className="msb-recv">sandbox.</span><span className="msb-hn">log_dir()</span>
+
+<Tooltip tip="Not accepted on microsandbox cloud; log files are local to the host."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn log_dir(self, dir: impl Into<PathBuf>) -> Self
+```
+
+Write the sandbox's log files to `dir` instead of `<sandbox-dir>/logs`. Creation creates the directory if needed and makes `<sandbox-dir>/logs` a symlink to it, so log readers, `msb logs` and later starts use it. Removing the sandbox removes only the symlink; the directory and its files stay with the caller. A relative path resolves against the working directory at creation. Use a separate directory for each sandbox. Not supported on Windows. See [Logs](/sandboxes/logs#choose-the-log-directory).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>dir</code><span className="msb-type">impl Into&lt;PathBuf&gt;</span></div>
+    <div className="msb-param-desc">Host directory for the log files.</div>
+  </div>
+</div>
+
 #### <span className="msb-recv">sandbox.</span><span className="msb-hn">log_level()</span>
 
 ```rust

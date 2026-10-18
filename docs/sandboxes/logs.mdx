@@ -127,6 +127,35 @@ Sandbox logs live under `<sandbox-dir>/logs/`:
 | `kernel.log` | Guest kernel and agent console output |
 | `boot-error.json` | Structured startup failure details, when boot fails early |
 
+### Rotation and archives
+
+`exec.log` and `runtime.log` rotate at 10 MiB into `<file>.1` through `<file>.4`; `.1` is the newest. When `.4` would be overwritten, it is moved to an archive named `<file>.<UTC timestamp>`, for example `runtime.log.20261018T143005Z`, with a `-<n>` suffix when two archives share a second. A background thread compresses each archive to `<file>.<UTC timestamp>.gz` and removes the uncompressed file once the compressed file is written. If compression fails, the uncompressed archive stays and a warning is written to `runtime.log`.
+
+`kernel.log` is replaced on every boot. Before a restart, the previous `kernel.log` is archived and compressed the same way.
+
+`msb logs` and the SDK log readers read the live files and the `.1` to `.4` chain only. Archives are for operators and tools that need older output. microsandbox never deletes archives; the embedder or operator is responsible for deleting them. Removing a sandbox deletes its sandbox directory, including the default `logs/` directory and its archives.
+
+### Choose the log directory
+
+An embedder can keep logs outside the sandbox directory so they outlive the sandbox. Pass a log directory at creation; microsandbox creates it if needed and makes `<sandbox-dir>/logs` a symlink to it. `msb logs`, the SDK log readers and later starts use the directory through that symlink. Removing the sandbox removes only the symlink, so the files and their cleanup stay with the caller. Use a separate directory for each sandbox. The option is available for local sandboxes on Linux and macOS.
+
+<CodeGroup>
+```rust Rust
+let sandbox = Sandbox::builder("worker")
+    .image("alpine")
+    .log_dir("/var/lib/myapp/logs/worker")
+    .create()
+    .await?;
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("alpine"),
+    m.WithLogDir("/var/lib/myapp/logs/worker"),
+)
+```
+</CodeGroup>
+
 ## Reference
 
 For exact log APIs, see [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), or [Go](/sdk/go/sandbox). For local log retrieval and follow mode, see [`msb logs`](/cli/sandbox-commands#msb-logs).
