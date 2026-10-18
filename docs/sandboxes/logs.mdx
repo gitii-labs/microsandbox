@@ -129,15 +129,27 @@ Sandbox logs live under `<sandbox-dir>/logs/`:
 
 ### Rotation and archives
 
-`exec.log` and `runtime.log` rotate at 10 MiB into `<file>.1` through `<file>.4`; `.1` is the newest. When `.4` would be overwritten, it is moved to an archive named `<file>.<UTC timestamp>`, for example `runtime.log.20261018T143005Z`, with a `-<n>` suffix when two archives share a second. A background thread compresses each archive to `<file>.<UTC timestamp>.gz` and removes the uncompressed file once the compressed file is written. If compression fails, the uncompressed archive stays and the runtime logs a warning, which lands in `runtime.log` on Linux and macOS.
+`exec.log` and `runtime.log` rotate at 10 MiB into `<file>.1` through `<file>.4`; `.1` is the newest. When `.4` would be overwritten, it is moved to an archive instead. `kernel.log` is replaced on every boot, so the previous boot's `kernel.log` is archived before a restart.
 
-`kernel.log` is replaced on every boot. Before a restart, the previous `kernel.log` is archived and compressed the same way.
+An archive appears in the log directory under one of these names:
 
-`msb logs` and the SDK log readers read the live files and the `.1` to `.4` chain only. Archives are for operators and tools that need older output. microsandbox never deletes archives, so log disk use grows until the embedder or operator deletes them or the sandbox is removed. Removing a sandbox deletes its sandbox directory, including the default `logs/` directory and its archives.
+| Name | Meaning |
+|------|---------|
+| `<file>.<UTC timestamp>` | Archive not compressed yet, or compression failed |
+| `<file>.<UTC timestamp>.gz.partial` | Compression in progress; incomplete |
+| `<file>.<UTC timestamp>.gz` | Compressed archive |
+
+The timestamp, for example `20261018T143005Z`, is the time the file was archived, not when its content was written. A `-<n>` suffix follows it when two archives of one file share a second. A background thread compresses each archive and removes the uncompressed file once the compressed file is complete; the compressed file keeps the archive's modification time. If compression fails, the uncompressed archive stays and the runtime logs a warning, which lands in `runtime.log` on Linux and macOS. Compression interrupted by a stop is finished only when that sandbox starts again, so a stopped or removed sandbox can keep uncompressed archives and `.gz.partial` files.
+
+Order and age archives by file modification time, which is the time of the last write to that content. `msb logs` and the SDK log readers read the live files and the `.1` to `.4` chain only. microsandbox never deletes archives, so log disk use grows until the embedder or operator deletes them or the sandbox is removed. A tool that prunes by age must handle all three name forms. Removing a sandbox deletes its sandbox directory, including the default `logs/` directory and its archives.
 
 ### Choose the log directory
 
-An embedder can keep logs outside the sandbox directory so they outlive the sandbox. Pass a log directory at creation; microsandbox creates it if needed and makes `<sandbox-dir>/logs` a symlink to it. `msb logs`, the SDK log readers and later starts use the directory through that symlink. Removing the sandbox removes only the symlink, so the files and their cleanup stay with the caller. Use a separate directory for each sandbox. The option is available for local sandboxes on Linux and macOS.
+An embedder can keep logs outside the sandbox directory so they outlive the sandbox. Pass a log directory at creation; microsandbox creates it if needed and makes `<sandbox-dir>/logs` a symlink to it. `msb logs`, the SDK log readers and later starts use the directory through that symlink. Removing the sandbox removes only the symlink, so the files and their cleanup stay with the caller. The option is available in the Rust and Go SDKs, for local sandboxes on Linux and macOS.
+
+Creation rejects a log directory that, after resolving symlinks, is inside or contains the sandboxes directory, the volumes directory, or a bind, disk-image or mount-table source of the sandbox, because a guest that can write the log directory could redirect the runtime's writes. Mount-table children attached after creation are not checked.
+
+A runtime holds a lock in its log directory while it runs, so a second sandbox started with a directory in use fails with an error. A directory can be reused by a later sandbox once the earlier one has stopped: readers of the new sandbox then also see the earlier sandbox's `exec.log` and `runtime.log` entries and rotated files, which the new runtime appends to, and its previous `kernel.log` becomes an archive. A `boot-error.json` left in the directory is removed when the new sandbox is created.
 
 <CodeGroup>
 ```rust Rust

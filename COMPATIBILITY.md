@@ -457,6 +457,8 @@ Rotation keeps the live file and the `.1`–`.4` chain, its 10 MiB threshold and
 
 A caller-chosen log directory is recorded only as the `<sandbox>/logs` symlink created at local creation; launch JSON, the catalog and saved configurations are unchanged. Older SDKs, CLIs and runtimes reach it through the same deterministic path, and their recursive removal unlinks the symlink without following it. The Go create options refuse unknown fields, so a newer Go SDK paired with an older native library rejects `log_dir` instead of ignoring it.
 
+Current runtimes hold an exclusive lock on `log-dir.lock` in their log directory for their lifetime and refuse to start when it is held. Older runtimes neither create nor honour it, so they are not excluded from a shared caller-chosen directory; readers ignore the file.
+
 ## 17. Lifecycle, Locks, Leases, and Ordering
 
 Compatibility can depend on operation order even when no serialized shape changes. Lifecycle locks, database run rows, PID ownership, endpoints, metrics slots, CPU and writeback allocations, heartbeat state, maintenance leases, signals, shutdown delays, and cleanup together determine whether a sandbox is live and who may mutate it.
