@@ -129,11 +129,11 @@ Sandbox logs live under `<sandbox-dir>/logs/`:
 
 ### Rotation and archives
 
-`exec.log` and `runtime.log` rotate at 10 MiB into `<file>.1` through `<file>.4`; `.1` is the newest. When `.4` would be overwritten, it is moved to an archive named `<file>.<UTC timestamp>`, for example `runtime.log.20261018T143005Z`, with a `-<n>` suffix when two archives share a second. A background thread compresses each archive to `<file>.<UTC timestamp>.gz` and removes the uncompressed file once the compressed file is written. If compression fails, the uncompressed archive stays and a warning is written to `runtime.log`.
+`exec.log` and `runtime.log` rotate at 10 MiB into `<file>.1` through `<file>.4`; `.1` is the newest. When `.4` would be overwritten, it is moved to an archive named `<file>.<UTC timestamp>`, for example `runtime.log.20261018T143005Z`, with a `-<n>` suffix when two archives share a second. A background thread compresses each archive to `<file>.<UTC timestamp>.gz` and removes the uncompressed file once the compressed file is written. If compression fails, the uncompressed archive stays and the runtime logs a warning, which lands in `runtime.log` on Linux and macOS.
 
 `kernel.log` is replaced on every boot. Before a restart, the previous `kernel.log` is archived and compressed the same way.
 
-`msb logs` and the SDK log readers read the live files and the `.1` to `.4` chain only. Archives are for operators and tools that need older output. microsandbox never deletes archives; the embedder or operator is responsible for deleting them. Removing a sandbox deletes its sandbox directory, including the default `logs/` directory and its archives.
+`msb logs` and the SDK log readers read the live files and the `.1` to `.4` chain only. Archives are for operators and tools that need older output. microsandbox never deletes archives, so log disk use grows until the embedder or operator deletes them or the sandbox is removed. Removing a sandbox deletes its sandbox directory, including the default `logs/` directory and its archives.
 
 ### Choose the log directory
 
