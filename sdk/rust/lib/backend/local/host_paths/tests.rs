@@ -509,7 +509,7 @@ fn restore_paths_are_captured_but_snapshot_names_and_ids_are_not() {
 }
 
 #[test]
-fn resolves_a_relative_log_directory_without_following_symlinks() {
+fn resolves_a_relative_log_directory_and_keeps_dot_components() {
     let mut config = SandboxConfig {
         log_dir: Some("logs/../topic".into()),
         ..Default::default()

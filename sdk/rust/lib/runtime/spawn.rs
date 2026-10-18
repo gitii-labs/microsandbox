@@ -427,6 +427,18 @@ pub async fn spawn_sandbox(
         &config.spec.name,
     )?;
 
+    // A caller-chosen log directory is linked from `<sandbox>/logs`. Report a removed target
+    // by name instead of the bare "File exists" that creating through the dangling link gives.
+    if let Ok(target) = tokio::fs::read_link(&log_dir).await
+        && tokio::fs::metadata(&log_dir).await.is_err()
+    {
+        return Err(MicrosandboxError::Runtime(format!(
+            "log directory {} linked from {} is missing; recreate it to start the sandbox",
+            target.display(),
+            log_dir.display()
+        )));
+    }
+
     // Create directories concurrently.
     tokio::try_join!(
         tokio::fs::create_dir_all(&log_dir),

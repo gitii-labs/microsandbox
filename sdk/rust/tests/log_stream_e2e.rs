@@ -261,6 +261,16 @@ async fn log_dir_receives_logs_and_survives_removal() {
         "kernel archives: {kernel_archives:?}"
     );
 
+    // A removed log directory is reported by name instead of being recreated elsewhere.
+    let moved = chosen.path().join("moved");
+    std::fs::rename(&log_dir, &moved).expect("move log dir away");
+    let error = Sandbox::start(name)
+        .await
+        .err()
+        .expect("start without its log directory must fail");
+    assert!(error.to_string().contains("is missing"), "{error}");
+    std::fs::rename(&moved, &log_dir).expect("restore log dir");
+
     Sandbox::remove(name).await.expect("remove");
     let exec_log = std::fs::read_to_string(log_dir.join("exec.log")).expect("exec.log kept");
     assert!(
