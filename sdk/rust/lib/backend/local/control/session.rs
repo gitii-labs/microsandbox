@@ -23,6 +23,17 @@ pub(crate) struct ControlSession {
 //--------------------------------------------------------------------------------------------------
 
 impl ControlSession {
+    pub async fn watch_mount_writes(
+        &self,
+        cursor: Option<microsandbox_types::MountWriteCursor>,
+    ) -> Result<microsandbox_types::MountWrites, SharedError> {
+        tokio::select! {
+            biased;
+            _ = self.entry.invalidated.cancelled() => Err(Arc::new(ControlClientError::RuntimeChanged)),
+            result = self.connection.watch_mount_writes(cursor) => result.map_err(Arc::new),
+        }
+    }
+
     pub(super) fn new(entry: Arc<Entry>, connection: ControlConnection) -> Self {
         Self { entry, connection }
     }

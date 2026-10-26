@@ -29,6 +29,7 @@ pub(crate) mod metrics;
 mod modify;
 #[cfg(feature = "local")]
 mod mount_table;
+
 #[cfg(feature = "local")]
 mod patch;
 #[cfg(all(feature = "local", windows))]
@@ -202,6 +203,7 @@ pub use microsandbox_types::{ExternalMountRestorePolicy, ExternalMountWarning};
 #[cfg(feature = "net")]
 pub use microsandbox_types::{MintEndpoint, OAuthSecret};
 pub use microsandbox_types::{MountTableCache, MountTableChild, MountTableOwner, MountTableSpec};
+pub use microsandbox_types::{MountWriteCursor, MountWriteRevision, MountWrites};
 #[cfg(feature = "local")]
 pub(crate) use restore_builder::RestoreBootOverrides;
 pub use restore_builder::RestoreBuilder;

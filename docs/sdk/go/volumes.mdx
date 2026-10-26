@@ -73,6 +73,24 @@ err = sb.DetachMount(ctx, "token")
 
 ## Functions
 
+### Mount mutation notifications
+
+`Sandbox.WatchMountWrites(ctx, cursor)` observes successful guest mutations through the existing
+host control socket. Pass nil for an immediate attachment snapshot, then pass the returned
+`MountWrites.Cursor` to wait for a change without polling. Cancelling the context releases the
+waiting connection. A runtime or native SDK without this operation returns an explicit error.
+
+Each record identifies a child by name and runtime `Attachment`, with its last successful mutation
+`Revision`. IDs are never reused within `Cursor.Epoch`; an epoch changes when the table is replaced.
+Zero revisions mean no guest mutation has been observed. `Reset` identifies initial observation or
+a different epoch: reconcile the current attachments instead of reusing bindings from an old VM.
+Attach and detach can also advance the cursor without reporting a guest mutation.
+
+State is coalesced per live attachment, not queued per syscall. Slow or disconnected consumers can
+resume with their last cursor without losing the fact that an attachment changed. A detach removes
+its state; drain backing content before deleting it. These notifications do not report host writes,
+promise a durable upload, or wait for descriptor close, fsync, or a multi-file atomic snapshot.
+
 #### <span className="msb-recv"></span><span className="msb-hn">GetDefaultVolume()</span>
 
 <Tooltip tip="Available only on microsandbox cloud; the local backend has no default volume."><span className="msb-badge-cloud">Cloud-only <Icon icon="circle-info" size={11} /></span></Tooltip>

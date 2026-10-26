@@ -428,6 +428,8 @@ pub enum Operation {
     SandboxModify,
     /// `Sandbox::update_mounts`.
     SandboxUpdateMounts,
+    /// `Sandbox::watch_mount_writes`.
+    SandboxWatchMountWrites,
     /// `Sandbox::fs`.
     SandboxFs,
     /// The free function `all_sandbox_metrics`.
@@ -586,6 +588,7 @@ impl Operation {
             Operation::SandboxMetricsStream => "Sandbox::metrics_stream",
             Operation::SandboxModify => "Sandbox::modify",
             Operation::SandboxUpdateMounts => "Sandbox::update_mounts",
+            Operation::SandboxWatchMountWrites => "Sandbox::watch_mount_writes",
             Operation::SandboxFs => "Sandbox::fs",
             Operation::AllSandboxMetrics => "all_sandbox_metrics",
             Operation::AgentConnect => "agent connections",

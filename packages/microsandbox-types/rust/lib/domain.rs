@@ -582,6 +582,37 @@ pub struct MountTableSpec {
     pub children: Vec<MountTableChild>,
 }
 
+/// Retained successful-mutation state of one live mount-table attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountWriteRevision {
+    /// Guest-visible child name.
+    pub name: String,
+    /// Runtime attachment identity, never reused during this VM's lifetime.
+    pub attachment: u64,
+    /// Last successful mutation; zero means no guest mutation has been observed.
+    pub revision: u64,
+}
+
+/// Coalesced mount mutation state. Reconnect with the last cursor to avoid loss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountWrites {
+    /// Runtime-local cursor. Only reuse it with the same verified VM run.
+    pub cursor: MountWriteCursor,
+    /// Initial observation or a different runtime: reconcile every current attachment.
+    pub reset: bool,
+    /// Current attachments, including ones with no successful mutations yet.
+    pub mounts: Vec<MountWriteRevision>,
+}
+
+/// Identity and revision of one runtime's mount table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountWriteCursor {
+    /// Random table identity; changes on VM replacement.
+    pub epoch: String,
+    /// Last observed table revision.
+    pub revision: u64,
+}
+
 /// Rootfs patch applied before VM startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]

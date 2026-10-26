@@ -8,6 +8,8 @@ use microsandbox_protocol_client::{
     ClientError, ConnectOptions, Connector, Delivery, ErrorKind, LocalConnector, Message, Protocol,
     RequestOptions,
 };
+use serde::Deserialize;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +23,12 @@ use crate::{
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MountWriteReply {
+    ok: bool,
+    writes: Option<microsandbox_protocol::control::MountWrites>,
+}
 
 /// Operation format selected during this connection's setup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +208,66 @@ impl ControlConnection {
         match &self.inner.selected {
             Selected::Framed(client) => Ok(client),
             Selected::Json(_) => Err(ControlClientError::UnsupportedMode),
+        }
+    }
+
+    /// Wait for mount mutation state on a separately owned connection to this verified runtime.
+    /// No request deadline applies after setup: only mutations, cancellation, or disconnect end
+    /// the wait. Retained revisions make reopening with the same cursor lossless.
+    pub async fn watch_mount_writes(
+        &self,
+        cursor: Option<microsandbox_protocol::control::MountWriteCursor>,
+    ) -> ControlClientResult<microsandbox_protocol::control::MountWrites> {
+        let until = deadline(self.inner.options.setup_timeout)?;
+        let received = |kind| ClientError::new(kind).with_delivery(Delivery::Unknown);
+        let exchange = async {
+            let mut stream = timeout_at(until, self.inner.dialer.connect(until))
+                .await
+                .map_err(|_| ClientError::new(ErrorKind::Timeout))??;
+            let mut request =
+                serde_json::to_vec(&serde_json::json!({"op": "mounts_watch", "cursor": cursor}))
+                    .map_err(|_| ClientError::new(ErrorKind::InvalidData))?;
+            request.push(b'\n');
+            timeout_at(until, stream.write_all(&request))
+                .await
+                .map_err(|_| received(ErrorKind::Timeout))?
+                .map_err(|error| ClientError::from(error).with_delivery(Delivery::Unknown))?;
+            // Bound a misbehaving peer's allocation. Exceeding this is an explicit
+            // failure, never a truncated successful notification.
+            const MAX_WATCH_REPLY: u64 = 4 * 1024 * 1024;
+            let mut line = Vec::new();
+            BufReader::new(stream)
+                .take(MAX_WATCH_REPLY)
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|error| ClientError::from(error).with_delivery(Delivery::Unknown))?;
+            if line.len() as u64 == MAX_WATCH_REPLY {
+                return Err(received(ErrorKind::Capacity).into());
+            }
+            if line.is_empty() {
+                return Err(received(ErrorKind::PeerClosed).into());
+            }
+            // Caller validation: only a complete, newline-delimited record is admitted.
+            if !line.ends_with(b"\n") {
+                return Err(received(ErrorKind::InvalidData).into());
+            }
+            let reply =
+                crate::JsonReply::parse(line).map_err(|_| received(ErrorKind::InvalidData))?;
+            let value: MountWriteReply = serde_json::from_slice(reply.raw())
+                .map_err(|_| received(ErrorKind::InvalidData))?;
+            if !value.ok {
+                return Err(ControlClientError::LegacyRemote {
+                    reply: Box::new(reply),
+                });
+            }
+            value
+                .writes
+                .ok_or_else(|| received(ErrorKind::InvalidData).into())
+        };
+        tokio::select! {
+            biased;
+            _ = self.inner.closed.cancelled() => Err(received(ErrorKind::Closed).into()),
+            result = exchange => result,
         }
     }
 

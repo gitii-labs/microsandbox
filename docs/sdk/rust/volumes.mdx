@@ -23,6 +23,15 @@ let sb = Sandbox::builder("worker").image("alpine")
 
 `.mount_table(MountTableSpec)` serves a guest directory whose children change while the sandbox runs. Each child is a name over an absolute host directory or regular host file. `Sandbox::update_mounts` applies attach, detach and mode changes in order without a restart, and `attach_mount`, `detach_mount` and `set_mount_readonly` wrap single changes. Local backend on Linux and macOS only; Cloud rejects mount tables.
 
+`Sandbox::watch_mount_writes(None)` returns retained mutation revisions and runtime attachment IDs.
+Pass the returned cursor to wait for a change without polling. The same method is available on
+`SandboxHandle`. Dropping the future releases its connection. Revisions coalesce successful guest
+mutations, including repeated writes through an open handle; they do not wait for fsync or close.
+Reconnecting with the last cursor preserves mutation state for live attachments. `reset` requires
+reconciling current attachments, and a new cursor epoch invalidates old attachment bindings. A
+detached child's state is removed, so drain its backing content before deletion. Older runtimes
+refuse this operation explicitly; existing mount-table operations are unchanged.
+
 ```rust
 let sb = Sandbox::builder("worker").image("alpine")
     .mount_table(MountTableSpec {

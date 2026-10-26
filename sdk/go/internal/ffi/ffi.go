@@ -199,6 +199,7 @@ typedef char *(*msb_sandbox_ping_fn)(uint64_t cancel_id, uint64_t handle, uint8_
 typedef char *(*msb_sandbox_touch_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_modify_fn)(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_update_mounts_fn)(uint64_t cancel_id, uint64_t handle, const char *changes_json, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_sandbox_watch_mount_writes_fn)(uint64_t cancel_id, uint64_t handle, const char *cursor_json, uint8_t *buf, size_t buf_len);
 
 typedef char *(*msb_sandbox_attach_fn)(uint64_t cancel_id, uint64_t handle, const char *cmd, const char *opts_json, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_attach_default_fn)(uint64_t cancel_id, uint64_t handle, const char *opts_json, uint8_t *buf, size_t buf_len);
@@ -386,6 +387,7 @@ static msb_sandbox_ping_fn       ptr_msb_sandbox_ping       = NULL;
 static msb_sandbox_touch_fn      ptr_msb_sandbox_touch      = NULL;
 static msb_sandbox_modify_fn     ptr_msb_sandbox_modify     = NULL;
 static msb_sandbox_update_mounts_fn ptr_msb_sandbox_update_mounts = NULL;
+static msb_sandbox_watch_mount_writes_fn ptr_msb_sandbox_watch_mount_writes = NULL;
 static msb_exec_collect_fn         ptr_msb_exec_collect         = NULL;
 static msb_exec_wait_fn            ptr_msb_exec_wait            = NULL;
 static msb_exec_kill_fn            ptr_msb_exec_kill            = NULL;
@@ -599,6 +601,7 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE(msb_sandbox_touch);
 	RESOLVE(msb_sandbox_modify);
 	RESOLVE_OPTIONAL(msb_sandbox_update_mounts);
+	RESOLVE_OPTIONAL(msb_sandbox_watch_mount_writes);
 	RESOLVE(msb_exec_collect);
 	RESOLVE(msb_exec_wait);
 	RESOLVE(msb_exec_kill);
@@ -990,6 +993,10 @@ char *call_msb_sandbox_modify(uint64_t cancel_id, uint64_t handle, const char *o
 	return ptr_msb_sandbox_modify ? ptr_msb_sandbox_modify(cancel_id, handle, opts_json, buf, buf_len) : NULL;
 }
 bool has_update_mounts(void) { return ptr_msb_sandbox_update_mounts != NULL; }
+bool has_watch_mount_writes(void) { return ptr_msb_sandbox_watch_mount_writes != NULL; }
+char *call_msb_sandbox_watch_mount_writes(uint64_t cancel_id, uint64_t handle, const char *cursor_json, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_sandbox_watch_mount_writes(cancel_id, handle, cursor_json, buf, buf_len);
+}
 char *call_msb_sandbox_update_mounts(uint64_t cancel_id, uint64_t handle, const char *changes_json, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_update_mounts(cancel_id, handle, changes_json, buf, buf_len);
 }
@@ -3256,6 +3263,21 @@ func (s *Sandbox) Modify(ctx context.Context, optsJSON string) (string, error) {
 	defer C.free(unsafe.Pointer(cOpts))
 	return call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
 		return C.call_msb_sandbox_modify(cancelID, s.h(), cOpts, buf, bufLen)
+	})
+}
+
+// WatchMountWrites waits for retained mount mutations using a separate cancellable connection.
+func (s *Sandbox) WatchMountWrites(ctx context.Context, cursorJSON string) (string, error) {
+	if err := ensureLoaded(); err != nil {
+		return "", err
+	}
+	if !bool(C.has_watch_mount_writes()) {
+		return "", &Error{Kind: KindUnsupportedOperation, Message: "native SDK does not support mount mutation notifications; update the native SDK"}
+	}
+	cCursor := C.CString(cursorJSON)
+	defer C.free(unsafe.Pointer(cCursor))
+	return call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_sandbox_watch_mount_writes(cancelID, s.h(), cCursor, buf, bufLen)
 	})
 }
 

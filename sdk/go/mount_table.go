@@ -102,6 +102,47 @@ func (s *Sandbox) SetMountReadonly(ctx context.Context, name string, readonly bo
 	return s.updateMounts(ctx, []mountChange{{Change: "set_mode", Name: name, Readonly: &readonly}})
 }
 
+// MountWriteCursor identifies a runtime mount table and its last observed revision.
+type MountWriteCursor struct {
+	Epoch    string `json:"epoch"`
+	Revision uint64 `json:"revision"`
+}
+
+// MountWriteRevision is the last successful guest mutation of one live attachment.
+// Attachment IDs are never reused within a runtime epoch. Revision zero means no mutation.
+type MountWriteRevision struct {
+	Name       string `json:"name"`
+	Attachment uint64 `json:"attachment"`
+	Revision   uint64 `json:"revision"`
+}
+
+// MountWrites retains coalesced mutation state without a lossy event queue.
+type MountWrites struct {
+	Cursor MountWriteCursor     `json:"cursor"`
+	Reset  bool                 `json:"reset"`
+	Mounts []MountWriteRevision `json:"mounts"`
+}
+
+// WatchMountWrites waits for successful guest mutations, not descriptor close or fsync.
+// A nil cursor returns initial state immediately. Reuse the returned cursor to wait without
+// polling. Reset requires reconciling every live attachment. Cancellation closes the wait;
+// reconnecting with the last cursor preserves mutations while disconnected.
+func (s *Sandbox) WatchMountWrites(ctx context.Context, cursor *MountWriteCursor) (MountWrites, error) {
+	var writes MountWrites
+	payload, err := json.Marshal(cursor)
+	if err != nil {
+		return writes, fmt.Errorf("encode mount mutation cursor: %w", err)
+	}
+	raw, err := s.inner.WatchMountWrites(ctx, string(payload))
+	if err != nil {
+		return writes, wrapFFI(err)
+	}
+	if err := json.Unmarshal([]byte(raw), &writes); err != nil {
+		return writes, fmt.Errorf("decode mount mutations: %w", err)
+	}
+	return writes, nil
+}
+
 // mountChange is the wire form of one mount-table change.
 type mountChange struct {
 	Change   string               `json:"change"`

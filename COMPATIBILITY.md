@@ -510,6 +510,21 @@ Choose evidence proportional to the boundary and failure risk:
 
 If an applicable direction cannot be tested locally, state exactly what remains unverified and which CI, platform, previous binary, or fixture is required.
 
+## Mount-table mutation observation
+
+The additive `mounts_watch` operation uses a separately owned JSON connection on the existing,
+process-verified host control endpoint. It waits outside serialized mutation dispatch; there is no
+idle request deadline after setup. Disconnect cancels the server wait. Replies retain per-live-child
+mutation revisions, never-reused attachment IDs and a random table epoch. There is no replay queue
+or persisted event format. A cursor from another epoch produces a reset snapshot.
+
+Existing launch JSON, mount-table child records, framed generations, agentd, guest filesystem
+metadata and saved sandbox configuration are unchanged. Old SDKs keep using the existing APIs
+against new runtimes. New SDKs requesting mutation observation from an old runtime get an explicit
+upgrade-required error; unrelated operations do not use or require the new operation. Go loads the
+new `msb_sandbox_watch_mount_writes` symbol optionally and refuses an older native library when this
+method is requested. No fallback reports success without notifications.
+
 ## Guest filesystem flush policy
 
 Capture requests carry an optional `guest_flush` field gated by `guest_flush_policy` capability. Missing fields retain the previous crash-consistent policy for old clients; explicit `auto` requires writeback for live disk-only capture. New full-capture clients may omit Auto for an older runtime because its capture contract is unchanged, but cannot downgrade Required or Skip silently. Explicit-policy pause has a separate operation so an old runtime cannot acknowledge it as ordinary pause. Legacy `Pause` and resume wire forms remain unchanged.

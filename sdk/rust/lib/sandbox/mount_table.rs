@@ -2,7 +2,7 @@
 
 use microsandbox_control_client::{MountsResult, UpdateMounts};
 use microsandbox_protocol::control::{MountChange, MountsUpdate};
-use microsandbox_types::MountTableChild;
+use microsandbox_types::{MountTableChild, MountWriteCursor, MountWrites};
 
 use crate::backend::sandbox::SandboxIdentity;
 use crate::backend::{Backend, LocalBackend};
@@ -16,6 +16,22 @@ use super::{Sandbox, SandboxHandle, modify};
 //--------------------------------------------------------------------------------------------------
 
 impl Sandbox {
+    /// Wait for successful guest mount mutations without waiting for close or fsync.
+    /// None returns an initial snapshot; reuse its cursor for event-driven waits.
+    /// Dropping the future cancels the connection. Older runtimes reject this operation.
+    pub async fn watch_mount_writes(
+        &self,
+        cursor: Option<MountWriteCursor>,
+    ) -> MicrosandboxResult<MountWrites> {
+        watch_mount_writes(
+            self.name(),
+            self.identity(),
+            self.backend().as_ref(),
+            cursor,
+        )
+        .await
+    }
+
     /// Apply mount-table changes in order while the sandbox runs.
     ///
     /// The batch stops at the first failed change with
@@ -60,6 +76,14 @@ impl Sandbox {
 }
 
 impl SandboxHandle {
+    /// Wait for retained mount mutations; see [`Sandbox::watch_mount_writes`].
+    pub async fn watch_mount_writes(
+        &self,
+        cursor: Option<MountWriteCursor>,
+    ) -> MicrosandboxResult<MountWrites> {
+        watch_mount_writes(self.name(), self.identity(), self.backend.as_ref(), cursor).await
+    }
+
     /// Apply mount-table changes in order without connecting to the guest.
     /// See [`Sandbox::update_mounts`].
     pub async fn update_mounts(&self, changes: Vec<MountChange>) -> MicrosandboxResult<()> {
@@ -70,6 +94,46 @@ impl SandboxHandle {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+async fn watch_mount_writes(
+    name: &str,
+    identity: SandboxIdentity,
+    backend: &dyn Backend,
+    cursor: Option<MountWriteCursor>,
+) -> MicrosandboxResult<MountWrites> {
+    let operation = Operation::SandboxWatchMountWrites;
+    let local = backend
+        .as_local()
+        .ok_or_else(|| MicrosandboxError::local_only(operation))?;
+    let SandboxIdentity::Local(expected_id) = identity else {
+        return Err(MicrosandboxError::local_only(operation));
+    };
+    let session = {
+        let _transition =
+            LocalBackend::acquire_sandbox_transition_guard(&local.config().run_dir(), name).await?;
+        let run = local.control_run_identity(name, expected_id).await?;
+        modify::control_session_for_run(local, name, run).await?
+    };
+    // Do not retain a lifecycle guard while waiting: stop and mount changes must proceed.
+    match session.watch_mount_writes(cursor).await {
+        Ok(writes) => Ok(writes),
+        Err(error)
+            if matches!(
+                error.as_ref(),
+                microsandbox_control_client::ControlClientError::LegacyRemote { .. }
+            ) =>
+        {
+            Err(MicrosandboxError::unsupported(
+                operation,
+                UnsupportedReason::NotAvailable(
+                    "mount mutation notifications require an updated runtime with a mount table"
+                        .into(),
+                ),
+            ))
+        }
+        Err(error) => Err(MicrosandboxError::ControlClient(error)),
+    }
+}
 
 async fn update_mounts(
     name: &str,

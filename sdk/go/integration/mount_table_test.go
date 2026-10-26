@@ -3,13 +3,116 @@
 package integration
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
 )
+
+// TestMountWriteNotificationsWithHeldDescriptor keeps one UID-1000 guest fd
+// open across two separately observed mutations. FIFO barriers never close or
+// fsync it, and the host waits on actual runtime events rather than a scan timer.
+func TestMountWriteNotificationsWithHeldDescriptor(t *testing.T) {
+	ctx, cancel := context.WithCancel(integrationCtx(t))
+	defer cancel()
+	name := "go-sdk-held-mount-writes"
+	host := canonicalTempDir(t)
+	sb, err := microsandbox.CreateSandbox(ctx, name,
+		microsandbox.WithImage(goIntegrationImage),
+		microsandbox.WithMounts(map[string]microsandbox.MountConfig{
+			"/mnt/distributed": microsandbox.Mount.Table(microsandbox.MountTableChild{
+				Name: "work", Host: host, StatVirtualization: microsandbox.StatVirtualizationRelaxed,
+				HostPermissions: microsandbox.HostPermissionsMirror,
+				Owner:           &microsandbox.MountOwner{UID: 1000, GID: 1000},
+			}),
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanup, done := context.WithTimeout(context.Background(), time.Minute)
+		defer done()
+		if err := sb.Stop(cleanup); err != nil {
+			t.Error(err)
+		}
+		if err := sb.Close(); err != nil {
+			t.Error(err)
+		}
+		if err := microsandbox.RemoveSandbox(cleanup, name); err != nil {
+			t.Error(err)
+		}
+	})
+	initial, err := sb.WatchMountWrites(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initial.Reset || initial.Cursor.Epoch == "" || initial.Cursor.Revision == 0 || len(initial.Mounts) != 1 || initial.Mounts[0].Name != "work" || initial.Mounts[0].Attachment == 0 || initial.Mounts[0].Revision != 0 {
+		t.Fatalf("initial mutation state: %+v", initial)
+	}
+	shell := func(command string) {
+		t.Helper()
+		out, err := sb.Shell(ctx, command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !out.Success() {
+			t.Fatalf("%s: %s%s", command, out.Stdout(), out.Stderr())
+		}
+	}
+	shell("mkdir /tmp/mount-proof; chmod 0777 /tmp/mount-proof; mkfifo /tmp/mount-proof/next /tmp/mount-proof/release; chmod 0666 /tmp/mount-proof/next /tmp/mount-proof/release")
+	finished := make(chan error, 1)
+	go func() {
+		out, err := sb.Exec(ctx, "/bin/sh", []string{"-c", "set -eu; test $(id -u) = 1000; test $(id -g) = 1000; exec 3>/mnt/distributed/work/note; printf one >&3; read next </tmp/mount-proof/next; printf two >&3; read release </tmp/mount-proof/release"}, microsandbox.WithExecUser("1000:1000"))
+		if err == nil && !out.Success() {
+			err = fmt.Errorf("held writer: %s%s", out.Stdout(), out.Stderr())
+		}
+		finished <- err
+	}()
+	cursor := initial.Cursor
+	await := func(want string) {
+		t.Helper()
+		for {
+			next, err := sb.WatchMountWrites(ctx, &cursor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if next.Reset || next.Cursor.Epoch != initial.Cursor.Epoch || next.Cursor.Revision <= cursor.Revision || len(next.Mounts) != 1 || next.Mounts[0].Name != "work" || next.Mounts[0].Attachment != initial.Mounts[0].Attachment || next.Mounts[0].Revision == 0 {
+				t.Fatalf("mutation identity changed: %+v", next)
+			}
+			cursor = next.Cursor
+			data, err := os.ReadFile(filepath.Join(host, "note"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) == want {
+				break
+			}
+		}
+		select {
+		case err := <-finished:
+			t.Fatalf("writer closed before %q was observed: %v", want, err)
+		default:
+		}
+	}
+	await("one")
+	shell("printf 'next\\n' >/tmp/mount-proof/next")
+	await("onetwo")
+	shell("printf 'release\\n' >/tmp/mount-proof/release")
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
 
 // TestMountTableLiveChanges drives a mount table through the Go SDK: a launch
 // child, a live attach, a read-only switch, a detach and a file child with an
