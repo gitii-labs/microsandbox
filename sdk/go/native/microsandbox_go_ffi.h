@@ -322,6 +322,16 @@ char *msb_sandbox_update_mounts(uint64_t cancel_id,
                                 uintptr_t buf_len);
 
 /**
+ * Wait for retained successful mount mutations. Input is a cursor or JSON null.
+ * Cancellation drops the waiting connection; no background subscription remains.
+ */
+char *msb_sandbox_watch_mount_writes(uint64_t cancel_id,
+                                     Handle handle,
+                                     const char *cursor_json,
+                                     unsigned char *buf,
+                                     uintptr_t buf_len);
+
+/**
  * Reports whether this handle owns the sandbox lifecycle (synchronous).
  * Returns `{"owns":true}` or `{"owns":false}`.
  */

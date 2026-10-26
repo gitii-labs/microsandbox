@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Event-driven retained mount-table mutation state shared with placement consumers.
+pub use microsandbox_types::{MountWriteCursor, MountWriteRevision, MountWrites};
+
 /// Aggregate disk-compaction result shared with SDK-facing types.
 pub type DiskCompactionResult = microsandbox_types::DiskCompactionResult;
 

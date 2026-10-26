@@ -15,14 +15,17 @@ bincode = { version = "2.0.1", features = ["serde"] }
 hex.workspace = true
 libc.workspace = true
 microsandbox-image.workspace = true
+microsandbox-types.workspace = true
 microsandbox-utils.workspace = true
 msb_krun.workspace = true
 sha2.workspace = true
 scopeguard.workspace = true
+rand.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [features]
 default = ["download-binaries", "embed-binaries"]

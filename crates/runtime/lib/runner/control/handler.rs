@@ -17,6 +17,11 @@ pub struct ControlContext {
 }
 
 pub(crate) trait Handler: Send + Sync + 'static {
+    #[cfg(unix)]
+    fn mount_write_table(&self) -> Option<microsandbox_filesystem::MountTable> {
+        None
+    }
+
     fn handle(&self, request: ControlOperation, generation: u8) -> Response;
 
     fn handle_json_with_memory(
@@ -121,6 +126,11 @@ impl Reply {
 //--------------------------------------------------------------------------------------------------
 
 impl Handler for ControlContext {
+    #[cfg(unix)]
+    fn mount_write_table(&self) -> Option<microsandbox_filesystem::MountTable> {
+        self.executor.mount_write_table()
+    }
+
     fn handle_json_with_memory(
         &self,
         value: serde_json::Value,

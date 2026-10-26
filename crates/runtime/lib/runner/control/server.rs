@@ -347,6 +347,40 @@ async fn json<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             return Ok(());
         }
     };
+    #[cfg(unix)]
+    if request.get("op").and_then(serde_json::Value::as_str) == Some("mounts_watch") {
+        // Watch waits outside serialized mutation dispatch so an idle consumer
+        // never prevents attach, mode changes, or shutdown. EOF cancels the wait.
+        if memory.is_some() {
+            return Err(invalid()); // Caller validation: watches never accept descriptors.
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Watch {
+            op: String,
+            cursor: Option<microsandbox_types::MountWriteCursor>,
+        }
+        let watch: Watch = serde_json::from_str(text.trim()).map_err(|_| invalid())?;
+        debug_assert_eq!(watch.op, "mounts_watch");
+        let Some(table) = dispatcher.mount_write_table() else {
+            writer.write_all(b"{\"ok\":false,\"error\":\"mount mutation notifications require a runtime with a mount table\"}\n").await?;
+            return writer.flush().await;
+        };
+        let writes = tokio::select! {
+            writes = table.watch_writes(watch.cursor) => writes,
+            result = reader.read_u8() => return match result {
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
+                Err(error) => Err(error),
+                // Caller validation: a watch connection admits only one request.
+                Ok(_) => Err(invalid()),
+            },
+        };
+        let mut bytes = serde_json::to_vec(&serde_json::json!({"ok": true, "writes": writes}))
+            .map_err(|_| invalid())?;
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await?;
+        return writer.flush().await;
+    }
     let (reply, mut replies) = mpsc::channel(1);
     let job = Job {
         input: Input::JsonWire(request, memory),
@@ -470,6 +504,58 @@ fn expired() -> io::Error {
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod mount_watch_tests {
+    use super::super::handler::{Handler, Response};
+    use super::*;
+
+    struct WatchHandler(microsandbox_filesystem::MountTable);
+    impl Handler for WatchHandler {
+        fn handle(&self, _: ControlOperation, _: u8) -> Response {
+            panic!("watch must not occupy mutation dispatch")
+        }
+        fn mount_write_table(&self) -> Option<microsandbox_filesystem::MountTable> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_watch_returns_initial_state_and_cancels_on_disconnect() {
+        let table = microsandbox_filesystem::MountTable::new();
+        let (sender, mut receiver) = tokio::net::UnixStream::pair().unwrap();
+        let dispatcher = Dispatcher::new(Arc::new(WatchHandler(table.clone())));
+        let server = tokio::spawn(async move { serve(&mut receiver, dispatcher).await });
+        let mut sender = BufReader::new(sender);
+        sender
+            .write_all(b"{\"op\":\"mounts_watch\",\"cursor\":null}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        sender.read_line(&mut line).await.unwrap();
+        let initial: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(initial["ok"], true);
+        assert_eq!(initial["writes"]["reset"], true);
+        server.await.unwrap().unwrap();
+
+        let (mut sender, mut receiver) = tokio::net::UnixStream::pair().unwrap();
+        let dispatcher = Dispatcher::new(Arc::new(WatchHandler(table)));
+        let server = tokio::spawn(async move { serve(&mut receiver, dispatcher).await });
+        let request =
+            serde_json::json!({"op": "mounts_watch", "cursor": initial["writes"]["cursor"]});
+        sender
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        // EOF must release the waiting connection without a mutation or timeout.
+        drop(sender);
+        timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod descriptor_tests {

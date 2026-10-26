@@ -4,9 +4,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     path::PathBuf,
-    sync::{Arc, OnceLock, RwLock, RwLockReadGuard},
+    sync::{
+        Arc, OnceLock, RwLock, RwLockReadGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
+
+use microsandbox_types::{MountWriteCursor, MountWriteRevision, MountWrites};
+use tokio::sync::watch;
 
 use super::MountTableFs;
 use crate::{
@@ -110,7 +116,6 @@ pub struct MountTable {
     pub(super) state: Arc<TableState>,
 }
 
-#[derive(Default)]
 pub(super) struct TableState {
     pub(super) children: RwLock<Children>,
     /// Held shared by every device operation on a child. A mode switch or
@@ -119,6 +124,8 @@ pub(super) struct TableState {
     /// The wait lasts as long as the longest operation in flight, so a slow
     /// host filesystem under a child also delays mode switches and detaches.
     pub(super) ops: RwLock<()>,
+    pub(super) writes: watch::Sender<u64>,
+    epoch: String,
 }
 
 #[derive(Default)]
@@ -132,6 +139,7 @@ pub(super) struct Children {
 pub(super) struct Child {
     pub(super) id: u64,
     pub(super) fs: ChildFs,
+    pub(super) revision: AtomicU64,
 }
 
 /// A child's backend, by the kind of its host path.
@@ -198,7 +206,15 @@ impl MountTable {
         children.last_id += 1;
         let id = children.last_id;
         children.by_name.insert(child.name, id);
-        children.by_id.insert(id, Arc::new(Child { id, fs }));
+        children.by_id.insert(
+            id,
+            Arc::new(Child {
+                id,
+                fs,
+                revision: AtomicU64::new(0),
+            }),
+        );
+        self.state.writes.send_modify(|revision| *revision += 1);
         Ok(())
     }
 
@@ -222,6 +238,7 @@ impl MountTable {
         // closes every descriptor before the caller is told it is detached.
         drop(self.state.ops.write().unwrap());
         drop(removed);
+        self.state.writes.send_modify(|revision| *revision += 1);
         Ok(())
     }
 
@@ -256,6 +273,63 @@ impl MountTable {
     /// Whether any child is attached.
     pub fn is_empty(&self) -> bool {
         self.state.children.read().unwrap().by_name.is_empty()
+    }
+
+    /// Wait for a changed mutation cursor, or return the initial attachment snapshot.
+    /// State is retained per live attachment, so reconnects and slow consumers lose no writes.
+    /// Dropping this future releases its receiver without a background worker.
+    pub async fn watch_writes(&self, cursor: Option<MountWriteCursor>) -> MountWrites {
+        let mut receiver = self.state.writes.subscribe();
+        let reset = cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.epoch != self.state.epoch);
+        loop {
+            // Lock order matches attach: children before the watch value. Mutations
+            // publish the child's revision under the watch lock before waking waiters.
+            let snapshot = {
+                let children = self.state.children.read().unwrap();
+                let revision = receiver.borrow_and_update();
+                if reset
+                    || cursor
+                        .as_ref()
+                        .is_some_and(|cursor| cursor.revision != *revision)
+                {
+                    Some(MountWrites {
+                        cursor: MountWriteCursor {
+                            epoch: self.state.epoch.clone(),
+                            revision: *revision,
+                        },
+                        reset,
+                        mounts: children
+                            .by_name
+                            .iter()
+                            .map(|(name, id)| MountWriteRevision {
+                                name: name.clone(),
+                                attachment: *id,
+                                revision: children.by_id[id].revision.load(Ordering::Acquire),
+                            })
+                            .collect(),
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                return snapshot;
+            }
+            // The table owns the sender for the full wait, so it cannot close.
+            receiver
+                .changed()
+                .await
+                .expect("mount table owns its mutation sender");
+        }
+    }
+
+    pub(super) fn written(&self, child: &Child) {
+        self.state.writes.send_modify(|revision| {
+            *revision += 1;
+            child.revision.store(*revision, Ordering::Release);
+        });
     }
 
     /// Begin one device operation; see [`TableState::ops`]. Never nest it:
@@ -324,6 +398,21 @@ impl ChildFs {
 
     pub(super) fn is_file(&self) -> bool {
         matches!(self, Self::File(_))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Default for TableState {
+    fn default() -> Self {
+        Self {
+            children: RwLock::default(),
+            ops: RwLock::default(),
+            writes: watch::channel(0).0,
+            epoch: format!("{:032x}", rand::random::<u128>()),
+        }
     }
 }
 

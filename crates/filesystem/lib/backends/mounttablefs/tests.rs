@@ -33,6 +33,7 @@ const LINUX_ENOSPC: i32 = 28;
 const LINUX_ESTALE: i32 = 116;
 const LINUX_O_WRONLY: u32 = 1;
 const LINUX_O_RDWR: u32 = 2;
+const LINUX_O_TRUNC: u32 = 0o1000;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -216,6 +217,130 @@ fn errno<T>(result: io::Result<T>) -> i32 {
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mutation_revisions_cover_repeated_held_writes_and_reconnect() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut f = Fixture::new();
+        let dir = f.host_dir();
+        f.attach("work", &dir, false);
+        let initial = f.table.watch_writes(None).await;
+        assert!(initial.reset);
+        assert_eq!(initial.mounts[0].revision, 0);
+        let root = f.lookup(ROOT, "work").unwrap();
+        let (file, handle) = f.create(root.inode, "note").unwrap();
+        assert_eq!(f.write(file.inode, handle, b"one").unwrap(), 3);
+        let first = f.table.watch_writes(Some(initial.cursor)).await;
+        assert!(!first.reset);
+        assert!(first.mounts[0].revision > 0);
+        // Keep the same backend handle open. No flush, release, fsync, or close
+        // separates these writes, including while there is no waiting consumer.
+        assert_eq!(
+            f.fs.write(
+                ctx(),
+                file.inode,
+                handle,
+                &mut Reader(b"two".to_vec()),
+                3,
+                3,
+                None,
+                false,
+                false,
+                0
+            )
+            .unwrap(),
+            3
+        );
+        let second = f.table.watch_writes(Some(first.cursor)).await;
+        assert!(second.mounts[0].revision > first.mounts[0].revision);
+        assert_eq!(second.mounts[0].attachment, first.mounts[0].attachment);
+        assert_eq!(std::fs::read(dir.join("note")).unwrap(), b"onetwo");
+        let mut waiting = Box::pin(f.table.watch_writes(Some(second.cursor.clone())));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                waiting.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(waiting); // Cancellation leaves no retained subscriber or consumed event.
+        f.table.set_readonly("work", true).unwrap();
+        assert_eq!(
+            f.write(file.inode, handle, b"bad")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(LINUX_EROFS)
+        );
+        let unchanged = f.table.watch_writes(None).await;
+        assert_eq!(unchanged.cursor, second.cursor);
+        assert_eq!(unchanged.mounts[0].revision, second.mounts[0].revision);
+        f.table.detach("work").unwrap();
+        f.attach("work", &dir, false);
+        let replaced = f.table.watch_writes(Some(second.cursor)).await;
+        assert_ne!(replaced.mounts[0].attachment, second.mounts[0].attachment);
+        assert_eq!(replaced.mounts[0].revision, 0);
+        assert_eq!(
+            f.write(file.inode, handle, b"old")
+                .unwrap_err()
+                .raw_os_error(),
+            Some(LINUX_ESTALE)
+        );
+        let another = MountTable::new().watch_writes(Some(replaced.cursor)).await;
+        assert!(another.reset);
+    })
+    .await
+    .expect("mount mutation notification did not arrive");
+}
+
+#[tokio::test]
+async fn mutation_revisions_cover_metadata_and_namespace_operations_only_after_success() {
+    let mut f = Fixture::new();
+    let dir = f.host_dir();
+    f.attach("work", &dir, false);
+    let root = f.lookup(ROOT, "work").unwrap().inode;
+    let mut revision = f.table.watch_writes(None).await.cursor.revision;
+    macro_rules! changed {
+        ($operation:expr) => {{
+            let result = $operation.unwrap();
+            let next = f.table.watch_writes(None).await.cursor.revision;
+            assert!(next > revision, "successful mutation was not reported");
+            revision = next;
+            result
+        }};
+    }
+    let (entry, handle) = changed!(f.create(root, "note"));
+    let mut attr: stat64 = unsafe { std::mem::zeroed() };
+    attr.st_mode = 0o600;
+    changed!(f.fs.setattr(ctx(), entry.inode, attr, Some(handle), SetattrValid::MODE));
+    changed!(f.fs.open(ctx(), entry.inode, false, LINUX_O_RDWR | LINUX_O_TRUNC));
+    changed!(f.fs.link(ctx(), entry.inode, root, &cstr("hard")));
+    changed!(f.fs.symlink(
+        ctx(),
+        &cstr("note"),
+        root,
+        &cstr("soft"),
+        Extensions::default()
+    ));
+    changed!(f.fs.mkdir(ctx(), root, &cstr("sub"), 0o700, 0, Extensions::default()));
+    changed!(f.fs.rename(ctx(), root, &cstr("note"), root, &cstr("renamed"), 0));
+    changed!(f.fs.setxattr(
+        ctx(),
+        entry.inode,
+        &cstr("user.notification_test"),
+        b"test",
+        0
+    ));
+    changed!(f.fs.removexattr(ctx(), entry.inode, &cstr("user.notification_test")));
+    changed!(f.fs.unlink(ctx(), root, &cstr("soft")));
+    changed!(f.fs.rmdir(ctx(), root, &cstr("sub")));
+    assert!(f.fs.unlink(ctx(), root, &cstr("absent")).is_err());
+    f.fs.getattr(ctx(), entry.inode, Some(handle)).unwrap();
+    f.fs.fsync(ctx(), entry.inode, false, handle).unwrap();
+    assert_eq!(
+        f.table.watch_writes(None).await.cursor.revision,
+        revision,
+        "failed mutations, reads and fsync must not report writes"
+    );
+}
 
 #[test]
 fn guest_numbers_carry_the_attachment_id() {

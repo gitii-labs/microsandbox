@@ -36,6 +36,7 @@ const DT_DIR: u32 = 4;
 const DT_REG: u32 = 8;
 const S_IFDIR: u32 = 0o040000;
 const ACCESS_W_OK: u32 = 2;
+const LINUX_O_TRUNC: u32 = 0o1000;
 
 const LINUX_EPERM: i32 = 1;
 const LINUX_EBADF: i32 = 9;
@@ -351,6 +352,7 @@ impl DynFileSystem for MountTableFs {
                 .fs
                 .as_dyn()
                 .setattr(ctx, target.inode, attr, handle, valid)?;
+        self.table.written(&target.child);
         Ok((guest_stat(&target.child, attr)?, timeout))
     }
 
@@ -380,6 +382,7 @@ impl DynFileSystem for MountTableFs {
                 .fs
                 .as_dyn()
                 .symlink(ctx, linkname, target.inode, name, extensions)?;
+        self.table.written(&target.child);
         self.guest_entry(&target.child, entry)
     }
 
@@ -406,6 +409,7 @@ impl DynFileSystem for MountTableFs {
             umask,
             extensions,
         )?;
+        self.table.written(&target.child);
         self.guest_entry(&target.child, entry)
     }
 
@@ -428,6 +432,7 @@ impl DynFileSystem for MountTableFs {
                 .fs
                 .as_dyn()
                 .mkdir(ctx, target.inode, name, mode, umask, extensions)?;
+        self.table.written(&target.child);
         self.guest_entry(&target.child, entry)
     }
 
@@ -436,7 +441,9 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        target.child.fs.as_dyn().unlink(ctx, target.inode, name)
+        target.child.fs.as_dyn().unlink(ctx, target.inode, name)?;
+        self.table.written(&target.child);
+        Ok(())
     }
 
     fn rmdir(&self, ctx: Context, parent: u64, name: &CStr) -> io::Result<()> {
@@ -444,7 +451,9 @@ impl DynFileSystem for MountTableFs {
             return Err(errno(LINUX_EACCES));
         }
         let target = self.target(parent)?;
-        target.child.fs.as_dyn().rmdir(ctx, target.inode, name)
+        target.child.fs.as_dyn().rmdir(ctx, target.inode, name)?;
+        self.table.written(&target.child);
+        Ok(())
     }
 
     fn rename(
@@ -463,7 +472,9 @@ impl DynFileSystem for MountTableFs {
         old.child
             .fs
             .as_dyn()
-            .rename(ctx, old.inode, oldname, new_local, newname, flags)
+            .rename(ctx, old.inode, oldname, new_local, newname, flags)?;
+        self.table.written(&old.child);
+        Ok(())
     }
 
     fn link(&self, ctx: Context, inode: u64, newparent: u64, newname: &CStr) -> io::Result<Entry> {
@@ -476,6 +487,7 @@ impl DynFileSystem for MountTableFs {
             .fs
             .as_dyn()
             .link(ctx, source.inode, parent_local, newname)?;
+        self.table.written(&source.child);
         self.guest_entry(&source.child, entry)
     }
 
@@ -496,6 +508,10 @@ impl DynFileSystem for MountTableFs {
                 .fs
                 .as_dyn()
                 .open(ctx, target.inode, kill_priv, flags)?;
+        // A truncating open changes content even if the guest never writes.
+        if flags & LINUX_O_TRUNC != 0 {
+            self.table.written(&target.child);
+        }
         Ok((self.guest_handle(&target.child, handle)?, options))
     }
 
@@ -524,6 +540,7 @@ impl DynFileSystem for MountTableFs {
             umask,
             extensions,
         )?;
+        self.table.written(&target.child);
         Ok((
             self.guest_entry(&target.child, entry)?,
             self.guest_handle(&target.child, handle)?,
@@ -571,7 +588,7 @@ impl DynFileSystem for MountTableFs {
     ) -> io::Result<usize> {
         let target = self.target(inode)?;
         let handle = self.handle(&target, handle)?;
-        target.child.fs.as_dyn().write(
+        let written = target.child.fs.as_dyn().write(
             ctx,
             target.inode,
             handle,
@@ -582,7 +599,12 @@ impl DynFileSystem for MountTableFs {
             delayed_write,
             kill_priv,
             flags,
-        )
+        )?;
+        // A successful empty write has not changed backing content.
+        if written > 0 {
+            self.table.written(&target.child);
+        }
+        Ok(written)
     }
 
     fn flush(&self, ctx: Context, inode: u64, handle: u64, lock_owner: u64) -> io::Result<()> {
@@ -620,7 +642,9 @@ impl DynFileSystem for MountTableFs {
             .child
             .fs
             .as_dyn()
-            .fallocate(ctx, target.inode, handle, mode, offset, length)
+            .fallocate(ctx, target.inode, handle, mode, offset, length)?;
+        self.table.written(&target.child);
+        Ok(())
     }
 
     fn release(
@@ -674,7 +698,9 @@ impl DynFileSystem for MountTableFs {
             .child
             .fs
             .as_dyn()
-            .setxattr(ctx, target.inode, name, value, flags)
+            .setxattr(ctx, target.inode, name, value, flags)?;
+        self.table.written(&target.child);
+        Ok(())
     }
 
     fn getxattr(
@@ -716,7 +742,9 @@ impl DynFileSystem for MountTableFs {
             .child
             .fs
             .as_dyn()
-            .removexattr(ctx, target.inode, name)
+            .removexattr(ctx, target.inode, name)?;
+        self.table.written(&target.child);
+        Ok(())
     }
 
     fn opendir(

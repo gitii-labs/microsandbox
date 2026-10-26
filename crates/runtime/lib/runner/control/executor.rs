@@ -655,6 +655,11 @@ impl RuntimeControlExecutor {
     }
 
     #[cfg(unix)]
+    pub(super) fn mount_write_table(&self) -> Option<microsandbox_filesystem::MountTable> {
+        self.mount_table.clone()
+    }
+
+    #[cfg(unix)]
     fn handle_mounts_update(
         &self,
         changes: Vec<microsandbox_protocol::control::MountChange>,

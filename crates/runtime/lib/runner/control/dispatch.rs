@@ -87,6 +87,11 @@ pub(crate) struct Outgoing {
 //--------------------------------------------------------------------------------------------------
 
 impl Dispatcher {
+    #[cfg(unix)]
+    pub fn mount_write_table(&self) -> Option<microsandbox_filesystem::MountTable> {
+        self.handler.mount_write_table()
+    }
+
     pub fn new(handler: Arc<dyn Handler>) -> Arc<Self> {
         Arc::new(Self {
             handler,

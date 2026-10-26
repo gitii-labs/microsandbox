@@ -3996,6 +3996,33 @@ pub unsafe extern "C" fn msb_sandbox_update_mounts(
     })
 }
 
+/// Wait for retained successful mount mutations. Input is a cursor or JSON null.
+/// Cancellation drops the waiting connection; no background subscription remains.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_sandbox_watch_mount_writes(
+    cancel_id: u64,
+    handle: Handle,
+    cursor_json: *const c_char,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let cursor: Option<microsandbox::sandbox::MountWriteCursor> =
+            serde_json::from_str(&unsafe { cstr(cursor_json) }?).map_err(|e| {
+                FfiError::invalid_argument(format!("invalid mount mutation cursor: {e}"))
+            })?;
+        let sb = get(handle)?;
+        Ok(Box::pin(async move {
+            let writes = sb
+                .watch_mount_writes(cursor)
+                .await
+                .map_err(FfiError::from)?;
+            serde_json::to_string(&writes)
+                .map_err(|e| FfiError::internal(format!("encode mount mutations: {e}")))
+        }))
+    })
+}
+
 /// Reports whether this handle owns the sandbox lifecycle (synchronous).
 /// Returns `{"owns":true}` or `{"owns":false}`.
 #[unsafe(no_mangle)]
