@@ -1058,7 +1058,7 @@ impl DynFileSystem for MountTableFs {
         let (source, local_out) = self.same_child(inode_in, inode_out)?;
         let handle_in = self.handle(&source, handle_in)?;
         let handle_out = self.handle(&source, handle_out)?;
-        source.child.fs.as_dyn().copyfilerange(
+        let copied = source.child.fs.as_dyn().copyfilerange(
             ctx,
             source.inode,
             handle_in,
@@ -1068,7 +1068,12 @@ impl DynFileSystem for MountTableFs {
             offset_out,
             len,
             flags,
-        )
+        )?;
+        // Empty copies, including reads at EOF, do not change destination content.
+        if copied > 0 {
+            self.table.written(&source.child);
+        }
+        Ok(copied)
     }
 }
 

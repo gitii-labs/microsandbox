@@ -291,6 +291,49 @@ async fn mutation_revisions_cover_repeated_held_writes_and_reconnect() {
     .expect("mount mutation notification did not arrive");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn mutation_revisions_cover_successful_copy_file_range_only() {
+    let mut f = Fixture::new();
+    let dir = f.host_dir();
+    f.attach("work", &dir, false);
+    let root = f.lookup(ROOT, "work").unwrap().inode;
+    let (source, source_handle) = f.create(root, "source").unwrap();
+    let (destination, destination_handle) = f.create(root, "destination").unwrap();
+    assert_eq!(f.write(source.inode, source_handle, b"one").unwrap(), 3);
+    let before = f.table.watch_writes(None).await;
+    let copy = |offset, len, flags| {
+        f.fs.copyfilerange(
+            ctx(),
+            source.inode,
+            source_handle,
+            offset,
+            destination.inode,
+            destination_handle,
+            0,
+            len,
+            flags,
+        )
+    };
+    assert_eq!(copy(0, 3, 0).unwrap(), 3);
+    assert_eq!(std::fs::read(dir.join("destination")).unwrap(), b"one");
+    let written = f.table.watch_writes(None).await;
+    assert!(written.cursor.revision > before.cursor.revision);
+    assert!(written.mounts[0].revision > before.mounts[0].revision);
+    assert_eq!(written.mounts[0].attachment, before.mounts[0].attachment);
+
+    assert_eq!(copy(0, 0, 0).unwrap(), 0);
+    assert_eq!(f.table.watch_writes(None).await, written);
+    assert_eq!(copy(3, 3, 0).unwrap(), 0); // EOF copies no bytes despite a positive length.
+    assert_eq!(f.table.watch_writes(None).await, written);
+    assert_eq!(
+        copy(0, 3, 1).unwrap_err().raw_os_error(),
+        Some(libc::EINVAL)
+    );
+    assert_eq!(f.table.watch_writes(None).await, written);
+    assert_eq!(std::fs::read(dir.join("destination")).unwrap(), b"one");
+}
+
 #[tokio::test]
 async fn mutation_revisions_cover_metadata_and_namespace_operations_only_after_success() {
     let mut f = Fixture::new();
