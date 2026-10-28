@@ -652,8 +652,13 @@ pub(crate) async fn intercept_relay(
     let mut guest_eof = false;
     loop {
         tokio::select! {
+            // Caller validation: revocation drops both TLS streams, including an
+            // outstanding provider request. It cannot undo a rotation already accepted.
+            error = oauth.lease_lost() => return Err(error),
+
             // Guest → server: receive encrypted, decrypt, forward plaintext.
             data = from_smoltcp.recv(), if !guest_eof => {
+                oauth.check_leases()?;
                 let data = match data {
                     Some(d) => d,
                     // Guest half-closed (TCP FIN): propagate as a TLS
@@ -663,7 +668,12 @@ pub(crate) async fn intercept_relay(
                     // with its own close_notify, ending the relay.)
                     None => {
                         guest_eof = true;
-                        if server_tls.shutdown().await.is_err() {
+                        let shutdown = tokio::select! {
+                            biased;
+                            error = oauth.lease_lost() => return Err(error),
+                            result = server_tls.shutdown() => result,
+                        };
+                        if shutdown.is_err() {
                             break;
                         }
                         continue;
@@ -696,6 +706,7 @@ pub(crate) async fn intercept_relay(
 
             // Server → guest: read plaintext, encrypt, send via channel.
             result = server_tls.read(&mut server_buf) => {
+                oauth.check_leases()?;
                 match result {
                     Ok(0) => {
                         let tail = oauth.finish_response_scrubbing()?;
@@ -812,8 +823,13 @@ async fn forward_plaintext(
             Ok(data) => {
                 let data = oauth.transform_requests(&data, traffic.sni).await?;
                 if !data.is_empty() {
+                    oauth.check_leases()?;
                     *upstream_started = true;
-                    server_tls.write_all(&data).await?;
+                    tokio::select! {
+                        biased;
+                        error = oauth.lease_lost() => return Err(error),
+                        result = server_tls.write_all(&data) => result?,
+                    }
                     traffic.record("upstream-request", &data);
                     wrote_plaintext = true;
                 }
@@ -842,7 +858,11 @@ async fn forward_plaintext(
     // tokio-rustls buffers writes; flush each drained plaintext batch so
     // upstream servers waiting for the full request body can respond.
     if wrote_plaintext {
-        server_tls.flush().await?;
+        tokio::select! {
+            biased;
+            error = oauth.lease_lost() => return Err(error),
+            result = server_tls.flush() => result?,
+        }
     }
 
     Ok(())
@@ -881,8 +901,279 @@ async fn flush_to_guest(
 mod tests {
     use std::sync::Mutex;
 
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::UnixListener;
+    use tokio::sync::oneshot;
+
     use super::*;
     use crate::secrets::{config::SecretsConfig, handle::SecretsHandle};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum LeaseEnd {
+        BeforePost,
+        PendingHeaders,
+        PendingBody,
+        AfterCommit,
+    }
+
+    async fn oauth_lease_relay(end: LeaseEnd) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_oauth_lease_relay(end),
+        )
+        .await
+        .expect("OAuth lease relay did not finish");
+    }
+
+    async fn run_oauth_lease_relay(end: LeaseEnd) {
+        assert!(
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .is_ok()
+                || rustls::crypto::CryptoProvider::get_default().is_some()
+        );
+        let socket = std::env::temp_dir().join(format!(
+            "msb-lease-{}-{}.sock",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let broker_listener = UnixListener::bind(&socket).unwrap();
+        let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = provider_listener.local_addr().unwrap();
+        let config = SecretsConfig {
+            oauth: vec![crate::secrets::config::OAuthSecret {
+                broker_endpoint: socket.to_string_lossy().into_owned(),
+                grant_id: "lease-test".into(),
+                token_endpoint: format!("https://auth.example.com:{}/token", addr.port()),
+                require_grant_marker: false,
+                device_code_endpoint: None,
+                poll_endpoint: None,
+                poll_secret_fields: vec![],
+                mint_endpoints: vec![],
+                inject_hosts: vec![],
+                access_token_field: "access_token".into(),
+                refresh_token_field: "refresh_token".into(),
+                access_env_var: "ACCESS_TOKEN".into(),
+                refresh_env_var: "REFRESH_TOKEN".into(),
+                access_sentinel: "$MSB_OAUTH_ACCESS_test".into(),
+                refresh_sentinel: "$MSB_OAUTH_REFRESH_test".into(),
+            }],
+            ..Default::default()
+        };
+        let state = Arc::new(
+            TlsState::new(
+                microsandbox_types::TlsConfig {
+                    verify_upstream: false,
+                    ..Default::default()
+                },
+                SecretsHandle::new(config),
+            )
+            .unwrap(),
+        );
+        let cert = state.get_or_generate_cert("auth.example.com").unwrap();
+        let (close_tx, close_rx) = oneshot::channel();
+        let broker = tokio::spawn(async move {
+            // Initialization loads the grant on a separate connection.
+            let (load, _) = broker_listener.accept().await.unwrap();
+            let mut load = BufReader::new(load);
+            let mut line = String::new();
+            load.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["action"],
+                "load"
+            );
+            let material =
+                b"{\"access\":\"test-access\",\"refresh\":\"test-refresh\",\"generation\":7}\n";
+            load.get_mut().write_all(material).await.unwrap();
+            drop(load);
+            let (lease, _) = broker_listener.accept().await.unwrap();
+            let mut lease = BufReader::new(lease);
+            line.clear();
+            lease.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["action"],
+                "acquire"
+            );
+            lease.get_mut().write_all(material).await.unwrap();
+            if end == LeaseEnd::BeforePost {
+                lease.get_mut().shutdown().await.unwrap();
+                line.clear();
+                assert_eq!(lease.read_line(&mut line).await.unwrap(), 0);
+                return;
+            }
+            if end != LeaseEnd::AfterCommit {
+                close_rx.await.unwrap();
+                // Revoke the lease but retain the read half to prove no late commit.
+                lease.get_mut().shutdown().await.unwrap();
+                line.clear();
+                assert_eq!(lease.read_line(&mut line).await.unwrap(), 0);
+                return;
+            }
+            line.clear();
+            lease.read_line(&mut line).await.unwrap();
+            let commit: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(commit["action"], "commit");
+            assert_eq!(commit["access"], "new-test-access");
+            assert_eq!(commit["refresh"], "new-test-refresh");
+            lease
+                .get_mut()
+                .write_all(b"{\"ok\":true,\"generation\":8}\n")
+                .await
+                .unwrap();
+            line.clear();
+            assert_eq!(lease.read_line(&mut line).await.unwrap(), 0);
+        });
+        let provider = tokio::spawn(async move {
+            let (stream, _) = provider_listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(cert.server_config.clone())
+                .accept(stream)
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut request = String::new();
+            if end != LeaseEnd::BeforePost {
+                loop {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0; "refresh_token=test-refresh".len()];
+                stream.read_exact(&mut body).await.unwrap();
+                assert_eq!(body, b"refresh_token=test-refresh");
+                let body =
+                    br#"{"access_token":"new-test-access","refresh_token":"new-test-refresh"}"#;
+                if matches!(end, LeaseEnd::PendingBody | LeaseEnd::AfterCommit) {
+                    stream
+                        .get_mut()
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    let count = if end == LeaseEnd::PendingBody {
+                        body.len() / 2
+                    } else {
+                        body.len()
+                    };
+                    stream.get_mut().write_all(&body[..count]).await.unwrap();
+                    stream.get_mut().flush().await.unwrap();
+                }
+            }
+            if matches!(end, LeaseEnd::PendingHeaders | LeaseEnd::PendingBody) {
+                close_tx.send(()).unwrap();
+            }
+            if end == LeaseEnd::AfterCommit {
+                stream.get_mut().shutdown().await.unwrap();
+            }
+            let mut extra = Vec::new();
+            match stream.read_to_end(&mut extra).await {
+                Ok(_) => {}
+                Err(error) => assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                )),
+            }
+            assert!(
+                extra.is_empty(),
+                "no request or retry after lease cancellation"
+            );
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(state.intercept_ca.cert_der.clone()).unwrap();
+        let mut guest = rustls::ClientConnection::new(
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ),
+            ServerName::try_from("auth.example.com").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        guest.write_tls(&mut hello).unwrap();
+        let (from_tx, from_rx) = mpsc::channel(16);
+        let (to_tx, mut to_rx) = mpsc::channel(16);
+        let relay = tokio::spawn(intercept_relay(
+            addr,
+            UpstreamTcpTarget::direct(addr),
+            "auth.example.com",
+            true,
+            hello,
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(16)),
+            state,
+            Arc::new(ProxyConnectState::default()),
+            None,
+            None,
+        ));
+        let mut sent = false;
+        let mut response = Vec::new();
+        while let Some(data) = to_rx.recv().await {
+            guest.read_tls(&mut data.as_ref()).unwrap();
+            guest.process_new_packets().unwrap();
+            if !guest.is_handshaking() && !sent {
+                let body = "refresh_token=$MSB_OAUTH_REFRESH_test";
+                guest.writer().write_all(format!("POST /token HTTP/1.1\r\nHost: auth.example.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+                sent = true;
+            }
+            let mut wire = Vec::new();
+            guest.write_tls(&mut wire).unwrap();
+            if !wire.is_empty() {
+                from_tx.send(Bytes::from(wire)).await.unwrap();
+            }
+            let mut plain = [0; 4096];
+            loop {
+                match guest.reader().read(&mut plain) {
+                    Ok(0) => break,
+                    Ok(n) => response.extend_from_slice(&plain[..n]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("guest TLS read: {error}"),
+                }
+            }
+        }
+        assert!(sent);
+        let result = relay.await.unwrap();
+        if end == LeaseEnd::AfterCommit {
+            result.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.contains("$MSB_OAUTH_ACCESS_test"));
+            assert!(response.contains("$MSB_OAUTH_REFRESH_test"));
+            assert!(!response.contains("new-test-"));
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(response.is_empty());
+        }
+        drop(from_tx);
+        provider.await.unwrap();
+        broker.await.unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_lease_closed_before_post_sends_no_request() {
+        oauth_lease_relay(LeaseEnd::BeforePost).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_lease_closure_cancels_pending_provider_headers() {
+        oauth_lease_relay(LeaseEnd::PendingHeaders).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_lease_closure_drops_partial_provider_response() {
+        oauth_lease_relay(LeaseEnd::PendingBody).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_lease_live_commit_has_exclusive_response_reader() {
+        oauth_lease_relay(LeaseEnd::AfterCommit).await;
+    }
 
     #[tokio::test]
     async fn secret_body_rejection_answers_tls_before_upstream_request() {
