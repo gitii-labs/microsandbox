@@ -172,6 +172,15 @@ OAuth connections to keep markers, injected tokens and raw provider responses
 out of logs; other connections retain their existing tracing. Agent framing, storage and leases are
 unchanged.
 
+OAuth token forwarding observes the existing acquired broker socket until the
+provider response is complete. EOF, socket errors or unsolicited broker data
+cancel the upstream connection; a lease already closed before dispatch refuses
+the request. Commit exclusively reads its existing reply after observation is
+dropped. This changes cancellation timing, not broker messages, socket paths,
+SDK launch contracts or persisted grants. Existing brokers already retain this
+connection through commit. Older runtimes still defer detection until commit.
+Cancellation cannot undo a token rotation the provider has already accepted.
+
 In v0.7.0, the private launcher is `msb machine`; `msb sandbox` is the public command group and `sbx` is its alias. The current CLI also recognizes previous internal `msb sandbox` launches. The SDK selects the tested v0.6.x launch contract for previous executables and encodes the corresponding arguments and JSON. Public top-level verbs such as `msb run` remain supported.
 
 Complete previous invocations use the separate boot-only decoder; `msb machine` retains strict execution-intent validation. Runtime selection keeps the unified setup API and its installed-binary precedence. Launch selection uses our embedded-version reader and cached previous contracts, without additional capability/help probes.

@@ -2,9 +2,11 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -351,6 +353,48 @@ enum RequestBodyFraming {
 //--------------------------------------------------------------------------------------------------
 
 impl OAuthConnection {
+    /// Fail closed before sending a request if its broker lease has ended.
+    pub(crate) fn check_leases(&self) -> io::Result<()> {
+        for lease in self.grants.iter().filter_map(|grant| grant.lease.as_ref()) {
+            // Caller validation: peek the socket itself, not cached Tokio readiness,
+            // so a lease already closed before dispatch cannot authorize a POST.
+            match socket2::SockRef::from(lease).peek(&mut [MaybeUninit::uninit(); 1]) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                _ => return Err(lost_lease()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Observe revocation only between broker exchanges. Dropping this future
+    /// stops observation synchronously; commit remains the socket's sole reader.
+    pub(crate) async fn lease_lost(&self) -> io::Error {
+        let mut leases = self
+            .grants
+            .iter()
+            .filter_map(|grant| grant.lease.as_ref())
+            .map(|lease| async move {
+                loop {
+                    if lease.readable().await.is_err() {
+                        return;
+                    }
+                    match lease.try_io(tokio::io::Interest::READABLE, || {
+                        socket2::SockRef::from(lease).peek(&mut [MaybeUninit::uninit(); 1])
+                    }) {
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                        // Caller validation: EOF, errors, or unsolicited broker data
+                        // invalidate the lease. No bytes are consumed by observation.
+                        _ => return,
+                    }
+                }
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        if leases.next().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+        lost_lease()
+    }
+
     /// Load grants relevant to this TLS SNI. Broker failures reject the connection.
     pub(crate) async fn new_tls_intercepted(
         configs: &[OAuthSecret],
@@ -2047,6 +2091,10 @@ async fn broker_acquire(config: &OAuthSecret) -> io::Result<(LoadResponse, UnixS
     Ok((response, stream))
 }
 
+fn lost_lease() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "OAuth broker lease ended")
+}
+
 /// Ask the broker to store a secret an endpoint just minted, and to name the
 /// sentinel that stands for it.
 async fn broker_mint(config: &OAuthSecret, field: &str, value: &str) -> io::Result<String> {
@@ -2850,6 +2898,41 @@ mod tests {
 
     fn connection() -> OAuthConnection {
         connection_for(vec![config()])
+    }
+
+    #[tokio::test]
+    async fn lease_observation_does_not_consume_bytes_or_retain_the_socket() {
+        let mut connection = connection();
+        let (lease, mut broker) = UnixStream::pair().unwrap();
+        connection.grants[0].lease = Some(lease);
+        connection.check_leases().unwrap();
+        {
+            let observation = connection.lease_lost();
+            tokio::pin!(observation);
+            assert!(futures::poll!(&mut observation).is_pending());
+            broker.write_all(b"unexpected").await.unwrap();
+            assert_eq!(observation.await.kind(), io::ErrorKind::PermissionDenied);
+        }
+        let mut bytes = [0; 10];
+        connection.grants[0]
+            .lease
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut bytes)
+            .await
+            .unwrap();
+        assert_eq!(&bytes, b"unexpected");
+        drop(connection);
+        assert_eq!(broker.read(&mut bytes).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_lease_does_not_cancel_an_ordinary_connection() {
+        let connection = connection();
+        connection.check_leases().unwrap();
+        let observation = connection.lease_lost();
+        tokio::pin!(observation);
+        assert!(futures::poll!(&mut observation).is_pending());
     }
 
     struct BrokerState {
