@@ -53,13 +53,13 @@
     "test:unit": "vitest run tests/unit",
     "test:smoke": "vitest run tests/smoke.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck:native",
-    "typecheck:native": "tsc --noEmit --skipLibCheck false --target ES2022 --moduleResolution NodeNext --module NodeNext native/index.d.ts"
+    "typecheck:native": "tsc --ignoreConfig --noEmit --skipLibCheck false --types node --target ES2022 --moduleResolution NodeNext --module NodeNext native/index.d.ts"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3",
-    "@types/node": "^25.5.2",
-    "typescript": "^5.6",
-    "vitest": "^5.0"
+    "@napi-rs/cli": "^3.10.12",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
   },
   "optionalDependencies": {
     "@superradcompany/microsandbox-darwin-arm64": "0.7.13",

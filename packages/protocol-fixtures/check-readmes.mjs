@@ -1,38 +1,34 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Compile complete README examples against the built, exported declarations.
-// Virtual source files keep documentation checks from writing into the packages.
+// Compile temporary source files with the installed compiler's public CLI.
 const packages = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 let checked = 0;
 for (const name of ["protocol-client", "agent-client", "control-client"]) {
   const directory = path.join(packages, name, "typescript");
   const require = createRequire(path.join(directory, "package.json"));
-  const ts = require("typescript");
+  const compiler = path.join(path.dirname(require.resolve("typescript/package.json")), "bin", "tsc");
   const readme = readFileSync(path.join(directory, "README.md"), "utf8");
   for (const [index, match] of [...readme.matchAll(/```ts\n([\s\S]*?)\n```/g)].entries()) {
-    const filename = path.join(directory, `readme-example-${index + 1}.ts`);
-    const options = {
-      target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.NodeNext,
-      moduleResolution: ts.ModuleResolutionKind.NodeNext, noEmit: true,
-      strict: true, noUncheckedIndexedAccess: true, skipLibCheck: true,
-      lib: ["lib.es2023.d.ts", "lib.dom.d.ts"],
-    };
-    const host = ts.createCompilerHost(options);
-    const originalRead = host.readFile.bind(host), originalExists = host.fileExists.bind(host);
-    // TypeScript uses forward slashes even when path.join produces Windows separators.
-    const canonical = name => host.getCanonicalFileName(path.normalize(name));
-    const isExample = name => canonical(name) === canonical(filename);
-    host.readFile = name => isExample(name) ? match[1] : originalRead(name);
-    host.fileExists = name => isExample(name) || originalExists(name);
-    const diagnostics = ts.getPreEmitDiagnostics(ts.createProgram([filename], options, host));
-    if (diagnostics.length) {
-      process.stderr.write(ts.formatDiagnosticsWithColorAndContext(diagnostics, {
-        getCurrentDirectory: () => directory, getCanonicalFileName: name => name, getNewLine: () => "\n",
-      }));
-      process.exitCode = 1;
+    const temporary = mkdtempSync(path.join(directory, ".readme-check-"));
+    try {
+      const filename = path.join(temporary, `readme-example-${index + 1}.ts`);
+      writeFileSync(filename, match[1]);
+      const result = spawnSync(process.execPath, [compiler,
+        "--ignoreConfig", "--target", "ES2023", "--module", "NodeNext",
+        "--moduleResolution", "NodeNext", "--noEmit", "--strict",
+        "--noUncheckedIndexedAccess", "--skipLibCheck", "--types", "node",
+        "--lib", "ES2023,DOM", filename,
+      ], { cwd: directory, stdio: "inherit" });
+      if (result.error) throw result.error;
+      // A failed compiler or signal must fail documentation validation.
+      if (result.status !== 0) process.exitCode = 1;
+    } finally {
+      rmSync(temporary, { recursive: true });
     }
     checked++;
   }
