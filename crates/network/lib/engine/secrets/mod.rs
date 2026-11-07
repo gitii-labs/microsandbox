@@ -9,3 +9,4 @@ pub mod detector;
 pub mod handle;
 pub mod handler;
 pub mod oauth;
+mod hpack;
