@@ -5442,7 +5442,7 @@ mod tests {
                         let entry = entry.unwrap();
                         if entry.path().unwrap().starts_with("layers") {
                             assert!(entry.header().entry_type().is_file());
-                            assert!(entry.header().raw_entry_size().unwrap() > 1024 * 1024);
+                            assert!(entry.header().entry_size().unwrap() > 1024 * 1024);
                             large_dense_member = true;
                         }
                     }

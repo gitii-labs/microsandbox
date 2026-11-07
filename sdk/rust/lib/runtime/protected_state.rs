@@ -41,6 +41,8 @@ pub(crate) async fn prepare(
     // cannot release the caller's lifecycle guard while a detached blocking worker migrates.
     let runtime = storage.join("runtime");
     let result = if creating.is_some() {
+        // Fresh bind/block-only homes have not passed through OCI disk preparation.
+        std::fs::create_dir_all(backend.sandboxes_dir())?;
         layout::initialize_new(&runtime)
     } else {
         layout::prepare(&runtime, binding.as_ref())
