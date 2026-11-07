@@ -464,6 +464,13 @@ static msb_sandbox_compact_fn ptr_msb_sandbox_compact = NULL;
 // dlopen handle — set once by load_microsandbox, never closed.
 static void *lib_handle = NULL;
 
+#ifdef MSB_GO_TCP_TEST_FIXTURE
+// The fixture must share the production image's registries and retained lifetime.
+void *tcp_test_library_handle(void) {
+    return lib_handle;
+}
+#endif
+
 bool has_port_modification(void) {
     return lib_handle && dlsym(lib_handle, "msb_supports_port_modification") != NULL;
 }
