@@ -27,7 +27,7 @@ concurrency:
 
 env:
   TAG: ${{ inputs.tag || github.ref_name }}
-  RUST_TOOLCHAIN: 1.94.0
+  RUST_TOOLCHAIN: 1.99.1
   LIBKRUNFW_VERSION: "5.6.1"
   LIBKRUNFW_ABI: "5"
   CARGO_TERM_COLOR: always
@@ -96,12 +96,12 @@ jobs:
         working-directory: vendor/libkrunfw
         run: make -j"$(nproc)"
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.musl }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: agentd-${{ matrix.arch }}
           cache-bin: false
@@ -120,7 +120,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kernel-${{ matrix.arch }}
           path: parts/
@@ -148,11 +148,11 @@ jobs:
         with:
           ref: refs/tags/${{ env.TAG }}
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.os }}-${{ matrix.arch }}
           cache-bin: false
@@ -161,7 +161,7 @@ jobs:
         if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: kernel-${{ matrix.arch }}
           path: parts/
@@ -222,7 +222,7 @@ jobs:
           [ -n "$floor" ]
           [ "$(printf '%s\n2.35\n' "$floor" | sort -V | tail -1)" = 2.35 ]
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-${{ matrix.os }}-${{ matrix.arch }}
           path: microsandbox-runtime-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
@@ -238,7 +238,7 @@ jobs:
         with:
           ref: refs/tags/${{ env.TAG }}
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: runtime-*
           path: dist/

@@ -48,9 +48,9 @@ jobs:
         with:
           submodules: true
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: true
@@ -112,7 +112,7 @@ jobs:
 
       - name: Set up mold (Linux host link)
         if: inputs.os == 'linux'
-        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # 2.41.0
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # HEAD
 
       - name: Build msb
         run: |
@@ -146,11 +146,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: true
@@ -173,7 +173,7 @@ jobs:
 
       - name: Set up mold (Linux host link)
         if: inputs.os == 'linux'
-        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # 2.41.0
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # HEAD
 
       - name: Check workspace
         run: cargo +stable check --workspace --exclude microsandbox-agentd
@@ -187,14 +187,14 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: "26.13.0"
       - name: Install build deps (Linux)
         if: inputs.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
@@ -205,7 +205,7 @@ jobs:
           path: build/
       - name: Set up mold (Linux host link)
         if: inputs.os == 'linux'
-        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # 2.41.0
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # HEAD
       - name: Build Node SDK
         working-directory: sdk/node-ts
         run: |
@@ -222,13 +222,14 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: true
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
+          python-version: "3.15.0"
           enable-cache: true
           cache-dependency-glob: "sdk/python/uv.lock"
       - name: Install build deps (Linux)
@@ -241,7 +242,7 @@ jobs:
           path: build/
       - name: Set up mold (Linux host link)
         if: inputs.os == 'linux'
-        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # 2.41.0
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36 # HEAD
       - name: Stage runtime bundle
         run: |
           mkdir -p sdk/python/microsandbox/_bundled/bin sdk/python/microsandbox/_bundled/lib
