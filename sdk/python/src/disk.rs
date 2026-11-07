@@ -31,13 +31,13 @@ impl PyDisk {
     /// Create and durably publish a sparse ext4 image without clobbering a path.
     #[staticmethod]
     fn create(py: Python<'_>, path: PathBuf, size_bytes: u64) -> PyResult<PyDiskInfo> {
-        convert(py.allow_threads(|| microsandbox::disk::create(path, size_bytes)))
+        convert(py.detach(|| microsandbox::disk::create(path, size_bytes)))
     }
 
     /// Read and validate metadata without modifying an image.
     #[staticmethod]
     fn inspect(py: Python<'_>, path: PathBuf) -> PyResult<PyDiskInfo> {
-        convert(py.allow_threads(|| microsandbox::disk::inspect(path)))
+        convert(py.detach(|| microsandbox::disk::inspect(path)))
     }
 
     /// Grow a private copy and publish it exclusively, preserving the source.
@@ -48,7 +48,7 @@ impl PyDisk {
         destination: PathBuf,
         size_bytes: u64,
     ) -> PyResult<PyDiskInfo> {
-        convert(py.allow_threads(|| microsandbox::disk::grow_copy(source, destination, size_bytes)))
+        convert(py.detach(|| microsandbox::disk::grow_copy(source, destination, size_bytes)))
     }
 }
 
