@@ -875,6 +875,11 @@ impl LocalBackend {
                     self.ensure_named_volumes(preparation, &config),
                 )
                 .await?;
+                // Install the link before launch preparation creates the default logs path.
+                // Preparation failures use the provisional row's ordinary storage cleanup.
+                if let Some(log_dir) = &config.log_dir {
+                    link_log_dir(&sandbox_dir, log_dir)?;
+                }
                 self.prepare_sandbox_launch(&config, preparation).await?;
                 Ok::<_, MicrosandboxError>((volumes, _branch_pin))
             })
@@ -909,13 +914,6 @@ impl LocalBackend {
             _transition_guard,
             created_named_volumes.clone(),
         );
-
-        if let Some(log_dir) = &config.log_dir
-            && let Err(error) = link_log_dir(&sandbox_dir, log_dir)
-        {
-            drop(lifecycle_guard);
-            return Err(creation_cleanup.finish_failure(error).await);
-        }
 
         // Persist the fully prepared config before launch. The recovery row remains armed
         // until all create-time validation and publication have succeeded.
