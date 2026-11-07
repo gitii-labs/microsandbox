@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "microsandbox"
 description = "Python SDK for microsandbox — secure, fast microVM-based sandboxing."
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { file = "LICENSE" }
 authors = [{ name = "Super Rad Company", email = "development@superrad.company" }]
 readme = "README.md"
 dynamic = ["version"]
