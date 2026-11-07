@@ -534,13 +534,12 @@ impl Session {
                 debug!("channel_close");
                 let channel_num = map_err!(ChannelId::decode(&mut r))?;
                 map_err!(ensure_end(&r))?;
-                if !self.common.is_established_channel(channel_num) {
-                    return Ok(());
-                }
                 if let Some(ref mut enc) = self.common.encrypted {
-                    // The CHANNEL_CLOSE message must be sent to the server at this point or the session
-                    // will not be released.
-                    enc.close(channel_num)?;
+                    if !enc.close_received(channel_num)? {
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
                 }
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
@@ -1157,6 +1156,7 @@ mod tests {
             server_mac: crate::mac::NONE,
             session_id: CryptoVec::from(&b"session-id"[..]),
             channels: HashMap::new(),
+            closing_channels: Default::default(),
             last_channel_id: Wrapping(0),
             write: Vec::new(),
             write_cursor: 0,

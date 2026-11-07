@@ -18,7 +18,16 @@ channel-open replies independent of application data queue congestion. The local
 reply API now sends atomically through that queue; a closed queue reports failure.
 The transport abort signal remains independent of callbacks and socket writes.
 
+The local close-lifecycle patch retains established channel IDs until a peer's
+CLOSE acknowledges the local CLOSE. Peer-initiated CLOSE replies bypass blocked
+output. Unknown and unconfirmed channel IDs remain inadmissible. This fixes a
+lifecycle defect present in upstream 0.65.1; it is not an upstream-included fix.
+
 ## Patched Source
+
+- `src/session.rs` and both encrypted packet handlers: complete local, peer and
+  simultaneous close handshakes without losing acknowledgements or waiting for
+  output that a closed peer cannot accept. Closing IDs are not reused early.
 
 - `src/channels/mod.rs`: one signed send ledger for reserved writes and admitted
   non-reserving writes, with additive checked replenishment. Reservation guards
