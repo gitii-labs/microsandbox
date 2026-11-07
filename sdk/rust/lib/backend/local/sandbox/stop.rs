@@ -1039,7 +1039,7 @@ mod tests {
 
         // The flat path is the released runtime's endpoint; it has no lifecycle descriptor.
         let socket =
-            microsandbox_runtime::ipc::sandbox_socket_paths(&backend.config().run_dir(), name)
+            microsandbox_runtime::ipc::RuntimeSocketPaths::new(&backend.config().run_dir(), name)
                 .legacy_agent;
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let disk = backend.sandboxes_dir().join(name).join("legacy-test.disk");
@@ -1184,7 +1184,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn unlink_legacy_endpoints(backend: &LocalBackend, name: &str) {
         let agent =
-            microsandbox_runtime::ipc::sandbox_socket_paths(&backend.config().run_dir(), name)
+            microsandbox_runtime::ipc::RuntimeSocketPaths::new(&backend.config().run_dir(), name)
                 .legacy_agent;
         let control = microsandbox_runtime::control::control_socket_path_for(&agent);
         // Synchronization on the child's Ready output proves both listeners already exist.
@@ -1415,7 +1415,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_control_owner_with_unreachable_agent_returns_error() {
         let (_home, backend, id, run_id) = fixture("legacy-unreachable").await;
-        let agent = microsandbox_runtime::ipc::sandbox_socket_paths(
+        let agent = microsandbox_runtime::ipc::RuntimeSocketPaths::new(
             &backend.config().run_dir(),
             "legacy-unreachable",
         )

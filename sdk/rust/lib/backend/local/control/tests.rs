@@ -359,7 +359,9 @@ mod unix {
         let wal_inode = std::fs::metadata(&wal).unwrap().ino();
         let shm_inode = std::fs::metadata(&shm).unwrap().ino();
 
-        let identity = super::super::identity::DatabaseIdentity::capture(&path).unwrap();
+        let identity = super::super::identity::DatabaseIdentity::capture(&path)
+            .await
+            .unwrap();
         identity.verify().unwrap();
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())

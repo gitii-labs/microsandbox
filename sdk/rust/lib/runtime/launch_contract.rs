@@ -1306,7 +1306,7 @@ mod tests {
 
         // These independent settings must both be admitted when requested together.
         let mut combined = network;
-        combined.max_inbound_tcp_connections = Some(512);
+        combined.max_inbound_tcp_connections = Some(512.into());
         let error = machine
             .require_network_capabilities(&current, &combined)
             .await
