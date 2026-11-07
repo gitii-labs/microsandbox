@@ -1,13 +1,15 @@
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::{Future, Pending};
+use std::pin::Pin;
 
 use futures::future::Either as EitherFuture;
-use log::warn;
+use log::{debug, warn};
 use parsing::ChannelOpenConfirmation;
 pub use russh_cryptovec::CryptoVec;
 use ssh_encoding::{Decode, Encode};
 use thiserror::Error;
+use tokio::io::AsyncWrite;
 
 #[cfg(test)]
 mod tests;
@@ -291,7 +293,9 @@ impl Default for Limits {
     }
 }
 
-pub use auth::{AgentAuthError, MethodKind, MethodSet, Signer};
+pub use auth::{
+    AgentAuthError, GssapiAuthenticator, GssapiError, GssapiStep, MethodKind, MethodSet, Signer,
+};
 
 /// A reason for disconnection.
 #[allow(missing_docs)] // This should be relatively self-explanatory.
@@ -526,6 +530,20 @@ impl ChannelParams {
     }
 }
 
+pub(crate) async fn flush_or_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut sshbuffer::PacketWriter,
+    stream: &mut W,
+    inactivity_timer: Pin<&mut impl Future<Output = ()>>,
+) -> Result<(), Error> {
+    tokio::select! {
+        r = writer.flush_into(stream) => Ok(r?),
+        _ = inactivity_timer => {
+            debug!("timeout while writing");
+            Err(Error::InactivityTimeout)
+        }
+    }
+}
+
 /// Returns `f(val)` if `val` it is [Some], or a forever pending [Future] if it is [None].
 pub(crate) fn future_or_pending<R, F: Future<Output = R>, T>(
     val: Option<T>,
@@ -558,7 +576,7 @@ pub struct PendingChannelOpen {
 /// that fallback cannot be queued. For cancellation-safe asynchronous replies,
 /// retain the handle and use [`respond`](Self::respond).
 pub struct ChannelOpenHandleInner<M: Send> {
-    sender: tokio::sync::mpsc::Sender<M>,
+    sender: tokio::sync::mpsc::UnboundedSender<M>,
     inner: Option<PendingChannelOpen>,
     make_msg: fn(PendingChannelOpen, Result<(), ChannelOpenFailure>) -> M,
     abort: Option<tokio::sync::watch::Sender<bool>>,
@@ -566,7 +584,7 @@ pub struct ChannelOpenHandleInner<M: Send> {
 
 impl<M: Send> ChannelOpenHandleInner<M> {
     pub(crate) fn new(
-        sender: tokio::sync::mpsc::Sender<M>,
+        sender: tokio::sync::mpsc::UnboundedSender<M>,
         pending: PendingChannelOpen,
         make_msg: fn(PendingChannelOpen, Result<(), ChannelOpenFailure>) -> M,
     ) -> Self {
@@ -587,7 +605,7 @@ impl<M: Send> ChannelOpenHandleInner<M> {
         if let Some(pending) = self.inner.take() {
             if self
                 .sender
-                .try_send((self.make_msg)(pending, result))
+                .send((self.make_msg)(pending, result))
                 .is_err()
                 && let Some(abort) = &self.abort
             {
@@ -597,13 +615,13 @@ impl<M: Send> ChannelOpenHandleInner<M> {
         }
     }
 
-    /// Enqueue a definitive reply, retaining pending ownership while waiting.
-    /// Cancelling this future leaves the handle reusable for an explicit rejection.
+    /// Enqueue a definitive reply on the priority queue without waiting for data capacity.
+    /// The reply is sent atomically when this future is polled.
     pub async fn respond(&mut self, result: Result<(), ChannelOpenFailure>) -> Result<(), Error> {
-        let permit = self.sender.reserve().await.map_err(|_| Error::SendError)?;
         let pending = self.inner.take().ok_or(Error::Inconsistent)?;
-        permit.send((self.make_msg)(pending, result));
-        Ok(())
+        self.sender
+            .send((self.make_msg)(pending, result))
+            .map_err(|_| Error::SendError)
     }
 
     /// Accept the channel open request.

@@ -1,6 +1,8 @@
+import { Job, JobListBuilder, jobCall, jobPageFromJson, type JobPage } from "./jobs.js";
 import { remapKeysToCamel } from "./internal/config.js";
 import { mapNapiError, withMappedErrors } from "./internal/error-mapping.js";
-import { validateStopTimeout } from "./internal/stop.js";
+import { validateTimeoutMs } from "./internal/stop.js";
+import { forkMountBuilders, type ForkVolumes } from "./internal/fork-volumes.js";
 import {
   compactionResultFromJson,
   type DiskCompactionOptions,
@@ -9,6 +11,7 @@ import {
 import {
   modificationPlanFromJson,
   modifyOptionsToNapi,
+  requireModifyCapabilities,
   type ModifyOptions,
   type SandboxModificationPlan,
 } from "./modify.js";
@@ -100,6 +103,18 @@ export interface SandboxPingResult {
 export interface SandboxTouchResult {
   readonly name: string;
   readonly activitySeq: number;
+}
+
+/** Options for forking a running sandbox. */
+export interface ForkOptions {
+  recordIntegrity?: boolean;
+  guestFlush?: import("./snapshot.js").GuestFlush;
+  /**
+   * Rebind a captured disk at its guest path to a host image holding the captured
+   * state; a fork cannot add a new block device. Each child attaches the image
+   * directly, without a private copy, so batch forks should not share a writable image.
+   */
+  volumes?: ForkVolumes;
 }
 
 /** One named child or startup error from a capture-once batch, in input order. */
@@ -223,6 +238,21 @@ export class CreationProgressCreate {
 }
 
 export class Sandbox implements AsyncDisposable {
+  async getJob(id: string): Promise<Job> { return new Job(await jobCall(() => this.inner.getJob(id))); }
+  async listJobs(): Promise<JobPage> { return this.listJobsWith(b => b); }
+  async listJobsWith(configure: (b: JobListBuilder) => JobListBuilder): Promise<JobPage> {
+    const b = configure(new JobListBuilder());
+    return jobPageFromJson(await jobCall(() => this.inner.listJobs(b.includeAll, b.pageSize, b.after)));
+  }
+
+  async execDetached(cmd: string, args: Iterable<string> = []): Promise<Job> {
+    return new Job(await jobCall(() => this.inner.execDetached(cmd, Array.from(args))));
+  }
+  async execDetachedWith(cmd: string, configure: (b: NapiExecOptionsBuilder) => NapiExecOptionsBuilder): Promise<Job> {
+    const builder = configure(new napi.ExecOptionsBuilder().stdinPipe());
+    return new Job(await jobCall(() => this.inner.execDetachedWithBuilder(cmd, builder)));
+  }
+
   /** Prepare restoration; no VM starts until the builder's restore terminal. */
   static restore(snapshot: NapiSnapshotSeed): RestoreBuilder {
     const builder = typeof snapshot === "string"
@@ -553,6 +583,7 @@ export class Sandbox implements AsyncDisposable {
    * computed without applying anything.
    */
   async modify(opts?: ModifyOptions): Promise<SandboxModificationPlan> {
+    requireModifyCapabilities(opts);
     const raw = await withMappedErrors(() =>
       this.inner.modify(modifyOptionsToNapi(opts)),
     );
@@ -588,24 +619,30 @@ export class Sandbox implements AsyncDisposable {
   }
 
   /** @deprecated Use fork() for live execution duplication. */
-  async branch(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
+  async branch(name: string, options: ForkOptions = {}): Promise<Sandbox> {
     return this.fork(name, options);
   }
 
   /** @deprecated Use forkMany() for capture-once live duplication. */
-  async branchMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<ForkOutcome[]> {
+  async branchMany(names: string[], options: ForkOptions = {}): Promise<ForkOutcome[]> {
     return this.forkMany(names, options);
   }
 
   /** Create an independent local CoW child without a durable full snapshot. */
-  async fork(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
-    const child = await withMappedErrors(() => this.inner.fork(name, options.recordIntegrity, options.guestFlush));
+  async fork(name: string, options: ForkOptions = {}): Promise<Sandbox> {
+    const volumes = forkMountBuilders(options.volumes);
+    const child = await withMappedErrors(() => this.inner.fork(
+      name, options.recordIntegrity, options.guestFlush, volumes.length > 0 ? volumes : undefined,
+    ));
     return new Sandbox(child, name, false);
   }
 
   /** Capture once; return each named child's startup outcome in input order. */
-  async forkMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<ForkOutcome[]> {
-    const outcomes = await withMappedErrors(() => this.inner.forkMany(names, options.recordIntegrity, options.guestFlush));
+  async forkMany(names: string[], options: ForkOptions = {}): Promise<ForkOutcome[]> {
+    const volumes = forkMountBuilders(options.volumes);
+    const outcomes = await withMappedErrors(() => this.inner.forkMany(
+      names, options.recordIntegrity, options.guestFlush, volumes.length > 0 ? volumes : undefined,
+    ));
     return outcomes.map(o => o.sandbox
       ? { name: o.name, sandbox: new Sandbox(o.sandbox, o.name, false) }
       : { name: o.name, error: mapNapiError(new Error(o.error ?? "Child startup failed")) as Error });
@@ -627,7 +664,7 @@ export class Sandbox implements AsyncDisposable {
 
   /** One total budget; StopTimeoutError on expiry without killing. Zero never dispatches shutdown. */
   async stopWithTimeout(timeoutMs: number): Promise<void> {
-    validateStopTimeout(timeoutMs);
+    validateTimeoutMs(timeoutMs, "stop");
     await withMappedErrors(() => this.inner.stopWithTimeout(timeoutMs));
   }
 
@@ -639,7 +676,9 @@ export class Sandbox implements AsyncDisposable {
     await withMappedErrors(() => this.inner.requestKill());
   }
 
+  /** Force-kill with an integer observation timeout from 0 to 4294967295 milliseconds. */
   async killWithTimeout(timeoutMs: number): Promise<void> {
+    validateTimeoutMs(timeoutMs, "kill");
     await withMappedErrors(() => this.inner.killWithTimeout(timeoutMs));
   }
 

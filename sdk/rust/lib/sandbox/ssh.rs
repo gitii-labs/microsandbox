@@ -22,7 +22,7 @@ use russh::client::Msg as ClientMsg;
 use russh::keys::{
     Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyBase64, decode_secret_key,
 };
-use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
+use russh::server::{Auth, ChannelOpenHandle, Msg, PublicKeyOffer, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelOpenFailure, Sig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, watch};
@@ -55,10 +55,6 @@ const SSH_IN_PROCESS_WINDOW: u32 = 256 * 1024;
 
 /// One native SSH receive window plus ample encryption/framing overhead per direction.
 const SSH_IN_PROCESS_DUPLEX_CAPACITY: usize = 512 * 1024;
-
-/// How long a channel-open reply may wait for room in the session's queue before the
-/// transport is aborted rather than leave the peer's open unanswered.
-const SSH_OPEN_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a closed direct-tcpip channel's guest stream may go without progress (credit for the
 /// remaining input, then the guest's terminal reply) before it is cancelled.
@@ -812,7 +808,8 @@ impl SshClient {
                 .map_err(|e| MicrosandboxError::Terminal(format!("resolve tty path: {e}")))?;
             let tty_input = open_nonblocking_terminal_input(&tty_input_path)
                 .map_err(|e| MicrosandboxError::Terminal(format!("open tty input: {e}")))?;
-            let stdin_async = tokio::io::unix::AsyncFd::new(tty_input)
+            // SAFETY: The owned terminal file keeps its non-blocking descriptor open and unchanged.
+            let stdin_async = unsafe { tokio::io::unix::AsyncFd::register(tty_input) }
                 .map_err(|e| MicrosandboxError::Terminal(format!("async tty input: {e}")))?;
             let mut stdout = tokio::io::stdout();
             let mut sigwinch =
@@ -1205,9 +1202,9 @@ impl russh::server::Handler for SshSession {
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
-        public_key: &russh::keys::PublicKey,
+        offer: PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
-        if self.key_is_authorized(public_key) {
+        if self.key_is_authorized(offer.public_key) {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
@@ -1217,9 +1214,9 @@ impl russh::server::Handler for SshSession {
     async fn auth_publickey(
         &mut self,
         user: &str,
-        public_key: &russh::keys::PublicKey,
+        key: VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        if self.key_is_authorized(public_key) {
+        if self.key_is_authorized(key.public_key) {
             self.user = Some(user.to_string());
             Ok(Auth::Accept)
         } else {
@@ -1589,7 +1586,7 @@ impl russh::client::Handler for SshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -2027,8 +2024,8 @@ impl AsyncWrite for SshStdioStream {
 
 /// Deliver a definitive open reply without ever leaving an SSH callback waiting on queue space.
 ///
-/// A reply that cannot be queued in time aborts the transport through its separate signal, so a
-/// congested session can neither lose a reply nor leave the peer's open pending forever.
+/// russh's priority queue admits replies without waiting for application data capacity.
+/// A closed reply queue aborts the transport through its separate signal.
 async fn finish_ssh_open(
     reply: &mut ChannelOpenHandle,
     accepted: bool,
@@ -2039,9 +2036,9 @@ async fn finish_ssh_open(
     } else {
         Err(ChannelOpenFailure::AdministrativelyProhibited)
     };
-    match tokio::time::timeout(SSH_OPEN_REPLY_TIMEOUT, reply.respond(result)).await {
-        Ok(Ok(())) => true,
-        failure => {
+    match reply.respond(result).await {
+        Ok(()) => true,
+        Err(failure) => {
             tracing::warn!(
                 ?failure,
                 "SSH open reply could not be delivered; terminating connection"

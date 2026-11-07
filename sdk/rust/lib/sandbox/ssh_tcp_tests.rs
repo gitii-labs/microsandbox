@@ -29,7 +29,10 @@ struct Client {
 impl russh::client::Handler for Client {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, _: &russh::keys::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        _: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
         Ok(true)
     }
 
@@ -647,14 +650,18 @@ impl SaturatedOpens {
 }
 
 #[tokio::test]
-async fn saturated_open_queue_preserves_cancelled_accept_and_delivers_all_rejections() {
+async fn saturated_data_queue_does_not_block_open_replies() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut fixture = SaturatedOpens::new().await;
         {
             let accepting = fixture.pending[0].0.respond(Ok(()));
             tokio::pin!(accepting);
-            assert!(futures::poll!(&mut accepting).is_pending());
-        } // Cancel without consuming the pending reply state.
+            assert!(matches!(
+                futures::poll!(&mut accepting),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        fixture.pending.remove(0);
         let rejections = fixture
             .pending
             .into_iter()
@@ -666,6 +673,41 @@ async fn saturated_open_queue_preserves_cancelled_accept_and_delivers_all_reject
         for rejection in rejections {
             assert!(rejection.await.unwrap());
         }
+        let mut accepted_count = 0;
+        for opening in fixture.openings {
+            match opening.await.unwrap() {
+                Ok(channel) => {
+                    accepted_count += 1;
+                    channel.close().await.unwrap();
+                }
+                Err(russh::Error::ChannelOpenFailure(
+                    ChannelOpenFailure::AdministrativelyProhibited,
+                )) => {}
+                Err(error) => panic!("unexpected open error: {error:?}"),
+            }
+        }
+        assert_eq!(accepted_count, 1);
+        fixture
+            .client
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+            .await
+            .unwrap();
+        drop(fixture.client);
+        fixture.server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn saturated_data_queue_preserves_abandoned_open_rejections() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut fixture = SaturatedOpens::new().await;
+        // Cancelling before the first poll retains pending ownership. Once polled,
+        // russh's priority queue admits the reply without an application-queue wait.
+        drop(fixture.pending[0].0.respond(Ok(())));
+        drop(fixture.pending);
+        fixture.release.send(()).unwrap();
         for opening in fixture.openings {
             assert!(matches!(
                 opening.await.unwrap(),
@@ -687,36 +729,19 @@ async fn saturated_open_queue_preserves_cancelled_accept_and_delivers_all_reject
 }
 
 #[tokio::test]
-async fn saturated_open_reply_deadline_or_abandonment_terminates_transport() {
-    for abandon in [false, true] {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let mut fixture = SaturatedOpens::new().await;
-            if abandon {
-                drop(fixture.pending.remove(0));
-            } else {
-                let replies = fixture
-                    .pending
-                    .drain(..)
-                    .map(|(mut reply, session, _)| {
-                        tokio::spawn(
-                            async move { finish_ssh_open(&mut reply, false, &session).await },
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                for reply in replies {
-                    assert!(!reply.await.unwrap());
-                }
-            }
-            assert!(matches!(
-                fixture.server.await.unwrap(),
-                Err(russh::Error::Disconnect)
-            ));
-            for opening in fixture.openings {
-                assert!(opening.await.unwrap().is_err());
-            }
-            drop((fixture.client, fixture.pending, fixture.release));
-        })
-        .await
-        .unwrap();
-    }
+async fn transport_abort_cancels_blocked_open_callback_with_saturated_data_queue() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let fixture = SaturatedOpens::new().await;
+        fixture.pending[0].1.abort();
+        assert!(matches!(
+            fixture.server.await.unwrap(),
+            Err(russh::Error::Disconnect)
+        ));
+        for opening in fixture.openings {
+            assert!(opening.await.unwrap().is_err());
+        }
+        drop((fixture.client, fixture.pending, fixture.release));
+    })
+    .await
+    .unwrap();
 }

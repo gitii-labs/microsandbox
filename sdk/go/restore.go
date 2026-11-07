@@ -54,7 +54,9 @@ type RestoreConfig struct {
 	// HostAliasIPv4Ports selects IPv4 loopback for the child's host-alias TCP ports.
 	// Ports must be nonzero; both guest gateway families remain available.
 	HostAliasIPv4Ports []uint16
-	Vsock              []VsockRoute
+	// MaxInboundTCPConnections caps active inbound TCP connections; zero is unlimited. Nil uses the runtime default.
+	MaxInboundTCPConnections *uint
+	Vsock                    []VsockRoute
 }
 
 // RestoreSandbox restores an installed snapshot or archive into a detached sandbox.
@@ -109,6 +111,11 @@ func WithRestoreMaxTCPConnections(count uint) RestoreOption {
 // WithRestoreMaxUDPConnections caps destination UDP relay sessions. Zero means unlimited.
 func WithRestoreMaxUDPConnections(count uint) RestoreOption {
 	return func(o *RestoreConfig) { o.MaxUDPConnections = &count }
+}
+
+// WithRestoreMaxInboundTCPConnections caps active inbound TCP connections; zero is unlimited.
+func WithRestoreMaxInboundTCPConnections(value uint) RestoreOption {
+	return func(o *RestoreConfig) { o.MaxInboundTCPConnections = &value }
 }
 
 // WithRestoreTCPAcceptQueueSize sets the accept-queue depth for the child's published TCP
@@ -218,8 +225,9 @@ func buildFFIRestoreOptions[T SnapshotSeed](snapshot T, config RestoreConfig) ff
 		AllowMissingResources:       config.AllowMissingResources,
 		Volumes:                     resources.Volumes, CapturedVolumes: config.CapturedVolumes,
 		Ports: buildFFIPortBindings(config.Ports), TCPAcceptQueueSize: config.TCPAcceptQueueSize,
-		HostAliasIPv4Ports: config.HostAliasIPv4Ports,
-		Vsock:              buildFFIVsockRoutes(config.Vsock),
+		HostAliasIPv4Ports:       config.HostAliasIPv4Ports,
+		MaxInboundTCPConnections: config.MaxInboundTCPConnections,
+		Vsock:                    buildFFIVsockRoutes(config.Vsock),
 	}
 }
 

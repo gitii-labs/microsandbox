@@ -21,11 +21,7 @@ impl RuntimeExit {
     ) -> io::Result<Option<Self>> {
         // Pin before connecting; a later occupant of the PID must not become this owner.
         let process = Self::capture_pid(pid)?;
-        let agents = crate::runtime::spawn::sandbox_agent_socket_path_candidates_with_roots(
-            run_dir,
-            sandboxes_dir,
-            name,
-        );
+        let agents = crate::runtime::agent_socket_paths_in(run_dir, sandboxes_dir, name);
         let mut endpoints: Vec<_> = agents
             .iter()
             .map(|path| microsandbox_runtime::control::control_socket_path_for(path))
@@ -151,11 +147,7 @@ mod tests {
         let name = "x".repeat(capacity);
         let fallback = sandboxes_dir.join(&name).join("runtime/agent.sock");
         assert!(!microsandbox_runtime::ipc::socket_path_fits(&fallback));
-        let agents = crate::runtime::spawn::sandbox_agent_socket_path_candidates_with_roots(
-            &run_dir,
-            &sandboxes_dir,
-            &name,
-        );
+        let agents = crate::runtime::agent_socket_paths_in(&run_dir, &sandboxes_dir, &name);
         assert_eq!(agents.len(), 2);
         let mut endpoints: Vec<_> = agents
             .iter()

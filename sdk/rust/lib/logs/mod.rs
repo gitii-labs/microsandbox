@@ -68,6 +68,7 @@ mod watch;
 pub use cursor::{LogCursor, LogCursorParseError};
 #[cfg(feature = "local")]
 pub use logger::{RegisteredSandboxLogger, SandboxLogger};
+pub use microsandbox_protocol::core::InitFailureReason;
 #[cfg(feature = "local")]
 pub use microsandbox_runtime::boot_error::{BootError, BootErrorStage};
 pub use stream::{LogStreamOptions, LogStreamStart};

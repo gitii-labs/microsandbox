@@ -28,6 +28,7 @@ use crate::netstack::{
     shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
 };
 use crate::policy::{LoggingPolicyObserver, NetworkPolicy, NetworkProfile};
+use crate::ports::{BoundPublishedPorts, PublishedPortBindError};
 use crate::secrets::handle::SecretsHandle;
 
 //--------------------------------------------------------------------------------------------------
@@ -140,7 +141,7 @@ pub struct TerminationHandle {
     shared: Arc<SharedState>,
 }
 
-/// Read-only view of aggregate network byte counters.
+/// Read-only view of aggregate network counters.
 #[derive(Clone)]
 pub struct MetricsHandle {
     shared: Arc<SharedState>,
@@ -394,11 +395,18 @@ impl SmoltcpNetwork {
         }
     }
 
-    /// Start the smoltcp poll thread.
+    /// Claim published host ports and start the smoltcp poll thread.
     ///
     /// Must be called before VM boot. Requires a tokio runtime handle for
     /// spawning proxy tasks, DNS resolution, and published port listeners.
-    pub fn start(&mut self, tokio_handle: tokio::runtime::Handle) {
+    ///
+    /// # Errors
+    ///
+    /// Fails if a published host port cannot be claimed. No poll thread starts in that case.
+    pub fn start(
+        &mut self,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Result<(), PublishedPortBindError> {
         let shared = self.shared.clone();
         let poll_config = PollLoopConfig {
             gateway_mac: self.gateway_mac,
@@ -414,11 +422,20 @@ impl SmoltcpNetwork {
         let platform_policy = self.platform_policy.clone();
         let dns_config = config.dns.clone();
         let tls_state = self.tls_state.clone();
-        let published_ports = config.ports.clone();
+        let tcp_accept_queue_size = config.tcp_accept_queue_size.unwrap_or_default();
+        let published_ports = BoundPublishedPorts::bind(
+            &config.ports,
+            tcp_accept_queue_size,
+            self.guest_ipv4,
+            self.guest_ipv6,
+            self.gateway_ipv4,
+            self.gateway_ipv6,
+            &tokio_handle,
+        )?;
         let strict = config.strict;
         let max_tcp_connections = config.max_tcp_connections.and_then(ConnectionLimit::cap);
         let max_udp_connections = config.max_udp_connections;
-        let tcp_accept_queue_size = config.tcp_accept_queue_size.unwrap_or_default();
+        let max_inbound_tcp_connections = config.max_inbound_tcp_connections;
         let secrets = self.secrets.clone();
         let activation_gate = self.activation_gate.take();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
@@ -441,7 +458,7 @@ impl SmoltcpNetwork {
                         strict,
                         max_tcp_connections,
                         max_udp_connections,
-                        tcp_accept_queue_size,
+                        max_inbound_tcp_connections,
                         tokio_handle,
                         secrets,
                         outbound_proxy,
@@ -449,6 +466,8 @@ impl SmoltcpNetwork {
                 })
                 .expect("failed to spawn smoltcp poll thread"),
         );
+
+        Ok(())
     }
 
     /// Take the `NetBackend` for `VmBuilder::net()`. One-shot.
@@ -586,7 +605,7 @@ impl SmoltcpNetwork {
         }
     }
 
-    /// Create a handle for reading aggregate network byte counters.
+    /// Create a handle for reading aggregate network counters.
     pub fn metrics_handle(&self) -> MetricsHandle {
         MetricsHandle {
             shared: self.shared.clone(),
@@ -651,6 +670,21 @@ impl MetricsHandle {
     /// Total runtime -> guest bytes observed at the virtio-net boundary.
     pub fn rx_bytes(&self) -> u64 {
         self.shared.rx_bytes()
+    }
+
+    /// Published TCP connections rejected by the bounded admission queue.
+    pub fn inbound_tcp_rejected(&self) -> u64 {
+        self.shared.inbound_tcp_rejected()
+    }
+
+    /// Outbound TCP connections rejected because this sandbox reached its active cap.
+    pub fn outbound_tcp_rejected(&self) -> u64 {
+        self.shared.outbound_tcp_rejected()
+    }
+
+    /// Outbound UDP sessions evicted because this sandbox reached its session cap.
+    pub fn outbound_udp_evicted(&self) -> u64 {
+        self.shared.outbound_udp_evicted()
     }
 }
 
@@ -825,6 +859,14 @@ fn host_has_ipv6_route() -> bool {
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "network/test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "network/tcp_connect_tests.rs"]
+mod tcp_connect_tests;
 
 #[cfg(test)]
 #[path = "network/published_ports_tests.rs"]

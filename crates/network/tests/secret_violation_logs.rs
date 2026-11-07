@@ -18,6 +18,7 @@ use microsandbox_network::secrets::handler::SecretsHandler;
 use microsandbox_network::shared::{ResolvedHostnameFamily, SharedState};
 use microsandbox_network::tcp::proxy::spawn_tcp_proxy;
 use microsandbox_network::tls::state::TlsState;
+use microsandbox_types::HttpConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -124,12 +125,13 @@ async fn assert_proxy_violation_logs(logs: &CapturedLogs) {
                 )
             });
             let shared = Arc::new(SharedState::new(4));
-            shared.cache_resolved_hostname(
+            shared.set_http_config(HttpConfig::default());
+            assert!(shared.cache_resolved_hostname(
                 "api.example.com",
                 ResolvedHostnameFamily::Ipv4,
                 [addr.ip()],
                 Duration::from_secs(60),
-            );
+            ));
             let terminated = Arc::new(AtomicBool::new(false));
             let termination_flag = terminated.clone();
             shared.set_termination_hook(Arc::new(move || {
@@ -263,23 +265,48 @@ async fn assert_proxy_violation_logs(logs: &CapturedLogs) {
                 blocked_bytes.is_empty(),
                 "{path}: blocked data reached upstream"
             );
-            if matches!(
-                path,
-                "first flight"
-                    | "first flight body"
-                    | "CONNECT"
-                    | "CONNECT HTTP1.0"
-                    | "placeholder host"
-                    | "credential host"
-                    | "CONNECT placeholder host"
-                    | "CONNECT credential host"
-                    | "HTTP1.0"
-            ) {
-                let response = to_rx.recv().await.expect("HTTP/1 rejection response");
-                assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-                assert!(response.ends_with(b"Secret not permitted on this connection\n"));
+            let mut response = Vec::new();
+            while let Some(bytes) = to_rx.recv().await {
+                response.extend_from_slice(&bytes);
             }
-            assert!(to_rx.recv().await.is_none(), "{path}: proxy must close");
+            if action != SecretViolationAction::BlockAndTerminate
+                && matches!(
+                    path,
+                    "first flight"
+                        | "first flight body"
+                        | "body relay"
+                        | "placeholder host"
+                        | "credential host"
+                        | "HTTP1.0"
+                )
+            {
+                assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+                let response = String::from_utf8(response).unwrap();
+                assert_eq!(
+                    response.matches("HTTP/1.1 403 Forbidden\r\n").count(),
+                    1,
+                    "{path}: exactly one denial"
+                );
+                let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(content_length, body.len(), "{path}: complete denial only");
+                let denial: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(denial["code"], "secret_policy_denied");
+                assert!(
+                    !response.contains("$KEY")
+                        && !response.to_ascii_lowercase().contains("real-secret")
+                );
+            } else {
+                assert!(
+                    response.is_empty(),
+                    "{path}: no denial for unsafe responses or termination"
+                );
+            }
             if path == "early body response" {
                 assert_eq!(
                     early_response.as_deref().unwrap(),

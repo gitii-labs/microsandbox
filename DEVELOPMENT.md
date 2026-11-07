@@ -194,6 +194,12 @@ The `examples/rust/*` projects are workspace members as well.
 
 ## Testing
 
+Run the CLI context tests and SDK backend-policy subprocess tests on a host
+without a machine-wide `managed.json`. They isolate user configuration and
+environment variables, but intentionally retain system policy. Use an unmanaged
+development machine or CI runner; do not remove an organization's policy to run
+tests. Rust SDK unit tests use injected policy fixtures to cover managed settings.
+
 Run all workspace tests:
 
 ```bash
@@ -323,6 +329,12 @@ The release workflow (`.github/workflows/release.yml`) will:
 9. Build and publish Docker images to GHCR
 10. Update the Homebrew tap and winget manifests
 11. Sync docs to Mintlify and refresh the npm lockfile on `main`
+
+### Recovering an unpublished release
+
+If runner retirement or another workflow issue blocks a tagged release before publication, merge the workflow fix to `main`, cancel the blocked run, and dispatch **Release** on `main` with `release_tag` set to the existing tag (for example, `v0.7.12`). Leave this input empty for a build-only run. Do not move or recreate the tag.
+
+Recovery requires an unpublished tag whose commit is already in `main` and whose workspace version matches its name. The workflow resolves that commit once, records it in the run summary, and pins every build and publication checkout to it. All platform builds, artifact checks, and the production SDK smoke test still gate publication. A GitHub release that already exists is rejected; partial publication after that point needs a separate recovery assessment. Post-release lockfile maintenance continues to target current `main`.
 
 ### npm publishing and provenance
 

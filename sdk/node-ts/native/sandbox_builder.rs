@@ -203,6 +203,14 @@ impl JsSandboxBuilder {
         Ok(self)
     }
 
+    /// Enable or disable nested virtualization for local sandboxes.
+    #[napi(js_name = "nestedVirt")]
+    pub fn nested_virt(&mut self, enabled: bool) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.nested_virt(enabled));
+        self
+    }
+
     /// Guest transparent huge-page policy selected at boot.
     #[napi(ts_args_type = "policy: 'always' | 'madvise' | 'never'")]
     pub fn thp(&mut self, policy: String) -> Result<&Self> {
@@ -492,6 +500,15 @@ impl JsSandboxBuilder {
     pub fn disable_network(&mut self) -> &Self {
         let prev = self.take_inner();
         self.inner = Some(prev.disable_network());
+        self
+    }
+
+    /// Enable TLS interception, preserving existing network and TLS settings.
+    /// Does not re-enable disabled networking. Later network() callbacks preserve settings unless changed.
+    #[napi(js_name = "interceptTls")]
+    pub fn intercept_tls(&mut self) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.intercept_tls());
         self
     }
 

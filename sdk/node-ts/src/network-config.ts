@@ -63,6 +63,12 @@ export interface NetworkRateLimiterConfig {
 /** Where in the HTTP request the secret value can be substituted. */
 export interface SecretSubstitution {
   readonly headers?: boolean;
+  /**
+   * When set and non-empty, restrict header substitution to these field
+   * names (for example `["authorization"]`). A placeholder in any other
+   * header is treated as a disabled location.
+   */
+  readonly headerFields?: readonly string[];
   readonly query?: boolean;
   readonly body?: boolean;
 }
@@ -99,6 +105,10 @@ export type OutboundProxy =
   | {
       readonly protocol: "http_connect";
       readonly address: string;
+      readonly credentials?: {
+        readonly username: string;
+        readonly password: SecretSource;
+      };
     }
   | {
       readonly protocol: "socks4";
@@ -131,6 +141,8 @@ export interface NetworkConfig {
   readonly tcpAcceptQueueSize?: number | null;
   /** Host-alias TCP ports routed only to host IPv4 loopback for either guest gateway family. */
   readonly hostAliasIpv4Ports?: readonly number[];
+  /** Set the active inbound TCP cap; zero is unlimited. Omitted uses the runtime default. */
+  readonly maxInboundTcpConnections?: number | null;
   readonly strict: boolean;
   readonly rateLimiter: NetworkRateLimiterConfig | null;
   readonly interface?: {
@@ -146,8 +158,8 @@ export interface NetworkConfig {
   /** Canonical proxy configuration for outbound connections. */
   readonly outboundProxy: OutboundProxy | null;
   /**
-   * HTTP denial responses are disabled by default. When enabled, denyMessage
-   * overrides the built-in body; `{host}` names the blocked hostname.
+   * Local HTTP denial responses use JSON by default. In JSON mode, networkDenyMessage and secretDenyMessage
+   * override their respective JSON messages without interpolation.
    */
-  readonly http: { readonly denyResponse: boolean; readonly denyMessage?: string | null };
+  readonly http: { readonly denyResponse: boolean; readonly denyResponseFormat: "text" | "json"; readonly denyMessage?: string | null; readonly networkDenyMessage?: string | null; readonly secretDenyMessage?: string | null };
 }
