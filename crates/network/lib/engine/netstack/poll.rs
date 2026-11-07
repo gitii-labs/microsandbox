@@ -534,7 +534,8 @@ pub fn smoltcp_poll_loop(
         }
 
         for (handle, dst) in conn_tracker.poll_connects(&mut sockets) {
-            let target = resolve_tcp_host_target(dst, config.gateway);
+            let target =
+                resolve_tcp_host_target(dst, config.gateway, &config.host_alias_ipv4_ports);
             let proxy = ResolvedOutboundProxy::select_for_destination(
                 &outbound_proxy,
                 dst,
