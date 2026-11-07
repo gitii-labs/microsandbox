@@ -147,7 +147,7 @@ impl WindowSizeRef {
     /// ChannelTx writes. Absolute updates are only valid at open confirmation.
     pub(crate) async fn replenish(&self, amount: u32) -> Result<(), Error> {
         self.value
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 n.checked_add(i64::from(amount))
                     .filter(|n| *n <= i64::from(u32::MAX))
             })
@@ -163,7 +163,7 @@ impl WindowSizeRef {
     pub(crate) fn debit(&self, bytes: usize) -> Result<(), Error> {
         let bytes = i64::try_from(bytes).map_err(|_| Error::Inconsistent)?;
         self.value
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(bytes))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(bytes))
             .map_err(|_| Error::Inconsistent)?;
         Ok(())
     }
@@ -174,7 +174,7 @@ impl WindowSizeRef {
         }
         let previous = self
             .value
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n > 0).then(|| n - n.min(i64::from(maximum)))
             })
             .ok()?;

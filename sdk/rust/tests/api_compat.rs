@@ -108,3 +108,56 @@ async fn rust_sandbox_fs_handle_api_stays_available(
 
     Ok(())
 }
+
+#[test]
+fn boot_error_reason_is_preserved_in_every_backend_build() {
+    use microsandbox::logs::{BootError, InitFailureReason};
+
+    for (wire, expected) in [
+        (
+            Some("user_not_found"),
+            Some(InitFailureReason::UserNotFound),
+        ),
+        (
+            Some("group_not_found"),
+            Some(InitFailureReason::GroupNotFound),
+        ),
+        (Some("future_reason"), Some(InitFailureReason::Unknown)),
+        (None, None),
+    ] {
+        let mut record = serde_json::json!({
+            "t": "2026-10-03T00:00:00Z",
+            "stage": "config",
+            "errno": null,
+            "message": "guest initialization failed",
+        });
+        if let Some(wire) = wire {
+            record["reason"] = wire.into();
+        }
+        let error: BootError = serde_json::from_value(record).unwrap();
+        assert_eq!(error.reason, expected);
+        let encoded = serde_json::to_value(&error).unwrap();
+        if wire.is_none() {
+            assert!(encoded.get("reason").is_none());
+        } else {
+            assert_eq!(encoded["reason"], serde_json::to_value(expected).unwrap());
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "cloud")]
+fn rust_modify_surface_is_available_on_cloud_builds() {
+    let _ = microsandbox::Sandbox::modify;
+    let _ = microsandbox::sandbox::SandboxHandle::modify;
+    let _ = microsandbox::SandboxModificationBuilder::dry_run;
+    let _ = microsandbox::SandboxModificationBuilder::apply;
+    let _: Option<microsandbox::SandboxModificationPlan> = None;
+    let not_confirmed = microsandbox::MicrosandboxError::ModificationNotConfirmed {
+        cause: "the running sandbox does not hold the secret".into(),
+    };
+    assert_eq!(
+        not_confirmed.to_string(),
+        "the change did not complete as asked: the running sandbox does not hold the secret"
+    );
+}

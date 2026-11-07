@@ -117,6 +117,8 @@ pub struct MountTable {
 }
 
 pub(super) struct TableState {
+    /// Per-child backend state budget, also used for children attached after device startup.
+    max_state_bytes: usize,
     pub(super) children: RwLock<Children>,
     /// Held shared by every device operation on a child. A mode switch or
     /// detach takes it exclusively before replying, so no operation that
@@ -161,6 +163,17 @@ impl MountTable {
         Self::default()
     }
 
+    /// Create an empty table with the given state budget for each child backend.
+    /// Both initial and later attachments retain this budget across table clones.
+    pub fn with_state_limit(bytes: usize) -> Self {
+        Self {
+            state: Arc::new(TableState {
+                max_state_bytes: bytes,
+                ..Default::default()
+            }),
+        }
+    }
+
     /// The device backend serving this table.
     pub fn filesystem(&self) -> MountTableFs {
         MountTableFs::new(self.clone())
@@ -187,7 +200,7 @@ impl MountTable {
             return Err(name_error(LINUX_EEXIST, &child.name, "is already attached"));
         }
 
-        let fs = open_child(&child)?;
+        let fs = open_child(&child, self.state.max_state_bytes)?;
         fs.set_readonly(child.readonly);
         // Registers the child's root inode. The negotiated options belong to
         // the table device; a child never enables writeback caching.
@@ -408,6 +421,7 @@ impl ChildFs {
 impl Default for TableState {
     fn default() -> Self {
         Self {
+            max_state_bytes: msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
             children: RwLock::default(),
             ops: RwLock::default(),
             writes: watch::channel(0).0,
@@ -421,7 +435,7 @@ impl Default for TableState {
 //--------------------------------------------------------------------------------------------------
 
 /// Open the backend for a child, by the type of its host path.
-fn open_child(child: &MountTableChild) -> io::Result<ChildFs> {
+fn open_child(child: &MountTableChild, max_state_bytes: usize) -> io::Result<ChildFs> {
     let open_error = |what: &str, error: io::Error| {
         io::Error::new(
             error.kind(),
@@ -465,6 +479,7 @@ fn open_child(child: &MountTableChild) -> io::Result<ChildFs> {
         }
     };
     let cfg = PassthroughConfig {
+        max_state_bytes,
         root_dir: child.host_path.clone(),
         no_symlink_root: true,
         stat_virtualization: child.stat_virtualization,

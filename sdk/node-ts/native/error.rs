@@ -33,7 +33,9 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         MicrosandboxError::RuntimeNotInstalled(_) => "RuntimeNotInstalled",
         MicrosandboxError::RuntimeIncomplete(_) => "RuntimeIncomplete",
         MicrosandboxError::Database(_) => "Database",
-        MicrosandboxError::InvalidConfig(_) => "InvalidConfig",
+        MicrosandboxError::InvalidConfig(_) | MicrosandboxError::MissingRestoreBindings { .. } => {
+            "InvalidConfig"
+        }
         MicrosandboxError::NoDefaultCommand => "NoDefaultCommand",
         MicrosandboxError::SandboxNotFound(_) => "SandboxNotFound",
         MicrosandboxError::SandboxAlreadyExists(_) => "SandboxAlreadyExists",
@@ -81,6 +83,7 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         MicrosandboxError::MissedRotation { .. } => "MissedRotation",
         MicrosandboxError::InvalidCursor(_) => "InvalidCursor",
         MicrosandboxError::Unsupported { .. } => "Unsupported",
+        MicrosandboxError::ModificationNotConfirmed { .. } => "ModificationNotConfirmed",
         MicrosandboxError::Custom(_) => "Custom",
     }
 }
@@ -91,7 +94,19 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use microsandbox::RestoreKind;
+
     use super::*;
+
+    #[test]
+    fn missing_restore_bindings_keep_the_invalid_config_code() {
+        let error = MicrosandboxError::MissingRestoreBindings {
+            missing: vec!["mount /data".into()],
+            restore: RestoreKind::Disk,
+        };
+
+        assert_eq!(error_type_str(&error), "InvalidConfig");
+    }
 
     #[test]
     fn source_recovery_error_preserves_structured_native_payload() {
@@ -118,5 +133,18 @@ mod tests {
         );
         assert!(payload["recovery"]["artifact"].is_null());
         assert_eq!(payload["recovery"]["publication_error"], "disk full");
+    }
+
+    #[test]
+    fn modification_not_confirmed_preserves_code_and_message() {
+        let error = MicrosandboxError::ModificationNotConfirmed {
+            cause: "the running sandbox does not hold the secret".into(),
+        };
+
+        assert_eq!(error_type_str(&error), "ModificationNotConfirmed");
+        assert_eq!(
+            error.to_string(),
+            "the change did not complete as asked: the running sandbox does not hold the secret"
+        );
     }
 }

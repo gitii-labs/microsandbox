@@ -39,15 +39,18 @@ fn main() {
     let (bootstrap, mut boot_console) = match agent::receive_bootstrap(&port) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("agentd: bootstrap receive failed: {e}");
-            process::exit(1);
+            exit_startup_failure(
+                &port,
+                &mut agent::BootConsoleState::default(),
+                "bootstrap receive",
+                &e,
+            );
         }
     };
     let (mut boot, mut config) = match BootParams::from_bootstrap(bootstrap) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("agentd: bootstrap validation failed: {e}");
-            process::exit(1);
+            exit_startup_failure(&port, &mut boot_console, "bootstrap validation", &e);
         }
     };
     config.install_default_env();
@@ -62,8 +65,7 @@ fn main() {
     if let Err(e) = init::init(boot, || {
         agent::report_init_context(&port, &mut boot_console, config.user())
     }) {
-        eprintln!("agentd: init failed: {e}");
-        process::exit(1);
+        exit_startup_failure(&port, &mut boot_console, "init", &e);
     }
     let init_time_ns = clock::boottime_ns() - init_start;
 
@@ -75,23 +77,24 @@ fn main() {
             // init it is waiting to see in /proc/1 when a shutdown arrives.
             Ok(cmd) => config.set_handoff_init_path(cmd),
             Err(e) => {
-                eprintln!("agentd: handoff failed: {e}");
-                process::exit(1);
+                exit_startup_failure(&port, &mut boot_console, "handoff", &e);
             }
         }
     }
 
     // Phase 2: Build a single-threaded tokio runtime and run the agent loop.
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("agentd: failed to build tokio runtime");
+    {
+        Ok(rt) => rt,
+        Err(e) => exit_startup_failure(&port, &mut boot_console, "async runtime setup", &e.into()),
+    };
 
     let bulk_port = match agent::open_and_bind_bulk_port() {
         Ok(port) => port,
         Err(e) => {
-            eprintln!("agentd: bulk transport binding failed: {e}");
-            process::exit(1);
+            exit_startup_failure(&port, &mut boot_console, "bulk transport binding", &e);
         }
     };
 
@@ -116,4 +119,19 @@ fn main() {
     });
 
     process::exit(0);
+}
+
+#[cfg(target_os = "linux")]
+fn exit_startup_failure(
+    port: &std::fs::File,
+    boot_console: &mut agent::BootConsoleState,
+    stage: &str,
+    error: &AgentdError,
+) -> ! {
+    let message = format!("{stage} failed: {error}");
+    eprintln!("agentd: {message}");
+    if let Err(report_error) = agent::report_init_failure(port, boot_console, &message, error) {
+        eprintln!("agentd: could not report startup failure: {report_error}");
+    }
+    process::exit(1);
 }

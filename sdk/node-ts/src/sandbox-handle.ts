@@ -1,6 +1,8 @@
+import { Job, JobListBuilder, jobCall, jobPageFromJson, type JobPage } from "./jobs.js";
 import { remapKeysToCamel } from "./internal/config.js";
 import { mapNapiError, withMappedErrors } from "./internal/error-mapping.js";
-import { validateStopTimeout } from "./internal/stop.js";
+import { validateTimeoutMs } from "./internal/stop.js";
+import { forkMountBuilders } from "./internal/fork-volumes.js";
 import {
   compactionResultFromJson,
   type DiskCompactionOptions,
@@ -9,6 +11,7 @@ import {
 import {
   modificationPlanFromJson,
   modifyOptionsToNapi,
+  requireModifyCapabilities,
   type ModifyOptions,
   type SandboxModificationPlan,
 } from "./modify.js";
@@ -30,6 +33,7 @@ import {
 } from "./logs.js";
 import {
   Sandbox,
+  type ForkOptions,
   type SandboxPingResult,
   type SandboxTouchResult,
 } from "./sandbox.js";
@@ -51,6 +55,13 @@ export type RestartOptions = NapiSandboxRestartOptions;
 export type DestroyOptions = NapiSandboxDestroyOptions;
 
 export class SandboxHandle {
+  async getJob(id: string): Promise<Job> { return new Job(await jobCall(() => this.inner.getJob(id))); }
+  async listJobs(): Promise<JobPage> { return this.listJobsWith(b => b); }
+  async listJobsWith(configure: (b: JobListBuilder) => JobListBuilder): Promise<JobPage> {
+    const b = configure(new JobListBuilder());
+    return jobPageFromJson(await jobCall(() => this.inner.listJobs(b.includeAll, b.pageSize, b.after)));
+  }
+
   private readonly inner: NapiSandboxHandle;
   /** Sandbox name. Names are limited to 128 UTF-8 bytes. */
   readonly name: string;
@@ -122,6 +133,7 @@ export class SandboxHandle {
    * computed without applying anything.
    */
   async modify(opts?: ModifyOptions): Promise<SandboxModificationPlan> {
+    requireModifyCapabilities(opts);
     const raw = await withMappedErrors(() =>
       this.inner.modify(modifyOptionsToNapi(opts)),
     );
@@ -159,10 +171,11 @@ export class SandboxHandle {
   }
 
   /**
-   * Connect with an explicit timeout in milliseconds. Returns an error
-   * if the sandbox doesn't respond in this window.
+   * Connect with an integer timeout from 0 to 4294967295 milliseconds.
+   * Returns an error if the sandbox doesn't respond in this window.
    */
   async connectWithTimeout(timeoutMs: number): Promise<Sandbox> {
+    validateTimeoutMs(timeoutMs, "connect");
     const raw = await withMappedErrors(() =>
       this.inner.connectWithTimeout(timeoutMs),
     );
@@ -195,24 +208,30 @@ export class SandboxHandle {
   }
 
   /** @deprecated Use fork() for live execution duplication. */
-  async branch(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
+  async branch(name: string, options: ForkOptions = {}): Promise<Sandbox> {
     return this.fork(name, options);
   }
 
   /** @deprecated Use forkMany() for capture-once live duplication. */
-  async branchMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
+  async branchMany(names: string[], options: ForkOptions = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
     return this.forkMany(names, options);
   }
 
   /** Create an independent local CoW child without a durable full snapshot. */
-  async fork(name: string, options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<Sandbox> {
-    const child = await withMappedErrors(() => this.inner.fork(name, options.recordIntegrity, options.guestFlush));
+  async fork(name: string, options: ForkOptions = {}): Promise<Sandbox> {
+    const volumes = forkMountBuilders(options.volumes);
+    const child = await withMappedErrors(() => this.inner.fork(
+      name, options.recordIntegrity, options.guestFlush, volumes.length > 0 ? volumes : undefined,
+    ));
     return new Sandbox(child, name, false);
   }
 
   /** Capture once; return each named child's startup outcome in input order. */
-  async forkMany(names: string[], options: { recordIntegrity?: boolean; guestFlush?: import("./snapshot.js").GuestFlush } = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
-    const outcomes = await withMappedErrors(() => this.inner.forkMany(names, options.recordIntegrity, options.guestFlush));
+  async forkMany(names: string[], options: ForkOptions = {}): Promise<import("./sandbox.js").ForkOutcome[]> {
+    const volumes = forkMountBuilders(options.volumes);
+    const outcomes = await withMappedErrors(() => this.inner.forkMany(
+      names, options.recordIntegrity, options.guestFlush, volumes.length > 0 ? volumes : undefined,
+    ));
     return outcomes.map(o => o.sandbox
       ? { name: o.name, sandbox: new Sandbox(o.sandbox, o.name, false) }
       : { name: o.name, error: mapNapiError(new Error(o.error ?? "Child startup failed")) as Error });
@@ -237,7 +256,7 @@ export class SandboxHandle {
    * without killing. Zero expires before dispatch; a delivered request may finish later.
    */
   async stopWithTimeout(timeoutMs: number): Promise<void> {
-    validateStopTimeout(timeoutMs);
+    validateTimeoutMs(timeoutMs, "stop");
     await withMappedErrors(() => this.inner.stopWithTimeout(timeoutMs));
   }
 
@@ -249,7 +268,9 @@ export class SandboxHandle {
     await withMappedErrors(() => this.inner.requestKill());
   }
 
+  /** Force-kill with an integer observation timeout from 0 to 4294967295 milliseconds. */
   async killWithTimeout(timeoutMs: number): Promise<void> {
+    validateTimeoutMs(timeoutMs, "kill");
     await withMappedErrors(() => this.inner.killWithTimeout(timeoutMs));
   }
 

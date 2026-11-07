@@ -11,6 +11,7 @@ mod branch_batch;
 mod builder;
 #[cfg(feature = "local")]
 pub(crate) use builder::prepare_local_snapshot_restore;
+mod caller_config_overrides;
 #[cfg(feature = "cloud")]
 mod cloud;
 mod compact;
@@ -19,13 +20,16 @@ pub(crate) mod config;
 mod control_pipe;
 pub mod exec;
 #[cfg(feature = "local")]
+mod exit;
+#[cfg(feature = "local")]
 pub(crate) mod flat_rootfs;
 pub mod fs;
 mod handle;
 pub(crate) mod identity;
 pub mod init;
+pub mod jobs;
 pub(crate) mod metrics;
-#[cfg(feature = "local")]
+#[cfg(any(feature = "local", feature = "cloud"))]
 mod modify;
 #[cfg(feature = "local")]
 mod mount_table;
@@ -73,6 +77,8 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 #[cfg(feature = "local")]
 use microsandbox_image::progress_channel;
 
+#[cfg(feature = "local")]
+use crate::backend::local::creation::{CreationStorage, RemovalMode};
 use crate::{MicrosandboxResult, agent::AgentClient, backend::sandbox::SandboxIdentity};
 #[cfg(feature = "local")]
 use crate::{
@@ -124,12 +130,6 @@ pub(crate) use builder::{
     apply_checkpoint_restore_constraints, apply_snapshot_guest_clock, apply_snapshot_root_layout,
 };
 #[cfg(feature = "local")]
-pub(crate) use modify::control_checkpoint_create;
-#[cfg(feature = "local")]
-pub(crate) use modify::control_disk_checkpoint_create;
-#[cfg(feature = "local")]
-pub(crate) use modify::restore_requested_resources;
-#[cfg(feature = "local")]
 pub(crate) use patch::{apply_patches, build_flat_tree, build_upper_tree};
 #[cfg(all(feature = "local", windows))]
 pub(crate) use reap::reap_leaked_runtime_process;
@@ -151,6 +151,8 @@ pub use builder::{RegistryConfigBuilder, SandboxBuilder};
 pub use compact::{DiskCompactionBuilder, DiskCompactionDiskResult, DiskCompactionResult};
 pub use config::{SandboxConfig, SandboxConfigPatch};
 pub use exec::{ExecOptionsBuilder, ExecOutput, Rlimit, RlimitResource};
+#[cfg(feature = "local")]
+pub use exit::{SandboxRunExit, SandboxTerminationReason};
 pub use fs::{
     FsEntry, FsEntryKind, FsHandle, FsMetadata, FsOpenOptions, FsReadStream, FsSetAttrs,
     FsWriteSink, SandboxFsOps,
@@ -179,7 +181,7 @@ pub use microsandbox_network::policy::{
     Action as NetworkAction, NetworkPolicy, NetworkProfile, Rule as NetworkRule,
 };
 #[cfg(feature = "net")]
-pub use microsandbox_network::{OutboundProxy, Socks5Credentials};
+pub use microsandbox_network::{HttpConnectCredentials, OutboundProxy, Socks5Credentials};
 #[cfg(feature = "local")]
 pub use microsandbox_protocol::control::MountChange;
 #[cfg(feature = "local")]
@@ -188,9 +190,9 @@ pub use microsandbox_types::SandboxLogLevel as LogLevel;
 pub use microsandbox_types::{CpuPlacement, PullPolicy};
 #[cfg(feature = "net")]
 pub use microsandbox_types::{
-    DnsConfigPatch, HostPattern, HttpConfig, HttpConfigPatch, InterfaceOverridesPatch,
-    NetworkRateLimiterConfigPatch, SecretSubstitution, SecretViolationAction, SecretsConfigPatch,
-    TlsConfigPatch,
+    DnsConfigPatch, HostPattern, HttpConfig, HttpConfigPatch, HttpDenyResponseFormat,
+    InterfaceOverridesPatch, NetworkRateLimiterConfigPatch, SecretSubstitution,
+    SecretViolationAction, SecretsConfigPatch, TlsConfigPatch,
 };
 pub use microsandbox_types::{
     EnvVar, GuestClockPolicy, MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, NetworkSpec,
@@ -205,7 +207,6 @@ pub use microsandbox_types::{MintEndpoint, OAuthSecret};
 pub use microsandbox_types::{MountTableCache, MountTableChild, MountTableOwner, MountTableSpec};
 pub use microsandbox_types::{MountWriteCursor, MountWriteRevision, MountWrites};
 #[cfg(feature = "local")]
-pub(crate) use restore_builder::RestoreBootOverrides;
 pub use restore_builder::RestoreBuilder;
 
 #[cfg(feature = "local")]
@@ -213,14 +214,17 @@ mod external_mounts;
 mod restore_warnings;
 mod stop;
 #[cfg(feature = "local")]
-pub(crate) use external_mounts::resolve_external_mounts;
-#[cfg(feature = "local")]
+pub(crate) use external_mounts::{
+    external_bind_guest_paths, require_guest_mounts, require_recorded_mounts,
+    resolve_external_mounts,
+};
+#[cfg(any(feature = "local", feature = "cloud"))]
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
-    ModificationPolicy, ModificationWarning, PlannedChange, ResourceConvergenceState, ResourceKind,
-    ResourceResizeStatus, SandboxModificationBuilder, SandboxModificationPatch,
-    SandboxModificationPlan, SecretChangeKind, SecretModificationPatch, SecretPatchBuilder,
-    SecretPlannedChange, SecretSource,
+    ModificationPolicy, ModificationWarning, PlannedChange, PublishedPortKey,
+    ResourceConvergenceState, ResourceKind, ResourceResizeStatus, SandboxModificationBuilder,
+    SandboxModificationPatch, SandboxModificationPlan, SecretChangeKind, SecretModificationPatch,
+    SecretPatchBuilder, SecretPlannedChange, SecretSource,
 };
 #[cfg(feature = "ssh")]
 pub use ssh::{
@@ -450,12 +454,24 @@ impl Sandbox {
     /// Reuses the serialized sandbox config and pinned rootfs state without
     /// re-resolving the original OCI reference. Routes through the ambient
     /// [`default_backend`](crate::backend::default_backend).
+    ///
+    /// On a Cloud sandbox, a start is refused with
+    /// [`MicrosandboxError::CloudHttp`](crate::MicrosandboxError::CloudHttp) (409) while a
+    /// secret change to it is being saved, or while its result is not yet known after
+    /// [`MicrosandboxError::ModificationNotConfirmed`](crate::MicrosandboxError::ModificationNotConfirmed);
+    /// this usually clears within seconds. Start again after a short wait.
     pub async fn start(name: &str) -> MicrosandboxResult<Self> {
         let backend = crate::backend::default_backend();
         backend.sandboxes().start(backend.clone(), name).await
     }
 
     /// Start an existing sandbox in detached/background mode.
+    ///
+    /// On a Cloud sandbox, a start is refused with
+    /// [`MicrosandboxError::CloudHttp`](crate::MicrosandboxError::CloudHttp) (409) while a
+    /// secret change to it is being saved, or while its result is not yet known after
+    /// [`MicrosandboxError::ModificationNotConfirmed`](crate::MicrosandboxError::ModificationNotConfirmed);
+    /// this usually clears within seconds. Start again after a short wait.
     pub async fn start_detached(name: &str) -> MicrosandboxResult<Self> {
         let backend = crate::backend::default_backend();
         backend
@@ -690,14 +706,13 @@ impl Sandbox {
         &self.config
     }
 
-    /// Start planning a sandbox modification.
+    /// Start a sandbox modification.
     ///
-    /// The returned builder owns the canonical SDK patch and dry-run
-    /// classification logic. It does not apply changes until later modify
-    /// phases wire the same plan model into persistence and runtime control.
-    #[cfg(feature = "local")]
+    /// Returns a builder; `dry_run` plans the patch, `apply` applies it.
+    #[cfg(any(feature = "local", feature = "cloud"))]
     pub fn modify(&self) -> SandboxModificationBuilder {
         SandboxModificationBuilder::new(self.backend.clone(), self.name.clone())
+            .bound_to(self.identity())
     }
 
     /// Explicitly compact sealed backing layers of the root and sandbox-owned data disks.
@@ -1718,6 +1733,7 @@ pub(crate) fn validate_env(env: &[EnvVar]) -> MicrosandboxResult<()> {
                 var.key
             )));
         }
+        init::validate_env_pair("environment variable", &var.key, &var.value)?;
     }
     Ok(())
 }
@@ -1818,7 +1834,14 @@ pub(super) async fn remove_local_persisted_sandbox(
     // The runtime lock is the authoritative ownership proof. A numeric PID can remain visible
     // while an exited Unix child is waiting to be reaped, or can already identify an unrelated
     // process after PID reuse, so it must not override successful lock acquisition.
-    crate::runtime::remove_sandbox_socket_artifacts_for(local_backend, name)?;
+    if crate::backend::local::creation::pending(pools.write(), expected_id).await? {
+        return local_backend
+            .remove_incomplete_sandbox(expected_id, name, RemovalMode::Recovery)
+            .await;
+    }
+
+    let _storage = CreationStorage::acquire(local_backend, name)?;
+    local_backend.remove_socket_artifacts(name)?;
     remove_dir_if_exists(&local_backend.sandboxes_dir().join(name))?;
     sandbox_entity::Entity::delete_by_id(expected_id)
         .exec(pools.write())

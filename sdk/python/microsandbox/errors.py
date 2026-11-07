@@ -40,6 +40,11 @@ class CloudHttpError(MicrosandboxError):
     code = "cloud-http"
 
 
+class ModificationNotConfirmedError(MicrosandboxError):
+    """A Cloud change did not complete as asked: saved but not in effect, or result unknown."""
+    code = "modification-not-confirmed"
+
+
 class SandboxNotFoundError(MicrosandboxError):
     """Sandbox does not exist."""
     code = "sandbox-not-found"
@@ -200,3 +205,12 @@ class SnapshotSourceRecoveryError(MicrosandboxError):
         self.artifact = PublishedSnapshotArtifact(**artifact) if artifact is not None else None
         self.detail = detail
         self.publication_error = publication_error
+
+
+class JobError(MicrosandboxError):
+    """Managed-job refusal or failure. An uncertain launch retains its recoverable ID."""
+
+    def __init__(self, code: str, message: str, job_id: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.job_id = job_id
