@@ -24,8 +24,8 @@
     "@microsandbox/types": "0.7.13"
   },
   "devDependencies": {
-    "@types/node": "^25.5.2",
-    "typescript": "^5.6",
-    "vitest": "^4.1.12"
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
   }
 }

@@ -55,12 +55,12 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json"
   },
   "devDependencies": {
-    "@types/node": "^25.5.2",
-    "typescript": "^5.6",
-    "vitest": "^5.0.5"
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
   },
   "dependencies": {
     "@microsandbox/protocol-client": "0.7.13",
-    "cbor-x": "^1.6.0"
+    "cbor-x": "^1.6.9"
   }
 }

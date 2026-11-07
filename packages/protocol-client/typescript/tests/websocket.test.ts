@@ -13,6 +13,20 @@ class Socket extends EventTarget {
 }
 
 describe("bounded browser byte transport", () => {
+  it("copies shared-backed slices into browser-compatible send buffers", async () => {
+    const socket = new Socket(), transport = new WebSocketTransport(socket.asWebSocket());
+    const shared = new Uint8Array(new SharedArrayBuffer(4));
+    shared.set([0, 1, 2, 0]);
+    let sent: Uint8Array | undefined;
+    socket.send = bytes => { sent = bytes; };
+    await transport.write(shared.subarray(1, 3));
+    expect(sent).toEqual(new Uint8Array([1, 2]));
+    expect(sent?.buffer).toBeInstanceOf(ArrayBuffer);
+    shared[1] = 9;
+    expect(sent).toEqual(new Uint8Array([1, 2]));
+    await transport.close();
+  });
+
   it("preserves fragmented/coalesced message bytes and EOF boundaries", async () => {
     const socket = new Socket(), transport = new WebSocketTransport(socket.asWebSocket());
     expect(socket.binaryType).toBe("arraybuffer");

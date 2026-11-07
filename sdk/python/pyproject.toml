@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.6"]
+requires = ["maturin>=1.16.0"]
 build-backend = "maturin"
 
 [project]
@@ -38,11 +38,11 @@ Issues = "https://github.com/superradcompany/microsandbox/issues"
 
 [dependency-groups]
 dev = [
-    "maturin>=1.6",
-    "pytest>=8",
-    "pytest-asyncio>=0.24",
-    "pytest-xdist>=3",
-    "ruff>=0.7",
+    "maturin>=1.16.0",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.17.4",
 ]
 
 [tool.uv]
