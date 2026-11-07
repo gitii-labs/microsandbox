@@ -2597,6 +2597,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_layout_initializes_fresh_storage_container() {
+        let temporary = tempfile::tempdir().unwrap();
+        let backend = crate::test_support::local_backend_builder(temporary.path())
+            .build()
+            .await
+            .unwrap();
+        let config = test_config("fresh");
+        let pools = backend.db().await.unwrap();
+        LocalBackend::insert_sandbox_record_impl(
+            pools.write(),
+            &config,
+            SandboxStatus::Starting,
+            true,
+        )
+        .await
+        .unwrap();
+        let storage = CreationStorage::acquire(&backend, &config.spec.name).unwrap();
+        assert!(!backend.sandboxes_dir().exists());
+
+        crate::runtime::protected_state::prepare(&backend, &config, &storage)
+            .await
+            .unwrap();
+
+        microsandbox_runtime::checkpoint::layout::require_ready(&storage.join("runtime")).unwrap();
+    }
+
+    #[tokio::test]
     async fn existing_name_fails_before_image_pull() {
         use crate::config::{GlobalConfigPatch, layers::BackendConfig};
         let temp = tempfile::Builder::new()
