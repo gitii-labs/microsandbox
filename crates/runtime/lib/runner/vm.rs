@@ -2678,7 +2678,7 @@ fn build_vm(
         }
         #[cfg(unix)]
         Some(spec) => {
-            let table = microsandbox_filesystem::MountTable::new();
+            let table = microsandbox_filesystem::MountTable::with_state_limit(vm.fs_state_limit());
             for child in &spec.children {
                 mount_table_child(child.clone())
                     .and_then(|child| table.attach(child))

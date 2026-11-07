@@ -218,6 +218,35 @@ fn errno<T>(result: io::Result<T>) -> i32 {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
+#[test]
+fn state_budget_reaches_initial_and_later_child_backends() {
+    let default_limit = msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES;
+    let configured_limit = default_limit / 2;
+    assert_ne!(configured_limit, default_limit);
+    for (table, expected_limit) in [
+        (MountTable::new(), default_limit),
+        (MountTable::with_state_limit(configured_limit), configured_limit),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = std::fs::canonicalize(dir.path()).unwrap();
+        table.attach(child("initial", &host, false)).unwrap();
+        let fs = table.filesystem();
+        fs.init(FsOptions::empty()).unwrap();
+
+        // The runtime's control handler retains a clone after device startup.
+        let live_control = fs.table().clone();
+        live_control.attach(child("later", &host, false)).unwrap();
+
+        for name in ["initial", "later"] {
+            let child = table.child_by_name(name).unwrap();
+            let table::ChildFs::Directory(backend) = &child.fs else {
+                panic!("directory attachment must use a passthrough backend");
+            };
+            assert_eq!(backend.max_state_bytes(), expected_limit, "{name}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn mutation_revisions_cover_repeated_held_writes_and_reconnect() {
     tokio::time::timeout(Duration::from_secs(5), async {
