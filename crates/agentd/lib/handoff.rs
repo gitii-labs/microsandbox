@@ -50,6 +50,12 @@ use crate::error::{AgentdError, AgentdResult};
 /// created in `init::init` (see `create_run_dir`).
 const POST_HANDOFF_STDERR: &str = "/run/microsandbox/agentd.log";
 
+/// Status file that reports which signals PID 1 handles.
+const INIT_STATUS_PATH: &str = "/proc/1/status";
+
+/// File name of the multi-call binary that provides BusyBox init.
+const BUSYBOX_NAME: &str = "busybox";
+
 /// Directories searched for `systemctl` when `PATH` does not resolve it.
 /// agentd runs with whatever environment the VMM handed it, which on a
 /// handoff boot may carry no `PATH` at all.
@@ -120,8 +126,8 @@ const SYSTEMD_CONTROL_POLL: std::time::Duration = std::time::Duration::from_mill
 /// The worst case on this path is every step of it, because the generic route
 /// hands over to the systemd one when PID 1 turns out to have been on its way
 /// there: three seconds here, then [`GENERIC_SIGNAL_WINDOW`], then
-/// [`SYSTEMD_CONTROL_WAIT`] and [`SYSTEMD_POWEROFF_CALL_TIMEOUT`]: 3 + 2 + 10 +
-/// 10 is 25, and systemd's own ninety-second stop deadline after it makes 115
+/// [`SYSTEMD_CONTROL_WAIT`] and [`SYSTEMD_POWEROFF_CALL_TIMEOUT`]: 3 + 5 + 10 +
+/// 10 is 28, and systemd's own ninety-second stop deadline after it makes 118
 /// of the host's 120 — which `MSB_SHUTDOWN_FLUSH_TIMEOUT_MS` can shorten
 /// without agentd knowing.
 const INIT_EXEC_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -138,7 +144,7 @@ const INIT_EXEC_POLL: std::time::Duration = std::time::Duration::from_millis(10)
 /// so a single signal at that moment is a signal thrown away. Repeating is
 /// free: a guest that took the first one is already on its way down and its
 /// agentd goes with it, and a handler installed later catches the next.
-const GENERIC_SIGNAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+const GENERIC_SIGNAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often that route repeats itself, within the window above.
 const GENERIC_SIGNAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -201,6 +207,9 @@ pub(crate) struct InitPaths {
     /// The symlink to the program PID 1 is running.
     exe: PathBuf,
 
+    /// Signal handlers and blocked signals installed by PID 1.
+    status: PathBuf,
+
     /// systemd's runtime directory, read only when the program cannot be.
     runtime_dir: PathBuf,
 }
@@ -226,6 +235,7 @@ impl InitPaths {
         Self {
             comm: PathBuf::from(PID_1_COMM),
             exe: PathBuf::from(PID_1_EXE),
+            status: PathBuf::from(INIT_STATUS_PATH),
             runtime_dir: PathBuf::from(SYSTEMD_RUNTIME_DIR),
         }
     }
@@ -600,9 +610,8 @@ fn is_executable_file(path: &Path) -> bool {
 /// systemd's control client belongs to the image: it knows its manager's
 /// shutdown protocol independently of agentd's libc, so `systemctl` is the
 /// route taken whenever the manager can be reached. Every other init keeps the
-/// realtime-signal contract agentd defines in its own terms — which today is
-/// `crates/testing/init`'s contract, not a universal one: busybox init, for
-/// instance, reads SIGUSR2 as poweroff and would need its own arm.
+/// signal selected from its handlers: BusyBox uses SIGUSR2, other inits may
+/// handle SIGTERM, and the workspace's test init uses the realtime contract.
 pub async fn signal_init_shutdown(handoff_init: Option<&Path>) -> AgentdResult<()> {
     let pid_1 = InitPaths::pid_1();
     let route = shutdown_route(handoff_init, &pid_1, INIT_EXEC_WAIT).await;
@@ -694,10 +703,21 @@ pub(crate) async fn signal_generic_init(
     pid_1: &InitPaths,
     send: impl Fn(i32) -> AgentdResult<()>,
 ) -> AgentdResult<GenericOutcome> {
-    let signal = generic_init_poweroff_signal();
     let deadline = tokio::time::Instant::now() + GENERIC_SIGNAL_WINDOW;
     let mut asked = false;
     loop {
+        let handled = std::fs::read_to_string(&pid_1.status)
+            .ok()
+            .and_then(|status| parse_handled_signals(&status));
+        let init_is_busybox = std::fs::read_link(&pid_1.exe)
+            .is_ok_and(|exe| exe.file_name() == Some(BUSYBOX_NAME.as_ref()));
+        let signal = select_init_shutdown_signal(
+            handled,
+            init_is_busybox,
+            generic_init_poweroff_signal(),
+        );
+        // Read the route after inspecting handlers: a wrapper may exec systemd during
+        // those reads, and the generic realtime number can mean reboot to systemd.
         if pid_1.route() == ShutdownRoute::Systemd {
             return Ok(GenericOutcome::BecameSystemd);
         }
@@ -709,6 +729,10 @@ pub(crate) async fn signal_generic_init(
             // what the signal before it asked for.
             Err(error) if !asked => return Err(error),
             Err(_) => return Ok(GenericOutcome::Asked),
+        }
+        // PID 1 accepts this request; do not repeat an already delivered shutdown.
+        if handled.is_some_and(|mask| handles_signal(mask, signal)) {
+            return Ok(GenericOutcome::Asked);
         }
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -903,6 +927,7 @@ fn signal_pid_1(signum: i32) -> AgentdResult<()> {
     if ret != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+
     Ok(())
 }
 
@@ -929,6 +954,43 @@ async fn wait_for_control_socket(path: &Path, timeout: std::time::Duration) -> b
     }
 }
 
+/// Reads the signals a process catches or blocks from `/proc/<pid>/status` text.
+fn parse_handled_signals(status: &str) -> Option<u64> {
+    let mask = |field: &str| {
+        let value = status.lines().find_map(|line| line.strip_prefix(field))?;
+        u64::from_str_radix(value.trim(), 16).ok()
+    };
+
+    Some(mask("SigCgt:")? | mask("SigBlk:")?)
+}
+
+/// Whether a signal mask includes `signal`. Bit zero of the mask is signal 1.
+fn handles_signal(handled: u64, signal: libc::c_int) -> bool {
+    (1..=64).contains(&signal) && handled & (1 << (signal - 1)) != 0
+}
+
+/// Chooses the shutdown request for PID 1.
+///
+/// BusyBox init is matched by name because `/proc` hides the signals it is waiting for in
+/// `sigtimedwait`. Anything else unknown keeps the default request.
+fn select_init_shutdown_signal(
+    handled: Option<u64>,
+    init_is_busybox: bool,
+    default_signal: libc::c_int,
+) -> libc::c_int {
+    let handles = |signal| handled.is_some_and(|mask| handles_signal(mask, signal));
+
+    if handles(default_signal) {
+        default_signal
+    } else if init_is_busybox {
+        libc::SIGUSR2
+    } else if handles(libc::SIGTERM) {
+        libc::SIGTERM
+    } else {
+        default_signal
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -946,6 +1008,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp test dir");
         dir
+    }
+
+    const RT_SHUTDOWN: libc::c_int = 39;
+
+    fn mask(signals: &[libc::c_int]) -> u64 {
+        signals
+            .iter()
+            .fold(0, |mask, signal| mask | 1 << (signal - 1))
+    }
+
+    #[test]
+    fn parses_handled_signals_from_proc_status() {
+        // Taken from a running systemd, which blocks its shutdown signals and reads them from
+        // a signalfd, so they appear in SigBlk rather than SigCgt.
+        let status = "Name:\tsystemd\nSigBlk:\t7fe3c0fe28014a03\nSigCgt:\t00000000000004ec\n";
+
+        let handled = parse_handled_signals(status).unwrap();
+
+        assert!(handles_signal(handled, RT_SHUTDOWN));
+        assert!(handles_signal(handled, libc::SIGTERM));
+        assert!(!handles_signal(handled, libc::SIGSTOP));
+    }
+
+    #[test]
+    fn rejects_unreadable_proc_status() {
+        assert_eq!(parse_handled_signals("Name:\tinit\n"), None);
+        assert_eq!(parse_handled_signals("SigBlk:\t0\n"), None);
+        assert_eq!(
+            parse_handled_signals("SigBlk:\t0\nSigCgt:\tnot-hex\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_starting_init_cannot_receive_shutdown_signals() {
+        let status = "SigBlk:\t0000000000000000\nSigCgt:\t0000000000000000\n";
+
+        let handled = parse_handled_signals(status).unwrap();
+
+        assert!(!handles_signal(handled, RT_SHUTDOWN));
+        assert_eq!(
+            select_init_shutdown_signal(Some(handled), false, RT_SHUTDOWN),
+            RT_SHUTDOWN
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_signals() {
+        assert!(!handles_signal(u64::MAX, 0));
+        assert!(!handles_signal(u64::MAX, 65));
+    }
+
+    #[test]
+    fn shutdown_keeps_the_default_signal_for_inits_that_handle_it() {
+        let handled = mask(&[libc::SIGTERM, libc::SIGUSR2, RT_SHUTDOWN]);
+
+        assert_eq!(
+            select_init_shutdown_signal(Some(handled), false, RT_SHUTDOWN),
+            RT_SHUTDOWN
+        );
+        assert_eq!(
+            select_init_shutdown_signal(Some(handled), true, RT_SHUTDOWN),
+            RT_SHUTDOWN
+        );
+    }
+
+    #[test]
+    fn shutdown_uses_poweroff_signal_for_busybox_init() {
+        // Taken from a running BusyBox init, which only installs a handler for SIGTSTP.
+        let handled = mask(&[libc::SIGTSTP]);
+
+        assert_eq!(
+            select_init_shutdown_signal(Some(handled), true, RT_SHUTDOWN),
+            libc::SIGUSR2
+        );
+        assert_eq!(
+            select_init_shutdown_signal(None, true, RT_SHUTDOWN),
+            libc::SIGUSR2
+        );
+    }
+
+    #[test]
+    fn shutdown_uses_sigterm_for_other_inits_that_handle_it() {
+        let handled = mask(&[libc::SIGTERM, libc::SIGUSR2]);
+
+        assert_eq!(
+            select_init_shutdown_signal(Some(handled), false, RT_SHUTDOWN),
+            libc::SIGTERM
+        );
+    }
+
+    #[test]
+    fn shutdown_keeps_the_default_signal_when_init_handlers_are_unknown() {
+        assert_eq!(
+            select_init_shutdown_signal(None, false, RT_SHUTDOWN),
+            RT_SHUTDOWN
+        );
+        assert_eq!(
+            select_init_shutdown_signal(Some(0), false, RT_SHUTDOWN),
+            RT_SHUTDOWN
+        );
     }
 
     #[test]
@@ -1187,6 +1350,7 @@ mod tests {
         InitPaths {
             comm: dir.join("comm"),
             exe: dir.join("exe"),
+            status: dir.join("status"),
             // Absent unless a test makes it, like a guest with no systemd.
             runtime_dir: dir.join("run-systemd"),
         }
@@ -1431,6 +1595,40 @@ mod tests {
         let asked = sent.load(std::sync::atomic::Ordering::SeqCst);
         assert!(asked > 1, "asked {asked} times, so it never repeated");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Signal selection applies to the actual generic shutdown path, not just the selector.
+    #[tokio::test]
+    async fn generic_shutdown_uses_init_handlers_and_stops_after_delivery() {
+        for (program, signals, expected) in [
+            ("busybox", vec![libc::SIGUSR2], libc::SIGUSR2),
+            ("tini", vec![libc::SIGTERM], libc::SIGTERM),
+            (
+                "test-init",
+                vec![generic_init_poweroff_signal()],
+                generic_init_poweroff_signal(),
+            ),
+        ] {
+            let dir = unique_test_dir(program);
+            let pid_1 = init_paths(&dir);
+            write_atomically(&pid_1.comm, program);
+            point_exe_at(&pid_1.exe, &dir.join(program));
+            write_atomically(
+                &pid_1.status,
+                &format!("SigBlk:\t0\nSigCgt:\t{:016x}\n", mask(&signals)),
+            );
+            let sent = std::sync::atomic::AtomicUsize::new(0);
+            let outcome = signal_generic_init(&pid_1, |signal| {
+                assert_eq!(signal, expected);
+                sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(outcome, GenericOutcome::Asked);
+            assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// A PID 1 that turns out to be systemd part way through is handed over,
