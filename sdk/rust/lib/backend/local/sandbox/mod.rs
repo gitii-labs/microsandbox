@@ -2267,22 +2267,40 @@ mod tests {
         drop(transition);
         #[cfg(unix)]
         {
+            let original = sandbox_entity::Entity::find_by_id(id)
+                .one(pools.read()).await.unwrap().unwrap();
+            assert_eq!(original.status, SandboxStatus::Starting);
+            assert!(LocalBackend::load_latest_run(pools.read(), id).await.unwrap().is_none());
+            let storage = backend.sandboxes_dir().join("abandoned");
+            std::fs::create_dir_all(&storage).unwrap();
+            let marker = storage.join("pending-restore");
+            std::fs::write(&marker, b"child-owned state").unwrap();
             let socket =
                 RuntimeSocketPaths::new(&backend.config().run_dir(), "abandoned").legacy_agent;
             std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
             let listener = UnixListener::bind(&socket).unwrap();
-            assert_eq!(
-                backend
-                    .sandbox_handle_state("abandoned", Some(id))
-                    .await
-                    .unwrap()
-                    .0
-                    .status,
-                SandboxStatus::Starting
-            );
+            let result = backend.sandbox_handle_state("abandoned", Some(id)).await;
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                // This listener has no catalog PID. Preserve unknown ownership as an
+                // inspection failure, not a fabricated live runtime or permission to reap.
+                let error = result.expect_err("unknown runtime ownership must refuse reconciliation");
+                let crate::MicrosandboxError::Io(error) = error else {
+                    panic!("unknown runtime ownership must fail inspection: {error}");
+                };
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                assert_eq!(error.to_string(), "live runtime endpoint has no matching catalog process");
+            } else {
+                assert_eq!(result.unwrap().0.status, SandboxStatus::Starting);
+            }
+            let preserved = sandbox_entity::Entity::find_by_id(id)
+                .one(pools.read()).await.unwrap().unwrap();
+            assert_eq!(preserved.status, SandboxStatus::Starting);
+            assert_eq!(preserved.config, original.config);
+            assert!(LocalBackend::load_latest_run(pools.read(), id).await.unwrap().is_none());
+            assert_eq!(std::fs::read(&marker).unwrap(), b"child-owned state");
             assert!(
                 socket.exists(),
-                "reconciliation must preserve the live legacy endpoint"
+                "reconciliation must preserve the live unowned endpoint"
             );
             drop(listener);
             // macOS may defer teardown while a probe connection is queued.
