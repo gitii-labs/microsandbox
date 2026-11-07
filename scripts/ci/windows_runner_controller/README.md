@@ -33,7 +33,7 @@ The timer stores credential-free leases in a private blob container. Completed, 
 
 Provision a dedicated worker resource group and subnet with the isolation above, plus a separate control-plane resource group. The Function's system-assigned identity needs Virtual Machine Contributor and Network Contributor only on the worker group, Key Vault Secrets User only on its vault, and access to its own private lease storage. Prepared images additionally require Reader on their private gallery; the controller must not receive image-publishing permissions. Workers receive no identity. Do not grant the Function permissions over unrelated VMs or production networks.
 
-Use Python 3.12, Functions v4, a monitored timer, and `host.json` from this folder. There is no HTTP trigger. Dependencies and installer hashes are pinned; update them through review before GitHub retires the runner version. Create a source package with:
+Use Python 3.13 or newer, Functions v4, a monitored timer, and `host.json` from this folder. There is no HTTP trigger. Dependencies and installer hashes are pinned; update them through review before GitHub retires the runner version. Create a source package with:
 
 ```sh
 python3 scripts/ci/windows_runner_controller/package.py /tmp/windows-ci-controller.zip

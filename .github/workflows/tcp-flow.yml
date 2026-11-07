@@ -11,10 +11,10 @@ jobs:
   guest-protocol:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.99.1
           components: rustfmt
       - run: cargo test --locked -p microsandbox-agentd -p microsandbox-protocol
       - run: rustfmt --edition 2024 --check crates/agentd/lib/tcp.rs crates/agentd/lib/agent.rs crates/protocol/lib/tcp.rs crates/protocol/lib/message.rs
@@ -22,13 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.99.1
           components: rustfmt, clippy
       - run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev libelf-dev pkg-config
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-on-failure: true
@@ -66,9 +66,9 @@ jobs:
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib queued_reservations_survive
       - run: cargo test --locked --manifest-path vendor/russh/Cargo.toml --lib channels::tests
       - run: cargo check --locked --manifest-path sdk/go/native/Cargo.toml
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: "26.13.0"
       - name: Check Node host-alias builders against the checkout native binding
         working-directory: sdk/node-ts
         run: |
@@ -76,8 +76,9 @@ jobs:
           npm run build:native:debug
           npm run build:ts
           npx vitest run tests/unit/builders.test.ts -t 'port-scoped host-alias'
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
+          python-version: "3.15.0"
           enable-cache: true
           cache-dependency-glob: sdk/python/uv.lock
       - name: Check Python host-alias configuration against the checkout native binding
@@ -98,7 +99,7 @@ jobs:
       LIBKRUNFW_ABI: "5"
       MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}/build
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Require KVM on the Linux runner
         run: |
           if [ ! -c /dev/kvm ]; then
@@ -107,15 +108,15 @@ jobs:
           fi
           sudo chmod a+rw /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.99.1
           targets: x86_64-unknown-linux-musl
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           cache: false
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: host-alias-live
           cache-bin: false
@@ -129,7 +130,7 @@ jobs:
           echo "sha=$(git rev-parse HEAD:vendor/libkrunfw)" >> "$GITHUB_OUTPUT"
       - name: Cache the candidate firmware
         id: kernel
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
           key: host-alias-kernel-linux-x86_64-${{ steps.firmware.outputs.sha }}
@@ -182,7 +183,7 @@ jobs:
           grep -F -- '--- PASS: TestHostAliasIPv4PortsBothGuestFamilies (' "$RUNNER_TEMP/host-alias-go.log"
       - name: Upload focused guest-test logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: host-alias-live-logs
           path: |
@@ -195,7 +196,7 @@ jobs:
       run:
         working-directory: sdk/go
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
@@ -211,10 +212,10 @@ jobs:
       run:
         working-directory: packages
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: "26.13.0"
       - run: npm ci
       - run: npm run build -w @microsandbox/types && npm run build -w @microsandbox/protocol-client
       - run: npm run typecheck -w @microsandbox/agent-client

@@ -110,7 +110,7 @@ export class WebSocketTransport implements ByteTransport {
       await this.changed(4);
     }
     this.checkWritable();
-    this.socket.send(bytes);
+    this.socket.send(new Uint8Array(bytes));
     while (this.socket.bufferedAmount > 0) {
       this.checkWritable();
       await this.changed(4);

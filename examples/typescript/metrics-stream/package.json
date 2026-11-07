@@ -10,6 +10,6 @@
     "microsandbox": "file:../../../sdk/node-ts"
   },
   "devDependencies": {
-    "tsx": "^4"
+    "tsx": "^4.23.15"
   }
 }

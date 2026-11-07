@@ -26,7 +26,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/microsandbox/extconf.rb"]
   # Required while installing the source gem: extconf.rb loads rb_sys/mkmf.
-  spec.add_runtime_dependency "rb_sys", "~> 0.9"
-  spec.add_development_dependency "rake-compiler", "~> 1.2"
-  spec.add_development_dependency "test-unit", "~> 3.6"
+  spec.add_runtime_dependency "rb_sys", "~> 0.9", ">= 0.9.130"
+  spec.add_development_dependency "rake-compiler", "~> 1.3", ">= 1.3.3"
+  spec.add_development_dependency "test-unit", "~> 3.7", ">= 3.7.8"
 end
