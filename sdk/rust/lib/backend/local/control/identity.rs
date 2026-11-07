@@ -1,11 +1,13 @@
 //! OS identity without any new runtime handshake field or persisted schema.
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(not(target_os = "macos"))]
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
@@ -13,6 +15,8 @@ use std::path::{Path, PathBuf};
 #[cfg(not(any(target_os = "macos", windows)))]
 use microsandbox_control_client::ErrorKind;
 use microsandbox_control_client::{ClientError, ControlClientError, ControlClientResult};
+#[cfg(target_os = "macos")]
+use sea_orm::sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{FILETIME, WAIT_TIMEOUT},
@@ -41,21 +45,19 @@ pub(in crate::backend::local) struct ProcessIdentity {
 
 /// Identity of the catalog file a backend opened.
 ///
-/// On Unix the identity comes from `stat` on the path and never from an open
-/// descriptor. Closing any descriptor of a file drops every POSIX record lock
-/// the process holds on that file, including SQLite's: a later connection close
-/// in another process then takes itself for the last one and deletes the WAL
-/// index while this process still uses it. Idle pool connections close, so an
-/// unlinked catalog's inode number may be reused; the birth time, where the
-/// filesystem records one, tells such a replacement apart.
+/// Retain the catalog object so an unlinked inode or file ID cannot be reused.
+/// Linux uses an O_PATH descriptor, macOS a SQLite-managed connection, and Windows
+/// a file handle. An ordinary Unix descriptor would release SQLite's POSIX locks
+/// when closed; identity checks must not open and close one behind SQLite.
 pub(in crate::backend::local) struct DatabaseIdentity {
     path: PathBuf,
     id: (u64, u64, u64),
-    // Windows file IDs are read through a handle. Keep the original handle so an
-    // unlinked file ID cannot be recycled and mistaken for this backend's database.
-    // Windows locks belong to a handle, so this handle never affects SQLite's.
-    #[cfg(windows)]
+    // Keep the original object alive so an unlinked inode/file ID cannot be
+    // recycled and mistaken for this backend's database.
+    #[cfg(not(target_os = "macos"))]
     _file: File,
+    #[cfg(target_os = "macos")]
+    _connection: SqliteConnection,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -182,40 +184,50 @@ impl ProcessIdentity {
 }
 
 impl DatabaseIdentity {
-    pub fn capture(path: impl AsRef<Path>) -> ControlClientResult<Self> {
+    pub async fn capture(path: impl AsRef<Path>) -> ControlClientResult<Self> {
         let path = path.as_ref().to_owned();
-        #[cfg(unix)]
-        {
-            let id = path_id(&path).map_err(ClientError::from)?;
-            Ok(Self { path, id })
-        }
-        #[cfg(windows)]
-        {
-            let file = File::open(&path).map_err(ClientError::from)?;
+        #[cfg(target_os = "macos")]
+        let (id, connection) = {
+            let id = database_path_id(&path)?;
+            // SQLite coordinates descriptor teardown with its other connections.
+            // An idle pool connection could expire before this identity is dropped.
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true)
+                .create_if_missing(false);
+            let connection = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(|error| ClientError::from(std::io::Error::other(error)))?;
+            (id, connection)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (id, file) = {
+            let file = open_database_identity(&path).map_err(ClientError::from)?;
             let id = file_id(&file)?;
-            Ok(Self {
-                path,
-                id,
-                _file: file,
-            })
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = path;
-            Err(ClientError::new(ErrorKind::UnsupportedOperation).into())
-        }
+            (id, file)
+        };
+        let identity = Self {
+            path,
+            id,
+            #[cfg(target_os = "macos")]
+            _connection: connection,
+            #[cfg(not(target_os = "macos"))]
+            _file: file,
+        };
+        identity.verify()?;
+        Ok(identity)
     }
 
     pub fn verify(&self) -> ControlClientResult<()> {
         #[cfg(unix)]
-        let current = path_id(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
-        #[cfg(windows)]
+        let current =
+            database_path_id(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+        #[cfg(not(unix))]
         let current = {
-            let file = File::open(&self.path).map_err(|_| ControlClientError::RuntimeChanged)?;
+            let file = open_database_identity(&self.path)
+                .map_err(|_| ControlClientError::RuntimeChanged)?;
             file_id(&file)?
         };
-        #[cfg(not(any(unix, windows)))]
-        let current = return Err(ClientError::new(ErrorKind::UnsupportedOperation).into());
         if current != self.id {
             return Err(ControlClientError::RuntimeChanged);
         }
@@ -226,6 +238,33 @@ impl DatabaseIdentity {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(not(target_os = "macos"))]
+fn open_database_identity(path: &Path) -> std::io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        // Closing an ordinary descriptor releases this process's POSIX locks
+        // on the inode, including SQLite's locks on other descriptors. O_PATH
+        // pins the inode for replacement detection without participating in
+        // those locks, including when a retained identity is dropped.
+        File::options()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        File::open(path)
+    }
+}
+
+#[cfg(unix)]
+fn database_path_id(path: &Path) -> ControlClientResult<(u64, u64, u64)> {
+    // A raw open/close would release this process's SQLite locks. stat follows
+    // the same path without opening a descriptor; the retained file prevents reuse.
+    let metadata = std::fs::metadata(path).map_err(ClientError::from)?;
+    Ok((metadata.dev(), metadata.ino(), 0))
+}
 
 #[cfg(target_os = "linux")]
 fn linux_start(pid: i32) -> ControlClientResult<ProcessStart> {
@@ -319,31 +358,30 @@ fn windows_start(handle: &OwnedHandle) -> ControlClientResult<ProcessStart> {
     ))
 }
 
-#[cfg(unix)]
-fn path_id(path: &Path) -> std::io::Result<(u64, u64, u64)> {
-    let metadata = std::fs::metadata(path)?;
-    // Filesystems without a birth time report an error here on every call, so
-    // capture and verify both record zero and compare device and inode only.
-    let born = metadata
-        .created()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_nanos() as u64);
-    Ok((metadata.dev(), metadata.ino(), born))
-}
-
-#[cfg(windows)]
+#[cfg(not(target_os = "macos"))]
 fn file_id(file: &File) -> ControlClientResult<(u64, u64, u64)> {
-    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
-        return Err(ClientError::from(std::io::Error::last_os_error()).into());
+    #[cfg(unix)]
+    {
+        let metadata = file.metadata().map_err(ClientError::from)?;
+        Ok((metadata.dev(), metadata.ino(), 0))
     }
-    let info = unsafe { info.assume_init() };
-    Ok((
-        u64::from(info.dwVolumeSerialNumber),
-        u64::from(info.nFileIndexHigh),
-        u64::from(info.nFileIndexLow),
-    ))
+    #[cfg(windows)]
+    {
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(ClientError::from(std::io::Error::last_os_error()).into());
+        }
+        let info = unsafe { info.assume_init() };
+        Ok((
+            u64::from(info.dwVolumeSerialNumber),
+            u64::from(info.nFileIndexHigh),
+            u64::from(info.nFileIndexLow),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(ClientError::new(ErrorKind::UnsupportedOperation).into())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -360,7 +398,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
 
-    use super::{ControlClientError, ProcessIdentity};
+    use super::{ControlClientError, DatabaseIdentity, ProcessIdentity};
 
     //--------------------------------------------------------------------------------------------------
     // Types
@@ -408,6 +446,27 @@ mod tests {
     //--------------------------------------------------------------------------------------------------
     // Tests
     //--------------------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn database_identity_retains_the_unlinked_inode_and_rejects_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.db");
+        std::fs::write(&path, []).unwrap();
+        let identity = DatabaseIdentity::capture(&path).await.unwrap();
+        identity.verify().unwrap();
+        let original = identity._file.metadata().unwrap();
+        assert_eq!(original.nlink(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(identity._file.metadata().unwrap().nlink(), 0);
+        std::fs::write(&path, []).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), original.ino());
+        assert!(matches!(identity.verify(), Err(ControlClientError::RuntimeChanged)));
+        let replacement = DatabaseIdentity::capture(&path).await.unwrap();
+        replacement.verify().unwrap();
+    }
 
     #[test]
     fn linux_process_identity_handles_parentheses_and_detects_exit() {
