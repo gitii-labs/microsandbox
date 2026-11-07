@@ -96,8 +96,8 @@ microsandbox-runtime = { version = "=0.7.13", path = "crates/runtime", default-f
 microsandbox-utils = { version = "=0.7.13", path = "crates/utils" }
 microsandbox-vsock = { version = "=0.7.13", path = "crates/vsock" }
 # Keep runtime APIs and shared metrics types on the same engine source.
-msb_krun = { git = "https://github.com/superradcompany/libkrun", rev = "3d6ab775b1c85d2d903795219a3db4bf95ab0f47" }
-msb_krun_utils = { git = "https://github.com/superradcompany/libkrun", rev = "3d6ab775b1c85d2d903795219a3db4bf95ab0f47" }
+msb_krun = { git = "https://github.com/gitii-labs/libkrun", rev = "c73290fae1beafa293918f759c7091ea047410c8" }
+msb_krun_utils = { git = "https://github.com/gitii-labs/libkrun", rev = "c73290fae1beafa293918f759c7091ea047410c8" }
 test-macros = { path = "crates/testing/macros" }
 test-utils = { path = "crates/testing/utils" }
 
