@@ -30,5 +30,6 @@ type RestoreOptions struct {
 	Ports                       []PortBindingOptions `json:"ports,omitempty"`
 	TCPAcceptQueueSize          *uint32              `json:"tcp_accept_queue_size,omitempty"`
 	HostAliasIPv4Ports          []uint16             `json:"host_alias_ipv4_ports,omitempty"`
+	MaxInboundTCPConnections    *uint                `json:"max_inbound_tcp_connections,omitempty"`
 	Vsock                       []VsockRouteOptions  `json:"vsock,omitempty"`
 }
