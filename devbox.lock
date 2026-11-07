@@ -631,6 +631,10 @@
         }
       }
     },
+    "path:./packaging/devbox/native#libclang": {
+      "last_modified": "2026-11-07T23:27:32Z",
+      "resolved": "path:./packaging/devbox/native#libclang"
+    },
     "path:./packaging/devbox/native#openssl": {
       "last_modified": "2026-11-07T17:55:52Z",
       "resolved": "path:./packaging/devbox/native#openssl"

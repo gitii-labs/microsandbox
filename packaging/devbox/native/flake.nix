@@ -11,7 +11,29 @@
     in {
       packages = nixpkgs.lib.genAttrs systems (system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (final: prev: {
+              # Keep libclang and its LLVM dependency on the same stable release.
+              llvmPackages_23 = prev.llvmPackages_23.override {
+                version = "23.1.5";
+                monorepoSrc = final.runCommand "llvm-project-23.1.5-source" {
+                  nativeBuildInputs = [ final.xz ];
+                  passthru = {
+                    owner = "llvm";
+                    repo = "llvm-project";
+                    rev = "llvmorg-23.1.5";
+                  };
+                } ''
+                  mkdir -p "$out"
+                  tar -xJf ${final.fetchurl {
+                    url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/llvm-project-23.1.5.src.tar.xz";
+                    hash = "sha256-+1Cx6sk93rOqjatM/jJN/3T0qcK97mFgyeNhiPjQam4=";
+                  }} --strip-components=1 -C "$out"
+                '';
+              };
+            }) ];
+          };
           pythonPkgs = import pythonNixpkgs { inherit system; };
           python = pythonPkgs.python315.override {
             packageOverrides = _final: prev: {
@@ -28,6 +50,9 @@
         in {
           openssl = pkgs.openssl_4_1;
           python = python.withPackages (ps: [ ps.pyelftools ]);
+        } // nixpkgs.lib.optionalAttrs (system != "x86_64-darwin") {
+          # Native bindgen tooling supports Linux and Apple Silicon development.
+          libclang = pkgs.llvmPackages_23.libclang;
         });
     };
 }
