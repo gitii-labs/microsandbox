@@ -1,9 +1,16 @@
 //! Close handshakes over authenticated SSH on real loopback sockets.
 
+use std::borrow::Cow;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::net::TcpListener;
+use futures::task::AtomicWaker;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::client;
@@ -15,6 +22,146 @@ type Opened = (Channel<server::Msg>, server::Handle);
 
 const CLOSE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RECEIVE_WINDOW: u32 = 65536;
+const BOTH_CLOSES: u8 = 0b11;
+
+/// Observe actual packet writes, holding both readers until each peer has sent CLOSE.
+/// This is transport instrumentation only; russh still creates and processes every packet.
+struct CloseBarrier {
+    armed: AtomicBool,
+    emitted: AtomicU8,
+    recipients: [AtomicU32; 2],
+    readers: [AtomicWaker; 2],
+}
+
+impl CloseBarrier {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            emitted: AtomicU8::new(0),
+            recipients: [AtomicU32::new(0), AtomicU32::new(0)],
+            readers: [AtomicWaker::new(), AtomicWaker::new()],
+        }
+    }
+
+    fn arm(&self, client_recipient: ChannelId, server_recipient: ChannelId) {
+        self.recipients[0].store(client_recipient.0, Ordering::Relaxed);
+        self.recipients[1].store(server_recipient.0, Ordering::Relaxed);
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn observing(&self) -> bool {
+        self.armed.load(Ordering::Acquire) && self.emitted.load(Ordering::Acquire) != BOTH_CLOSES
+    }
+}
+
+struct ObservedTransport {
+    socket: TcpStream,
+    barrier: Option<Arc<CloseBarrier>>,
+    side: usize,
+    packet: Vec<u8>,
+}
+
+impl ObservedTransport {
+    fn new(socket: TcpStream, barrier: Option<Arc<CloseBarrier>>, side: usize) -> Self {
+        Self {
+            socket,
+            barrier,
+            side,
+            packet: Vec::new(),
+        }
+    }
+
+    fn observe_written(&mut self, bytes: &[u8]) {
+        let Some(barrier) = &self.barrier else { return };
+        if !barrier.observing() {
+            return;
+        }
+        self.packet.extend_from_slice(bytes);
+        // Only the simultaneous-close fixture negotiates none cipher/MAC/compression.
+        // Packet boundaries and message IDs are therefore visible without replacing SSH.
+        while self.packet.len() >= 4 {
+            let packet_length = u32::from_be_bytes(self.packet[..4].try_into().unwrap()) as usize;
+            let total = 4 + packet_length;
+            if self.packet.len() < total {
+                return;
+            }
+            assert!(
+                packet_length >= 10,
+                "CLOSE packet must include its recipient and padding"
+            );
+            assert_eq!(
+                self.packet[5],
+                crate::msg::CHANNEL_CLOSE,
+                "only CLOSE is emitted after the established-channel barrier is armed"
+            );
+            let recipient = u32::from_be_bytes(self.packet[6..10].try_into().unwrap());
+            assert_eq!(
+                recipient,
+                barrier.recipients[self.side].load(Ordering::Acquire)
+            );
+            let previous = barrier.emitted.fetch_or(1 << self.side, Ordering::AcqRel);
+            assert_eq!(
+                previous & (1 << self.side),
+                0,
+                "CLOSE emitted only once per side"
+            );
+            self.packet.drain(..total);
+            if previous | (1 << self.side) == BOTH_CLOSES {
+                for reader in &barrier.readers {
+                    reader.wake();
+                }
+            }
+        }
+    }
+}
+
+impl AsyncRead for ObservedTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(barrier) = &self.barrier {
+            if barrier.observing() {
+                barrier.readers[self.side].register(cx.waker());
+                if barrier.observing() {
+                    return Poll::Pending;
+                }
+            }
+        }
+        Pin::new(&mut self.socket).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ObservedTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.socket).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                self.observe_written(&buf[..written]);
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
+fn observable_packets(preferred: &mut crate::Preferred) {
+    preferred.cipher = Cow::Owned(vec![crate::cipher::NONE]);
+    preferred.mac = Cow::Owned(vec![crate::mac::NONE]);
+    preferred.compression = Cow::Owned(vec![crate::compression::NONE]);
+}
 
 struct Server {
     key: PublicKey,
@@ -89,12 +236,16 @@ struct Fixture {
 
 impl Fixture {
     async fn new(client_window: u32) -> Self {
+        Self::with_barrier(client_window, None).await
+    }
+
+    async fn with_barrier(client_window: u32, barrier: Option<Arc<CloseBarrier>>) -> Self {
         let key = PrivateKey::random(
             &mut crate::keys::key::safe_rng(),
             ssh_key::Algorithm::Ed25519,
         )
         .unwrap();
-        let config = Arc::new(server::Config {
+        let mut config = server::Config {
             keys: vec![
                 PrivateKey::random(
                     &mut crate::keys::key::safe_rng(),
@@ -103,7 +254,11 @@ impl Fixture {
                 .unwrap(),
             ],
             ..Default::default()
-        });
+        };
+        if barrier.is_some() {
+            observable_packets(&mut config.preferred);
+        }
+        let config = Arc::new(config);
         let (opened, mut openings) = mpsc::unbounded_channel();
         let (server_closed_tx, server_closed) = mpsc::unbounded_channel();
         let handler = Server {
@@ -113,21 +268,31 @@ impl Fixture {
         };
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
+        let server_barrier = barrier.clone();
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            server::run_stream(config, socket, handler)
-                .await
-                .unwrap()
-                .await
-                .unwrap();
+            server::run_stream(
+                config,
+                ObservedTransport::new(socket, server_barrier, 1),
+                handler,
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
         });
         let (client_closed_tx, client_closed) = mpsc::unbounded_channel();
-        let mut client = client::connect(
-            Arc::new(client::Config {
-                window_size: client_window,
-                ..Default::default()
-            }),
-            address,
+        let mut client_config = client::Config {
+            window_size: client_window,
+            ..Default::default()
+        };
+        if barrier.is_some() {
+            observable_packets(&mut client_config.preferred);
+        }
+        let socket = TcpStream::connect(address).await.unwrap();
+        let mut client = client::connect_stream(
+            Arc::new(client_config),
+            ObservedTransport::new(socket, barrier, 0),
             Client {
                 closed: client_closed_tx,
             },
@@ -229,7 +394,10 @@ async fn server_initiated_close_delivers_both_acknowledgements() {
 #[tokio::test]
 async fn simultaneous_close_delivers_both_acknowledgements() {
     tokio::time::timeout(CLOSE_TEST_TIMEOUT, async {
-        let mut fixture = Fixture::new(RECEIVE_WINDOW).await;
+        let barrier = Arc::new(CloseBarrier::new());
+        let mut fixture = Fixture::with_barrier(RECEIVE_WINDOW, Some(barrier.clone())).await;
+        // Both sessions must finish writing their own CLOSE before either can read its peer's.
+        barrier.arm(fixture.server_channel.id(), fixture.client_channel.id());
         let (client, server) = tokio::join!(
             fixture.client_channel.close(),
             fixture.server_channel.close(),
@@ -238,6 +406,7 @@ async fn simultaneous_close_delivers_both_acknowledgements() {
         server.unwrap();
         expect_close(&mut fixture.client_channel).await;
         expect_close(&mut fixture.server_channel).await;
+        assert_eq!(barrier.emitted.load(Ordering::Acquire), BOTH_CLOSES);
         fixture.finish().await;
     })
     .await
