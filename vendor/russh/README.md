@@ -1,7 +1,7 @@
 # Russh Flow Control and Open Replies
 
-Vendored from the crates.io `russh` 0.65.0 package, under Apache-2.0.
-Upstream commit: `183a22e8f8f490fa09b6eb7bd044ef99d8c4414f`, directory `russh/`.
+Vendored from the crates.io `russh` 0.65.1 package, under Apache-2.0.
+Upstream commit: `b33092aad1e51c66258a12e8b83fc473a68d9d34`, directory `russh/`.
 The package's normalized manifest is standalone; dependency requirements follow upstream. The root
 workspace lockfile controls shipped artifacts. The lockfile here pins the
 standalone vendor regression test's dependencies.

@@ -21,7 +21,7 @@ lto = false
 strip = false
 
 [dependencies]
-magnus = "0.8.2"
+magnus = "0.9.3"
 microsandbox_core = { package = "microsandbox", version = "=0.7.13", default-features = false, features = ["cloud", "local", "net", "ssh"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "time"] }
 serde = "1"

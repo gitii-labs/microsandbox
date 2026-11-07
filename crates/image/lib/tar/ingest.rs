@@ -300,7 +300,7 @@ pub async fn ingest_tar<R: AsyncRead + Unpin>(
             }
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 // Read file data.
-                let size = header.size().map_err(IngestError::Io)?;
+                let size = entry.effective_size();
                 if size > limits.max_file_size {
                     return Err(IngestError::FileTooLarge(
                         String::from_utf8_lossy(&path).into_owned(),
@@ -1548,6 +1548,53 @@ mod tests {
             ..ResourceLimits::default()
         };
         let result = ingest_tar(std::io::Cursor::new(data), &limits, None).await;
+        assert!(matches!(result, Err(IngestError::FileTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn ingest_pax_size_overrides_raw_header_and_enforces_limits() {
+        let content = vec![42u8; 1024];
+        let mut data = build_tar(|builder| {
+            builder
+                .append_pax_extensions([("size", b"1024".as_slice())])
+                .unwrap();
+            let mut header = sync_tar::Header::new_gnu();
+            header.set_path("pax.bin").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_entry_type(sync_tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, content.as_slice()).unwrap();
+        });
+
+        // The first two 512-byte blocks hold the PAX header and its payload.
+        // Give the file a raw size of zero while retaining the effective PAX size.
+        const FILE_HEADER_OFFSET: usize = 2 * 512;
+        let mut header = sync_tar::Header::new_gnu();
+        header.set_path("pax.bin").unwrap();
+        header.set_size(0);
+        header.set_entry_type(sync_tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_cksum();
+        data[FILE_HEADER_OFFSET..FILE_HEADER_OFFSET + 512].copy_from_slice(header.as_bytes());
+
+        let tree = ingest_tar(
+            std::io::Cursor::new(&data),
+            &ResourceLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let Some(TreeNode::RegularFile(file)) = tree.get(b"pax.bin") else {
+            panic!("expected PAX file");
+        };
+        assert_eq!(file.data, FileData::Memory(content));
+
+        let limits = ResourceLimits {
+            max_file_size: 512,
+            ..ResourceLimits::default()
+        };
+        let result = ingest_tar(std::io::Cursor::new(&data), &limits, None).await;
         assert!(matches!(result, Err(IngestError::FileTooLarge(_))));
     }
 
