@@ -138,6 +138,9 @@ impl LocalBackend {
             options.slug.as_ref().and_then(Option::as_deref),
         );
         validate_sandbox_name(options.spec.name.as_deref().unwrap_or_default())?;
+        // Caller validation: the supplied hostname does not depend on OCI metadata.
+        // Refuse invalid input before registry I/O; final resolved validation still runs below.
+        validate_hostname(options.spec.runtime.hostname.as_deref())?;
 
         let image = options.resolve_image(&self.config);
         if matches!(&image, RootfsSource::Oci(oci) if !oci.reference.is_empty()) {
@@ -3941,6 +3944,23 @@ esac
             } else {
                 None
             };
+            let original = if let Some(id) = sandbox_id {
+                assert!(
+                    LocalBackend::load_latest_run(pools.read(), id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                Some(
+                    sandbox_entity::Entity::find_by_id(id)
+                        .one(pools.read())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
             let socket = RuntimeSocketPaths::new(&run_dir, "legacy").legacy_agent;
             fs::create_dir_all(socket.parent().unwrap()).unwrap();
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -3952,10 +3972,23 @@ esac
                 LocalBackend::prepare_create_target(&pools, &config, &sandbox_dir, &run_dir)
                     .await
                     .expect_err("replacement must preserve a live legacy runtime");
-            assert!(matches!(
-                error,
-                crate::MicrosandboxError::SandboxStillRunning(_)
-            ));
+            if tracked && cfg!(any(target_os = "linux", target_os = "macos")) {
+                // No catalog PID can authenticate this listener. Refusal is not proof of a
+                // known running sandbox, and must not authorize reconciliation or replacement.
+                let crate::MicrosandboxError::Io(error) = error else {
+                    panic!("unknown runtime ownership must fail inspection: {error}");
+                };
+                assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                assert_eq!(
+                    error.to_string(),
+                    "live runtime endpoint has no matching catalog process"
+                );
+            } else {
+                assert!(
+                    matches!(error, crate::MicrosandboxError::SandboxStillRunning(_)),
+                    "{error}"
+                );
+            }
             assert!(socket.exists());
             assert_eq!(fs::read(&marker).unwrap(), b"runtime state");
             if let Some(id) = sandbox_id {
@@ -3965,6 +3998,22 @@ esac
                     .unwrap()
                     .expect("replacement must preserve the sandbox row");
                 assert_eq!(model.status, SandboxStatus::Starting);
+                assert_eq!(model.config, original.as_ref().unwrap().config);
+                assert!(
+                    LocalBackend::load_latest_run(pools.read(), id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(
+                    sandbox_entity::Entity::find()
+                        .filter(sandbox_entity::Column::Name.eq("legacy"))
+                        .one(pools.read())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
             }
 
             drop(listener);

@@ -823,10 +823,12 @@ mod tests {
                 .await
         })
         .await;
-        let error = result
-            .err()
-            .expect("invalid replacement must fail")
-            .to_string();
+        let error = result.err().expect("invalid replacement must fail");
+        assert!(
+            matches!(&error, crate::MicrosandboxError::InvalidConfig(_)),
+            "{error}"
+        );
+        let error = error.to_string();
         assert!(error.contains("hostname"), "{error}");
         assert_eq!(
             std::fs::read_to_string(sandbox_dir.join("sentinel")).unwrap(),
