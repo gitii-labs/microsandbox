@@ -2497,7 +2497,7 @@ where
         let components = normal_utf8_components(&path_in_archive)?;
         if entry_type == EntryType::Directory {
             validate_archive_directory(&components, &path_in_archive)?;
-            let size = header.entry_size()?;
+            let size = header.raw_entry_size()?;
             if size != 0 {
                 return Err(MicrosandboxError::Custom(format!(
                     "archive directory has a non-empty body: {}",
@@ -2529,7 +2529,7 @@ where
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let entry_size = header.entry_size()?;
+        let entry_size = header.raw_entry_size()?;
         let kind = archive_member_kind(&components);
         if kind == "owned-directory-payload" && components.last() == Some(&"directory.bin") {
             // The descriptor represents empty directories too; there may be no files/ tar
@@ -2766,7 +2766,7 @@ async fn read_entry_header<R: AsyncRead + Unpin>(
                 ));
             }
 
-            let size = header.entry_size()?;
+            let size = header.raw_entry_size()?;
             if size == 0 || size > 16 * 1024 {
                 return Err(MicrosandboxError::Custom(
                     "archive GNU long name exceeds the size limit".into(),
@@ -5442,7 +5442,7 @@ mod tests {
                         let entry = entry.unwrap();
                         if entry.path().unwrap().starts_with("layers") {
                             assert!(entry.header().entry_type().is_file());
-                            assert!(entry.header().entry_size().unwrap() > 1024 * 1024);
+                            assert!(entry.header().raw_entry_size().unwrap() > 1024 * 1024);
                             large_dense_member = true;
                         }
                     }
@@ -6042,7 +6042,7 @@ mod tests {
             if entry.path().unwrap() == Path::new(&archive_layer_path) {
                 assert!(entry.header().entry_type().is_gnu_sparse());
                 assert!(entry.header().as_gnu().unwrap().is_extended());
-                assert!(entry.header().entry_size().unwrap() < 4 * 1024 * 1024);
+                assert!(entry.header().raw_entry_size().unwrap() < 4 * 1024 * 1024);
                 found_sparse = true;
             }
         }

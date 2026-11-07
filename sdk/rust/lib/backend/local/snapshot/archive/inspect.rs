@@ -347,7 +347,7 @@ impl MetadataReader {
         let parts = normal_utf8_components(&path)?;
         if header.entry_type() == EntryType::Directory {
             validate_archive_directory(&parts, &path)?;
-            if header.entry_size()? != 0 {
+            if header.raw_entry_size()? != 0 {
                 return Err(MicrosandboxError::SnapshotIntegrity(
                     "archive directory has a non-empty body".into(),
                 ));
@@ -395,7 +395,7 @@ impl MetadataReader {
     }
 
     async fn skip_payload(&mut self, header: &Header) -> MicrosandboxResult<()> {
-        let size = header.entry_size()?;
+        let size = header.raw_entry_size()?;
         if header.entry_type() == EntryType::GNUSparse {
             SparseMap::read(&mut self.input(), header, size).await?;
         }
@@ -405,7 +405,7 @@ impl MetadataReader {
     }
 
     async fn metadata(&mut self, header: &Header, limit: u64) -> MicrosandboxResult<Vec<u8>> {
-        let size = header.entry_size()?;
+        let size = header.raw_entry_size()?;
         if size > limit || header.entry_type() == EntryType::GNUSparse {
             return Err(MicrosandboxError::SnapshotIntegrity(
                 "archive metadata exceeds its size limit or is sparse".into(),
