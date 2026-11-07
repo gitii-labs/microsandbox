@@ -6,6 +6,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from typing import Any, Literal
 
+from microsandbox.jobs import JobEvent, JobExit, JobInfo, JobLogEntry, JobPage
 from microsandbox.types import (
     BackendKind,
     DiskCompactionResult,
@@ -29,6 +30,7 @@ from microsandbox.types import (
     NetworkPolicy,
     PatchConfig,
     PortBinding,
+    PortEndpoint,
     PullEventType,
     PullPolicy,
     RegistryAuth,
@@ -100,6 +102,12 @@ class Sandbox:
     Sandbox names are limited to 128 UTF-8 bytes.
     """
 
+    async def get_job(self, id: str) -> Job: ...
+    async def list_jobs(
+        self, *, all: bool = False, limit: int = 50, cursor: str | None = None
+    ) -> JobPage: ...
+
+
     @staticmethod
     async def restore(
         snapshot: Snapshot | SnapshotHandle | str | os.PathLike[str],
@@ -126,6 +134,7 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         tcp_accept_queue_size: int | None = None,
         host_alias_ipv4_ports: Sequence[int] = (),
+        max_inbound_tcp_connections: int | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         external_mount_policy: Literal["strict", "relaxed"] = "strict",
         dangerously_inherit_resources: bool = False,
@@ -157,6 +166,7 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         tcp_accept_queue_size: int | None = None,
         host_alias_ipv4_ports: Sequence[int] = (),
+        max_inbound_tcp_connections: int | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         external_mount_policy: Literal["strict", "relaxed"] = "strict",
         dangerously_inherit_resources: bool = False,
@@ -171,6 +181,7 @@ class Sandbox:
         cpus: int | None = None,
         max_memory: int | None = None,
         max_cpus: int | None = None,
+        nested_virt: bool | None = None,
         workdir: str | None = None,
         shell: str | None = None,
         security: SecurityProfile | None = None,
@@ -197,6 +208,7 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         network: Network | None = None,
+        intercept_tls: bool = False,
         secrets: Sequence[SecretEntry] | None = None,
         secret_violation_action: ViolationAction | None = None,
         detached: bool = False,
@@ -210,6 +222,7 @@ class Sandbox:
         cpus: int | None = None,
         max_memory: int | None = None,
         max_cpus: int | None = None,
+        nested_virt: bool | None = None,
         workdir: str | None = None,
         shell: str | None = None,
         security: SecurityProfile | None = None,
@@ -236,6 +249,7 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         network: Network | None = None,
+        intercept_tls: bool = False,
         secrets: Sequence[SecretEntry] | None = None,
         secret_violation_action: ViolationAction | None = None,
         detached: bool = False,
@@ -264,6 +278,7 @@ class Sandbox:
         cpus: int | None = None,
         max_memory: int | None = None,
         max_cpus: int | None = None,
+        nested_virt: bool | None = None,
         workdir: str | None = None,
         shell: str | None = None,
         security: SecurityProfile | None = None,
@@ -290,6 +305,7 @@ class Sandbox:
         ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
         vsock: Mapping[str, int] | Sequence[VsockRoute] | None = None,
         network: Network | None = None,
+        intercept_tls: bool = False,
         secrets: Sequence[SecretEntry] | None = None,
         secret_violation_action: ViolationAction | None = None,
         detached: bool = False,
@@ -335,6 +351,19 @@ class Sandbox:
         tty: bool = False,
         rlimits: list[Rlimit] | None = None,
     ) -> ExecOutput: ...
+    async def exec_detached(
+        self,
+        cmd: str,
+        args: list[str] | ExecOptions | None = None,
+        *,
+        cwd: str | None = None,
+        user: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        stdin: Stdin | bytes | None = None,
+        tty: bool = False,
+        rlimits: list[Rlimit] | None = None,
+    ) -> Job: ...
     async def exec_stream(
         self,
         cmd: str,
@@ -418,6 +447,8 @@ class Sandbox:
         workdir: str | None = None,
         secrets: Mapping[str, SecretModifySpec] | None = None,
         secrets_rm: list[str] | None = None,
+        ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
+        ports_rm: Sequence[PortEndpoint] | None = None,
         policy: ModificationPolicy | None = None,
         dry_run: bool = False,
     ) -> SandboxModificationPlan: ...
@@ -443,20 +474,24 @@ class Sandbox:
     async def fork(
         self, name: str, *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> Sandbox: ...
     # Deprecated: use fork.
     async def branch(
         self, name: str, *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> Sandbox: ...
     async def fork_many(
         self, names: list[str], *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> list[ForkOutcome]: ...
     # Deprecated: use fork_many.
     async def branch_many(
         self, names: list[str], *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> list[ForkOutcome]: ...
     async def pause(self, *, guest_flush: GuestFlush | None = None) -> None: ...
     async def resume(self) -> None: ...
@@ -512,6 +547,12 @@ class SandboxHandle:
     Sandbox names are limited to 128 UTF-8 bytes.
     """
 
+    async def get_job(self, id: str) -> Job: ...
+    async def list_jobs(
+        self, *, all: bool = False, limit: int = 50, cursor: str | None = None
+    ) -> JobPage: ...
+
+
     @property
     def name(self) -> str: ...
     @property
@@ -551,6 +592,8 @@ class SandboxHandle:
         workdir: str | None = None,
         secrets: Mapping[str, SecretModifySpec] | None = None,
         secrets_rm: list[str] | None = None,
+        ports: Mapping[int, int] | Sequence[PortBinding] | None = None,
+        ports_rm: Sequence[PortEndpoint] | None = None,
         policy: ModificationPolicy | None = None,
         dry_run: bool = False,
     ) -> SandboxModificationPlan: ...
@@ -579,20 +622,24 @@ class SandboxHandle:
     async def fork(
         self, name: str, *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> Sandbox: ...
     # Deprecated: use fork.
     async def branch(
         self, name: str, *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> Sandbox: ...
     async def fork_many(
         self, names: list[str], *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> list[ForkOutcome]: ...
     # Deprecated: use fork_many.
     async def branch_many(
         self, names: list[str], *, record_integrity: bool = False,
         guest_flush: GuestFlush | None = None,
+        volumes: Mapping[str, MountConfig] | None = None,
     ) -> list[ForkOutcome]: ...
     async def pause(self, *, guest_flush: GuestFlush | None = None) -> None: ...
     async def resume(self) -> None: ...
@@ -1394,3 +1441,60 @@ def resolved_cli_msb_path() -> str: ...
 def set_runtime_msb_path(path: str) -> None: ...
 def set_packaged_msb_path(path: str) -> None: ...
 def version() -> str: ...
+
+class Job:
+    @property
+    def id(self) -> str: ...
+    async def inspect(self) -> JobInfo: ...
+    async def wait(self) -> JobExit: ...
+    async def signal(self, signal: int) -> None: ...
+    async def kill(self) -> None: ...
+    async def eof(self) -> None: ...
+    async def attach(
+        self,
+        *,
+        read_only: bool = False,
+        replay_bytes: int | None = None,
+        cursor: str | None = None,
+    ) -> JobAttachment: ...
+    async def logs(
+        self,
+        *,
+        tail: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        sources: list[str] | None = None,
+        from_cursor: str | None = None,
+    ) -> list[JobLogEntry]: ...
+    async def log_stream(
+        self,
+        *,
+        tail: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        sources: list[str] | None = None,
+        from_cursor: str | None = None,
+        follow: bool = False,
+    ) -> JobLogStream: ...
+    async def follow_logs(
+        self,
+        *,
+        tail: int | None = None,
+        since: int | None = None,
+        until: int | None = None,
+        sources: list[str] | None = None,
+        from_cursor: str | None = None,
+    ) -> JobLogStream: ...
+
+class JobAttachment:
+    async def recv(self) -> JobEvent | None: ...
+    async def write_stdin(self, data: bytes) -> None: ...
+    async def resize(self, rows: int, cols: int) -> None: ...
+    async def detach(self) -> None: ...
+    def __aiter__(self) -> JobAttachment: ...
+    async def __anext__(self) -> JobEvent: ...
+
+class JobLogStream:
+    async def close(self) -> None: ...
+    def __aiter__(self) -> JobLogStream: ...
+    async def __anext__(self) -> JobLogEntry: ...
