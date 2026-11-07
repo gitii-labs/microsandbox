@@ -17,6 +17,11 @@
               # Keep libclang and its LLVM dependency on the same stable release.
               llvmPackages_23 = prev.llvmPackages_23.override {
                 version = "23.1.5";
+                # This libclang output parses native Ruby headers for bindgen;
+                # it is not the project's general-purpose cross compiler.
+                devExtraCmakeFlags = [
+                  (final.lib.cmakeFeature "LLVM_TARGETS_TO_BUILD" "Native")
+                ];
                 monorepoSrc = final.runCommand "llvm-project-23.1.5-source" {
                   nativeBuildInputs = [ final.xz ];
                   passthru = {
