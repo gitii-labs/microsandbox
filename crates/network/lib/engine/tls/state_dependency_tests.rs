@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::FutureExt;
 use pem::{EncodeConfig, LineEnding, Pem};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::ServerName;
@@ -18,10 +19,34 @@ use crate::secrets::{config::SecretsConfig, handle::SecretsHandle};
 use microsandbox_types::{ScopedUpstreamCaCert, TlsConfig};
 
 //--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+struct TestDirectory {
+    path: PathBuf,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        // Cleanup errors must not cause a second panic while an assertion unwinds.
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            eprintln!(
+                "failed to remove TLS fixture directory {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-fn directory() -> PathBuf {
+fn directory() -> TestDirectory {
     assert!(
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -34,7 +59,7 @@ fn directory() -> PathBuf {
         rand::random::<u64>()
     ));
     std::fs::create_dir(&path).expect("create private, exclusive TLS fixture directory");
-    path
+    TestDirectory { path }
 }
 
 fn encoded_ca(ca: &CertAuthority, ending: LineEnding) -> Vec<u8> {
@@ -127,6 +152,43 @@ fn unknown_issuer(error: &io::Error) {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
+#[test]
+fn directory_owner_cleans_up_on_unwind_and_future_cancellation() {
+    let owner = directory();
+    let path = owner.path.clone();
+    std::fs::write(path.join("ca.key"), b"unwind fixture key").unwrap();
+    assert!(path.join("ca.key").is_file());
+    let unwound = std::panic::catch_unwind(move || {
+        let _owner = owner;
+        panic!("exercise TLS fixture unwinding");
+    });
+    assert!(unwound.is_err());
+    assert!(
+        !path.exists(),
+        "unwinding must remove the directory and key file"
+    );
+
+    let owner = directory();
+    let path = owner.path.clone();
+    std::fs::write(path.join("ca.key"), b"cancellation fixture key").unwrap();
+    assert!(path.join("ca.key").is_file());
+    let mut suspended = Box::pin(async move {
+        let _owner = owner;
+        std::future::pending::<()>().await;
+    });
+    assert!(suspended.as_mut().now_or_never().is_none());
+    assert!(
+        path.join("ca.key").is_file(),
+        "suspended fixture must retain its key file"
+    );
+    // Cancellation drops the pending future and its directory owner without a process signal.
+    drop(suspended);
+    assert!(
+        !path.exists(),
+        "cancellation must remove the directory and key file"
+    );
+}
+
 #[tokio::test]
 async fn pem4_ca_bundle_verifies_real_tls_and_rejects_unknown_ca_name_and_malformed_pem() {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -140,7 +202,7 @@ async fn pem4_ca_bundle_verifies_real_tls_and_rejects_unknown_ca_name_and_malfor
             pem,
             "persisted CA bytes must not be normalized"
         );
-        let path = directory.join("roots.pem");
+        let path = directory.path.join("roots.pem");
         let mut bundle = loaded.key_pem();
         bundle.extend_from_slice(b"text between PEM sections\n");
         bundle.extend_from_slice(&pem);
@@ -186,7 +248,6 @@ async fn pem4_ca_bundle_verifies_real_tls_and_rejects_unknown_ca_name_and_malfor
         );
         assert!(CertAuthority::load(b"not a certificate", &loaded.key_pem()).is_err());
         assert!(CertAuthority::load(&pem, b"not a key").is_err());
-        std::fs::remove_dir_all(directory).unwrap();
     })
     .await
     .expect("TLS CA trust regression did not finish");
@@ -197,8 +258,8 @@ async fn scoped_ca_trust_is_enforced_by_real_tls_not_only_connector_selection() 
     tokio::time::timeout(Duration::from_secs(20), async {
         let directory = directory();
         let ca = CertAuthority::generate();
-        let cert = directory.join("ca.pem");
-        let key = directory.join("ca.key");
+        let cert = directory.path.join("ca.pem");
+        let key = directory.path.join("ca.key");
         std::fs::write(&cert, encoded_ca(&ca, LineEnding::LF)).unwrap();
         std::fs::write(&key, ca.key_pem()).unwrap();
         let mut config = TlsConfig::default();
@@ -227,7 +288,6 @@ async fn scoped_ca_trust_is_enforced_by_real_tls_not_only_connector_selection() 
             .await
             .unwrap_err(),
         );
-        std::fs::remove_dir_all(directory).unwrap();
     })
     .await
     .expect("scoped TLS CA trust regression did not finish");
