@@ -112,7 +112,7 @@ jobs:
       - name: Stage the parts
         run: |
           mkdir -p parts
-          cp vendor/libkrunfw/libkrunfw.so.$LIBKRUNFW_VERSION vendor/libkrunfw/kernel.c parts/
+          cp "vendor/libkrunfw/libkrunfw.so.$LIBKRUNFW_VERSION" vendor/libkrunfw/kernel.c parts/
           cp target/${{ matrix.musl }}/release/agentd parts/
           # agentd is PID 1 in guests of any userland: it must not need a dynamic loader.
           if readelf -lW parts/agentd | grep -q INTERP; then
@@ -139,11 +139,24 @@ jobs:
             runner: ubuntu-22.04-arm
           - os: darwin
             arch: arm64
-            runner: macos-14
+            runner: [self-hosted, macOS, ARM64, air]
     runs-on: ${{ matrix.runner }}
     env:
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      MACOSX_DEPLOYMENT_TARGET: "26.0"
     steps:
+      # Keep toolchain defaults and verification state inside this job, including
+      # on the operator's self-hosted Apple Silicon runner.
+      # RUNNER_TEMP is cleared between jobs; stable paths also keep rust-cache's
+      # built-in CARGO/RUST environment fingerprint reusable across runs.
+      - name: Prepare job-local toolchain paths
+        run: |
+          set -euo pipefail
+          {
+            echo "RUSTUP_HOME=$RUNNER_TEMP/runtime-rustup-${{ matrix.os }}-${{ matrix.arch }}"
+            echo "CARGO_HOME=$RUNNER_TEMP/runtime-cargo-${{ matrix.os }}-${{ matrix.arch }}"
+            echo "TMPDIR=$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.TAG }}
@@ -156,6 +169,10 @@ jobs:
         with:
           key: ${{ matrix.os }}-${{ matrix.arch }}
           cache-bin: false
+          # Keep compiler/flags/manifests/lockfile hashing, and also include
+          # the deployment floor and embedded firmware metadata.
+          add-rust-environment-hash-key: true
+          env-vars: MACOSX_DEPLOYMENT_TARGET LIBKRUNFW_
 
       - name: Install build dependencies
         if: matrix.os == 'linux'
@@ -177,12 +194,12 @@ jobs:
           touch build/agentd
           cd build
           if [ "${{ matrix.os }}" = darwin ]; then
-            cc -fPIC -DABI_VERSION=$LIBKRUNFW_ABI -shared -o libkrunfw.$LIBKRUNFW_ABI.dylib ../parts/kernel.c
-            ln -sf libkrunfw.$LIBKRUNFW_ABI.dylib libkrunfw.dylib
+            cc -fPIC -DABI_VERSION="$LIBKRUNFW_ABI" -shared -o "libkrunfw.$LIBKRUNFW_ABI.dylib" ../parts/kernel.c
+            ln -sf "libkrunfw.$LIBKRUNFW_ABI.dylib" libkrunfw.dylib
           else
-            install -m 0755 ../parts/libkrunfw.so.$LIBKRUNFW_VERSION .
-            ln -sf libkrunfw.so.$LIBKRUNFW_VERSION libkrunfw.so.$LIBKRUNFW_ABI
-            ln -sf libkrunfw.so.$LIBKRUNFW_ABI libkrunfw.so
+            install -m 0755 "../parts/libkrunfw.so.$LIBKRUNFW_VERSION" .
+            ln -sf "libkrunfw.so.$LIBKRUNFW_VERSION" "libkrunfw.so.$LIBKRUNFW_ABI"
+            ln -sf "libkrunfw.so.$LIBKRUNFW_ABI" libkrunfw.so
           fi
 
       - name: Build msb
@@ -195,6 +212,9 @@ jobs:
 
       - name: Build the Go FFI
         run: cargo build --locked --release -p microsandbox-go
+
+      - name: Test runtime artifact verification
+        run: python3 -m unittest scripts.ci.test_verify_runtime_archive
 
       - name: Pack the runtime
         run: |
@@ -222,6 +242,16 @@ jobs:
           [ -n "$floor" ]
           [ "$(printf '%s\n2.35\n' "$floor" | sort -V | tail -1)" = 2.35 ]
 
+      - name: Verify the packed native runtime
+        run: |
+          python3 scripts/ci/verify_runtime_archive.py \
+            microsandbox-runtime-${{ matrix.os }}-${{ matrix.arch }}.tar.gz \
+            --os ${{ matrix.os }} --arch ${{ matrix.arch }} \
+            --commit "$(git rev-parse HEAD)" \
+            --version "$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)" \
+            --firmware-version "$LIBKRUNFW_VERSION" --firmware-abi "$LIBKRUNFW_ABI" \
+            --deployment-target "$MACOSX_DEPLOYMENT_TARGET"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runtime-${{ matrix.os }}-${{ matrix.arch }}
@@ -248,12 +278,12 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum *.tar.gz >checksums.sha256
+          sha256sum -- *.tar.gz >checksums.sha256
           cat checksums.sha256
           # Fails if the release exists: a published runtime is never replaced; rebuild under a new tag.
           gh release create "$TAG" --title "$TAG" --verify-tag \
             --notes "microsandbox runtime for Distributed, built from $(git rev-parse HEAD)." \
-            *.tar.gz checksums.sha256
+            -- *.tar.gz checksums.sha256
 
       # The Go SDK lives in sdk/go, so its module version is tagged sdk/go/<tag>.
       - name: Tag the Go module
