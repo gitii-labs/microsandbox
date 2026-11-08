@@ -49,7 +49,7 @@
     "build:ts": "npm run build --workspace @microsandbox/types && tsc -p tsconfig.json",
     "build": "npm run build:native && npm run build:ts",
     "build:ci": "npm run build:native:ci && npm run build:ts",
-    "test": "vitest run && npm run test:cloud-release-probe",
+    "test": "npm run test:cloud-release-probe && vitest run",
     "test:cloud-release-probe": "node --test scripts/cloud-release-smoke.test.mts",
     "test:unit": "vitest run tests/unit",
     "test:smoke": "vitest run tests/smoke.test.ts",
