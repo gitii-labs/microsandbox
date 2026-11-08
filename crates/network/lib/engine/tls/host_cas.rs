@@ -69,13 +69,7 @@ mod tests {
 
     #[test]
     fn collect_host_cas_returns_parseable_bundle() {
-        // The host running this test has *some* trust store — any modern
-        // macOS / Linux dev machine does. If this returns `None`, the test
-        // is uninformative, not wrong; skip.
-        let Some(bundle) = collect_host_cas() else {
-            eprintln!("host has no trusted CAs; skipping roundtrip check");
-            return;
-        };
+        let bundle = collect_host_cas().expect("host trust store must contain usable certificates");
 
         let parsed = pem::parse_many(&bundle).expect("bundle parses");
         assert!(!parsed.is_empty(), "bundle contains at least one cert");
@@ -89,11 +83,18 @@ mod tests {
 
         // DER dedup: no two entries should share the same body bytes.
         let mut seen = HashSet::new();
+        let mut roots = rustls::RootCertStore::empty();
         for p in &parsed {
             assert!(
                 seen.insert(p.contents().to_vec()),
                 "bundle contains a duplicated cert"
             );
+            roots
+                .add(rustls::pki_types::CertificateDer::from(
+                    p.contents().to_vec(),
+                ))
+                .expect("exported PEM block must contain a usable root certificate");
         }
+        assert_eq!(roots.len(), parsed.len());
     }
 }
