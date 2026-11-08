@@ -459,6 +459,15 @@ pub fn control_socket_path_for(agent_sock: &std::path::Path) -> PathBuf {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use microsandbox_types::SecretValue;
+
+#[cfg(feature = "runner")]
+pub use crate::runner::control::{ControlContext, spawn_control_listener};
+
+//--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
@@ -625,12 +634,3 @@ mod tests {
         assert!(!old.disk_compact_owned);
     }
 }
-
-//--------------------------------------------------------------------------------------------------
-// Re-Exports
-//--------------------------------------------------------------------------------------------------
-
-pub use microsandbox_types::SecretValue;
-
-#[cfg(feature = "runner")]
-pub use crate::runner::control::{ControlContext, spawn_control_listener};
