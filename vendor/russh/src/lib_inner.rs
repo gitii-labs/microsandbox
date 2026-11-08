@@ -603,10 +603,7 @@ impl<M: Send> ChannelOpenHandleInner<M> {
 
     fn try_send_reply(&mut self, result: Result<(), ChannelOpenFailure>) {
         if let Some(pending) = self.inner.take() {
-            if self
-                .sender
-                .send((self.make_msg)(pending, result))
-                .is_err()
+            if self.sender.send((self.make_msg)(pending, result)).is_err()
                 && let Some(abort) = &self.abort
             {
                 // A server must reject or disconnect, never lose an open reply.
