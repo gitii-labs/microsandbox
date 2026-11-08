@@ -36,6 +36,7 @@ class MicrosandboxIntegrationTest < Test::Unit::TestCase
   def test_network_allowlist_allows_one_host_and_denies_another
     sandbox = create_sandbox(
       "net-allowlist",
+      intercept_tls: true,
       network: { allowed_hosts: ["example.com"], allowed_ports: [443] }
     )
 
