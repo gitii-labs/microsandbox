@@ -591,12 +591,8 @@ mod tests {
         // Same key, signed as rsa-sha2-256.
         let mut session = test_auth_session();
         let mut handler = Recorder::default();
-        let packet = publickey_signed_packet_as(
-            "alice",
-            private,
-            "rsa-sha2-256",
-            Some(HashAlg::Sha256),
-        );
+        let packet =
+            publickey_signed_packet_as("alice", private, "rsa-sha2-256", Some(HashAlg::Sha256));
         session.process_packet(&mut handler, &packet).await.unwrap();
         assert_eq!(
             handler.calls,
@@ -660,12 +656,8 @@ mod tests {
 
         let mut session = test_auth_session();
         let mut handler = NoSha1::default();
-        let packet = publickey_signed_packet_as(
-            "alice",
-            private,
-            "rsa-sha2-256",
-            Some(HashAlg::Sha256),
-        );
+        let packet =
+            publickey_signed_packet_as("alice", private, "rsa-sha2-256", Some(HashAlg::Sha256));
         session.process_packet(&mut handler, &packet).await.unwrap();
         assert!(handler.authenticated, "rsa-sha2-256 was refused");
     }
@@ -708,6 +700,30 @@ mod tests {
     struct ChannelCallbackProbe {
         exec_called: bool,
         window_adjusted_called: bool,
+        close_called: bool,
+    }
+
+    #[tokio::test]
+    async fn close_lifecycle_unknown_and_unconfirmed_close_never_reaches_server_handler() {
+        let mut session = test_authenticated_session();
+        let channel = insert_unconfirmed_server_open(&mut session);
+        let mut handler = ChannelCallbackProbe::default();
+        for id in [ChannelId(999), channel] {
+            let mut packet = vec![msg::CHANNEL_CLOSE];
+            id.encode(&mut packet).unwrap();
+            session.process_packet(&mut handler, &packet).await.unwrap();
+        }
+        assert!(!handler.close_called);
+        assert!(session.channels.contains_key(&channel));
+        assert!(
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .channels
+                .contains_key(&channel)
+        );
     }
 
     #[tokio::test]
@@ -781,6 +797,15 @@ mod tests {
 
     impl Handler for ChannelCallbackProbe {
         type Error = Error;
+
+        async fn channel_close(
+            &mut self,
+            _: ChannelId,
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.close_called = true;
+            Ok(())
+        }
 
         async fn exec_request(
             &mut self,
@@ -945,6 +970,7 @@ mod tests {
             server_mac: mac::NONE,
             session_id: CryptoVec::new(),
             channels: std::collections::HashMap::new(),
+            closing_channels: Default::default(),
             last_channel_id: Wrapping(0),
             write: Vec::new(),
             write_cursor: 0,
@@ -1513,12 +1539,12 @@ impl Session {
             msg::CHANNEL_CLOSE => {
                 let channel_num = map_err!(ChannelId::decode(r))?;
                 map_err!(ensure_end(r))?;
-                if !self.common.is_established_channel(channel_num) {
-                    return Ok(());
-                }
                 if let Some(ref mut enc) = self.common.encrypted {
-                    // Reply with CHANNEL_CLOSE per RFC 4254 Section 5.3.
-                    enc.close(channel_num)?;
+                    if !enc.close_received(channel_num)? {
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
                 }
                 // Forward the close to the channel before removing it, so that
                 // consumers waiting on `Channel::wait()` receive an explicit
@@ -2165,11 +2191,12 @@ impl Session {
             channel_ref,
             channel_params,
         };
-        let reply =
-            ChannelOpenHandle::new(self.sender.priority_sender.clone(), pending, |pending, result| {
-                Msg::ChannelOpenReply { pending, result }
-            })
-            .with_abort(self.sender.abort.clone());
+        let reply = ChannelOpenHandle::new(
+            self.sender.priority_sender.clone(),
+            pending,
+            |pending, result| Msg::ChannelOpenReply { pending, result },
+        )
+        .with_abort(self.sender.abort.clone());
 
         match &msg.typ {
             ChannelType::Session => handler.channel_open_session(channel, reply, self).await,

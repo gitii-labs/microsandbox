@@ -2177,6 +2177,7 @@ mod tests {
                     server_mac: mac::NONE,
                     session_id: CryptoVec::new(),
                     channels: HashMap::new(),
+                    closing_channels: Default::default(),
                     last_channel_id: Wrapping(0),
                     write: Vec::new(),
                     write_cursor: 0,
@@ -2303,12 +2304,20 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(session
-            .process_packet(&mut TestHandler, &packet)
-            .await
-            .is_err());
+        assert!(
+            session
+                .process_packet(&mut TestHandler, &packet)
+                .await
+                .is_err()
+        );
         assert_eq!(
-            session.common.encrypted.as_ref().unwrap().received_extensions.len(),
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .received_extensions
+                .len(),
             2
         );
     }
@@ -2377,10 +2386,16 @@ mod tests {
     #[test]
     fn limit_triggered_rekey_waits_for_authentication() {
         let (mut session, _sender, _replies) = keyboard_interactive_session();
-        allow_rekey(&mut session, crate::Limits::new(0, 0, Duration::from_secs(3600)));
+        allow_rekey(
+            &mut session,
+            crate::Limits::new(0, 0, Duration::from_secs(3600)),
+        );
 
         session.flush().unwrap();
-        assert!(!session.kex.active(), "write limit hit before authentication");
+        assert!(
+            !session.kex.active(),
+            "write limit hit before authentication"
+        );
         assert_eq!(session.rekey_time_remaining(), None);
 
         session.common.encrypted.as_mut().unwrap().state = EncryptedState::Authenticated;
@@ -2464,6 +2479,59 @@ mod tests {
     }
 
     #[cfg(feature = "flate2")]
+    #[tokio::test]
+    async fn close_lifecycle_unknown_and_unconfirmed_close_never_reaches_client_handler() {
+        struct CloseProbe {
+            called: bool,
+        }
+        impl Handler for CloseProbe {
+            type Error = crate::Error;
+
+            async fn channel_close(
+                &mut self,
+                _: ChannelId,
+                _: &mut Session,
+            ) -> Result<(), Self::Error> {
+                self.called = true;
+                Ok(())
+            }
+        }
+        let mut session = authenticated_session();
+        let id = session
+            .common
+            .encrypted
+            .as_mut()
+            .unwrap()
+            .new_channel(1024, 1024);
+        let (sender, mut receiver) = channel(1);
+        session
+            .channels
+            .insert(id, crate::channels::ChannelRef::new(sender));
+        let mut handler = CloseProbe { called: false };
+
+        for invalid in [ChannelId(999), id] {
+            let mut packet = vec![msg::CHANNEL_CLOSE];
+            invalid.encode(&mut packet).unwrap();
+            session.process_packet(&mut handler, &packet).await.unwrap();
+        }
+        assert!(!handler.called);
+        assert!(session.channels.contains_key(&id));
+        assert!(
+            session
+                .common
+                .encrypted
+                .as_ref()
+                .unwrap()
+                .channels
+                .contains_key(&id)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[cfg(feature = "flate2")]
     fn authenticated_session() -> Session {
         let config = Arc::new(Config::default());
         let (receiver_sender, receiver) = channel(config.channel_buffer_size);
@@ -2484,6 +2552,7 @@ mod tests {
                     server_mac: mac::NONE,
                     session_id: CryptoVec::new(),
                     channels: HashMap::new(),
+                    closing_channels: Default::default(),
                     last_channel_id: Wrapping(0),
                     write: Vec::new(),
                     write_cursor: 0,

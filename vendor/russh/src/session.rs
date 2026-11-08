@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::mem::replace;
 use std::num::Wrapping;
@@ -46,6 +46,8 @@ pub(crate) struct Encrypted {
     pub server_mac: mac::Name,
     pub session_id: CryptoVec,
     pub channels: HashMap<ChannelId, ChannelParams>,
+    /// Established channels whose local CLOSE is awaiting the peer's CLOSE.
+    pub closing_channels: HashSet<ChannelId>,
     pub last_channel_id: Wrapping<u32>,
     // Non-sensitive packet assembly buffer, analogous to
     // OpenSSH sshbuf (output side).  Not mlocked because it
@@ -179,6 +181,7 @@ impl<C> CommonSession<C> {
             session_id: newkeys.session_id,
             state,
             channels: HashMap::new(),
+            closing_channels: HashSet::new(),
             last_channel_id: Wrapping(1),
             write: Vec::new(),
             write_cursor: 0,
@@ -289,9 +292,35 @@ impl Encrypted {
             channel.pending_close = true;
         } else {
             self.byte(channel, msg::CHANNEL_CLOSE)?;
-            self.channels.remove(&channel);
+            if let Some(params) = self.channels.remove(&channel) {
+                // Only an established channel may admit the peer's closing acknowledgement.
+                if params.confirmed {
+                    self.closing_channels.insert(channel);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Complete a close handshake, returning whether this channel admitted CLOSE.
+    pub fn close_received(&mut self, channel: ChannelId) -> Result<bool, crate::Error> {
+        if self.closing_channels.remove(&channel) {
+            return Ok(true);
+        }
+        // Caller validation: unknown and unconfirmed channel IDs must not reach callbacks.
+        if !self
+            .channels
+            .get(&channel)
+            .is_some_and(|params| params.confirmed)
+        {
+            return Ok(false);
+        }
+
+        // The peer has closed: queued output can no longer drain against its receive window.
+        // Reply immediately instead of leaving CLOSE behind that output.
+        self.byte(channel, msg::CHANNEL_CLOSE)?;
+        self.channels.remove(&channel);
+        Ok(true)
     }
 
     pub fn sender_window_size(&self, channel: ChannelId) -> usize {
@@ -760,6 +789,9 @@ impl Encrypted {
         while self
             .channels
             .contains_key(&ChannelId(self.last_channel_id.0))
+            || self
+                .closing_channels
+                .contains(&ChannelId(self.last_channel_id.0))
         {
             self.last_channel_id += Wrapping(1)
         }
@@ -768,6 +800,13 @@ impl Encrypted {
     pub fn new_channel(&mut self, window_size: u32, maxpacket: u32) -> ChannelId {
         loop {
             self.last_channel_id += Wrapping(1);
+            // A close acknowledgement still refers to the old channel until the handshake ends.
+            if self
+                .closing_channels
+                .contains(&ChannelId(self.last_channel_id.0))
+            {
+                continue;
+            }
             if let std::collections::hash_map::Entry::Vacant(vacant_entry) =
                 self.channels.entry(ChannelId(self.last_channel_id.0))
             {
@@ -881,6 +920,7 @@ mod tests {
             server_mac: mac::NONE,
             session_id: CryptoVec::new(),
             channels: HashMap::new(),
+            closing_channels: Default::default(),
             last_channel_id: Wrapping(0),
             write: Vec::new(),
             write_cursor: 0,
@@ -967,6 +1007,118 @@ mod tests {
             pending_eof,
             pending_close,
         }
+    }
+
+    #[test]
+    fn close_lifecycle_local_close_retains_only_the_acknowledgement() {
+        let id = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted.channels.insert(id, test_ready_channel(id, 42));
+
+        encrypted.close(id).unwrap();
+        assert!(!encrypted.channels.contains_key(&id));
+        assert!(encrypted.closing_channels.contains(&id));
+        encrypted.close(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+        assert!(encrypted.close_received(id).unwrap());
+        assert!(!encrypted.closing_channels.contains(&id));
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+        assert!(!encrypted.close_received(id).unwrap());
+    }
+
+    #[test]
+    fn close_lifecycle_peer_close_discards_blocked_output_and_pending_controls() {
+        let id = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(id, test_channel_windowed(id, 42, 0, true, true));
+        encrypted.flush_pending(id).unwrap();
+        assert!(encrypted.write.is_empty());
+        assert!(encrypted.has_pending_data(id));
+
+        assert!(encrypted.close_received(id).unwrap());
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+        assert!(!encrypted.channels.contains_key(&id));
+        assert!(!encrypted.closing_channels.contains(&id));
+        encrypted.flush_pending(id).unwrap();
+        assert_eq!(packet_types(&encrypted.write), vec![msg::CHANNEL_CLOSE]);
+    }
+
+    #[test]
+    fn close_lifecycle_simultaneous_close_emits_one_close_per_side() {
+        let id = ChannelId(10);
+        let mut client = test_encrypted();
+        let mut server = test_encrypted();
+        client.channels.insert(id, test_ready_channel(id, 42));
+        server.channels.insert(id, test_ready_channel(id, 42));
+        client.close(id).unwrap();
+        server.close(id).unwrap();
+        assert!(client.closing_channels.contains(&id));
+        assert!(server.closing_channels.contains(&id));
+
+        assert!(client.close_received(id).unwrap());
+        assert!(server.close_received(id).unwrap());
+        assert!(client.closing_channels.is_empty());
+        assert!(server.closing_channels.is_empty());
+        assert_eq!(packet_types(&client.write), vec![msg::CHANNEL_CLOSE]);
+        assert_eq!(packet_types(&server.write), vec![msg::CHANNEL_CLOSE]);
+    }
+
+    #[test]
+    fn close_lifecycle_pending_close_waits_for_data_then_admits_acknowledgement() {
+        let id = ChannelId(10);
+        let mut encrypted = test_encrypted();
+        encrypted
+            .channels
+            .insert(id, test_channel_windowed(id, 42, 0, true, false));
+        encrypted.close(id).unwrap();
+        assert!(encrypted.channels[&id].pending_close);
+        assert!(!encrypted.closing_channels.contains(&id));
+        assert!(encrypted.write.is_empty());
+
+        encrypted
+            .channels
+            .get_mut(&id)
+            .unwrap()
+            .recipient_window_size = 1024;
+        encrypted.flush_pending(id).unwrap();
+        assert_eq!(
+            packet_types(&encrypted.write),
+            vec![msg::CHANNEL_DATA, msg::CHANNEL_EOF, msg::CHANNEL_CLOSE]
+        );
+        assert!(encrypted.closing_channels.contains(&id));
+        assert!(encrypted.close_received(id).unwrap());
+        assert!(!encrypted.closing_channels.contains(&id));
+    }
+
+    #[test]
+    fn close_lifecycle_unknown_and_unconfirmed_ids_do_not_admit_close() {
+        let mut encrypted = test_encrypted();
+        let id = encrypted.new_channel(1024, 1024);
+        assert!(!encrypted.channels[&id].confirmed);
+        assert!(!encrypted.close_received(id).unwrap());
+        assert!(encrypted.channels.contains_key(&id));
+        assert!(!encrypted.close_received(ChannelId(999)).unwrap());
+        encrypted.close(id).unwrap();
+        assert!(!encrypted.closing_channels.contains(&id));
+        assert!(!encrypted.close_received(id).unwrap());
+    }
+
+    #[test]
+    fn close_lifecycle_allocators_do_not_reuse_ids_awaiting_acknowledgement() {
+        let mut encrypted = test_encrypted();
+        let id = ChannelId(1);
+        encrypted.channels.insert(id, test_ready_channel(id, 42));
+        encrypted.close(id).unwrap();
+        assert!(encrypted.closing_channels.contains(&id));
+        encrypted.last_channel_id = Wrapping(0);
+        assert_ne!(encrypted.new_channel_id(), id);
+        encrypted.last_channel_id = Wrapping(0);
+        assert_ne!(encrypted.new_channel(1024, 1024), id);
+        assert!(encrypted.close_received(id).unwrap());
+        encrypted.last_channel_id = Wrapping(0);
+        assert_eq!(encrypted.new_channel_id(), id);
     }
 
     // flush_pending (single-channel path)
