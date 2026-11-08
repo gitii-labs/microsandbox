@@ -24,6 +24,11 @@ impl RuntimeExit {
         let Some(process) = Self::capture_pid(pid)? else {
             return Ok(None);
         };
+        // Process ownership: an exited thread group has no live owner to authenticate.
+        // Its unreaped /proc entry can deny fd metadata access even to the parent.
+        if process.has_exited()? {
+            return Ok(None);
+        }
         let pid = process.pid;
         let inherited = format!(
             "/proc/{pid}/fd/{}",
@@ -32,7 +37,14 @@ impl RuntimeExit {
         let actual = match std::fs::metadata(inherited) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => {
+                // Close the exit race after the initial pidfd check. Only proven whole-process
+                // exit replaces this metadata failure; live permission errors remain errors.
+                if process.has_exited()? {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
         };
         let expected = std::fs::metadata(lifecycle)?;
         // A stale catalog PID can point to an unrelated process. Require the runtime's
@@ -277,5 +289,121 @@ mod tests {
             .is_none()
         );
         assert!(RuntimeExit::capture(None, home.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn exited_unreaped_process_does_not_require_proc_fd_access() {
+        let home = tempfile::tempdir().unwrap();
+        let lifecycle =
+            microsandbox_runtime::ipc::acquire_lifecycle_guard(home.path(), "exited").unwrap();
+        let fd = lifecycle.as_raw_fd();
+        let mut command = Command::new("bash");
+        command.args(["-c", "exit 0"]);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, microsandbox_runtime::vm::LIFECYCLE_LOCK_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = scopeguard::guard(command.spawn().unwrap(), |mut child| {
+            // Reap only this helper, including assertion failures before the exit check.
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let result = {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.id(),
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                },
+                0,
+                "wait for real child exit without reaping: {}",
+                std::io::Error::last_os_error()
+            );
+            let process = RuntimeExit::capture_pid(Some(child.id() as i32))
+                .unwrap()
+                .expect("unreaped child must still have a pidfd");
+            assert!(process.has_exited().unwrap());
+            RuntimeExit::capture(
+                Some(child.id() as i32),
+                &microsandbox_runtime::ipc::lifecycle_lock_path(home.path(), "exited"),
+            )
+        };
+        assert!(
+            child.wait().unwrap().success(),
+            "capture must not reap the child"
+        );
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn live_private_process_child() {
+        if std::env::var_os("MSB_CAPTURE_PRIVATE_CHILD").is_none() {
+            return;
+        }
+        // This child's real /proc descriptors must remain inaccessible to its parent.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }, 0);
+        println!("private-ready");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_exact(&mut [0]).unwrap();
+    }
+
+    #[test]
+    fn live_proc_fd_permission_error_is_not_exit_evidence() {
+        let mut child = scopeguard::guard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::local::sandbox::process_exit::tests::live_private_process_child",
+                    "--nocapture",
+                ])
+                .env("MSB_CAPTURE_PRIVATE_CHILD", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            |mut child| {
+                // Own only this private helper; failed assertions must not leave it blocked.
+                let _ = child.kill();
+                let _ = child.wait();
+            },
+        );
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(output.read_line(&mut line).unwrap(), 0);
+            if line.trim() == "private-ready" {
+                break;
+            }
+        }
+        let pid = child.id() as i32;
+        assert!(
+            !RuntimeExit::capture_pid(Some(pid))
+                .unwrap()
+                .unwrap()
+                .has_exited()
+                .unwrap()
+        );
+        let inherited = format!(
+            "/proc/{pid}/fd/{}",
+            microsandbox_runtime::vm::LIFECYCLE_LOCK_FD
+        );
+        assert_eq!(
+            std::fs::metadata(inherited).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let error = RuntimeExit::capture(Some(pid), Path::new("unused-live-owner-path"))
+            .err()
+            .expect("a live inaccessible owner must remain an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
     }
 }
