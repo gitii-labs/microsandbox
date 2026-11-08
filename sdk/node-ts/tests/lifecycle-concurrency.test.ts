@@ -29,10 +29,14 @@ async function fixture(label: string, run: (source: Sandbox, observer: Sandbox) 
   const name = `node-concurrency-${label}-${process.pid}`;
   const source = await Sandbox.builder(name).image("alpine").rootDisk(512).memory(256).create();
   let observer: Sandbox | undefined;
+  let testError: unknown;
   try {
     observer = await (await Sandbox.get(name)).connect();
     await run(source, observer);
-  } finally {
+  } catch (error) {
+    testError = error;
+  }
+  try {
     // A separate handle can recover a paused VM even if the tested wrapper is
     // consumed or regresses to holding its lock while waiting for the guest.
     const handle = await Sandbox.get(name).catch(error => {
@@ -44,7 +48,12 @@ async function fixture(label: string, run: (source: Sandbox, observer: Sandbox) 
       await handle.stop();
       await Sandbox.remove(name);
     }
+  } catch (cleanupError) {
+    // Retain the test failure when teardown also fails instead of replacing it.
+    if (testError !== undefined) throw new AggregateError([testError, cleanupError], "Lifecycle test and cleanup failed");
+    throw cleanupError;
   }
+  if (testError !== undefined) throw testError;
 }
 
 async function gatedExec(source: Sandbox, observer: Sandbox) {
