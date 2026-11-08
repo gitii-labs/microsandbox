@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import io
+import os
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -53,6 +55,51 @@ class RuntimeArchiveTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.archive = self.root / "runtime.tar.gz"
         self.firmware, self.ffi, self.links = inventory("linux", "5.6.1", "5")
+
+    def test_cache_paths_stay_job_local_without_run_identity_in_fingerprint(
+        self,
+    ) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github/workflows/runtime-release.yml"
+        ).read_text()
+        build = workflow.split("  build:\n", 1)[1].split("  release:\n", 1)[0]
+        script = build.split(
+            "- name: Prepare job-local toolchain paths\n        run: |\n", 1
+        )[1].split("\n      - uses:", 1)[0]
+        script = script.replace("${{ matrix.os }}", "darwin").replace(
+            "${{ matrix.arch }}", "arm64"
+        )
+        script = "\n".join(line[10:] for line in script.splitlines())
+        environments = []
+        for run_id, attempt in (("100", "1"), ("200", "2")):
+            output = self.root / f"env-{run_id}"
+            subprocess.run(
+                ["bash", "-euc", script],
+                check=True,
+                env={
+                    **os.environ,
+                    "RUNNER_TEMP": str(self.root),
+                    "GITHUB_ENV": str(output),
+                    "GITHUB_RUN_ID": run_id,
+                    "GITHUB_RUN_ATTEMPT": attempt,
+                },
+            )
+            environments.append(
+                dict(line.split("=", 1) for line in output.read_text().splitlines())
+            )
+        self.assertEqual(environments[0], environments[1])
+        self.assertEqual(
+            environments[0]["CARGO_HOME"], str(self.root / "runtime-cargo-darwin-arm64")
+        )
+        self.assertEqual(
+            environments[0]["RUSTUP_HOME"],
+            str(self.root / "runtime-rustup-darwin-arm64"),
+        )
+        self.assertIn("add-rust-environment-hash-key: true", build)
+        self.assertIn("env-vars: MACOSX_DEPLOYMENT_TARGET LIBKRUNFW_", build)
+        self.assertIn("toolchain: ${{ env.RUST_TOOLCHAIN }}", build)
+        self.assertIn("cache-bin: false", build)
 
     def pack(self, change: str = "") -> None:
         # These bytes test archive structure only. No native load is attempted;
@@ -154,6 +201,7 @@ class RuntimeArchiveTests(unittest.TestCase):
             "msb:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n\t@rpath/libkrunfw.5.dylib (compatibility version 0.0.0)\n",
             "    minos 26.0\n    path @executable_path/../lib (offset 12)\n",
             "26.0",
+            "msb:\n",
         )
 
     def test_darwin_rejects_builder_dependencies_rpaths_and_old_floor(self) -> None:
@@ -173,7 +221,57 @@ class RuntimeArchiveTests(unittest.TestCase):
                 self.subTest(dependencies=dependencies, commands=commands),
                 self.assertRaises(ValueError),
             ):
-                check_darwin_paths(Path("msb"), dependencies, commands, "26.0")
+                check_darwin_paths(
+                    Path("msb"), dependencies, commands, "26.0", "msb:\n"
+                )
+
+    def test_darwin_absolute_dylib_identity_is_not_a_dependency(self) -> None:
+        path = Path("libmicrosandbox_go_ffi.dylib")
+        identity = "/Users/runner/work/microsandbox/target/release/deps/libmicrosandbox_go_ffi.dylib"
+        check_darwin_paths(
+            path,
+            f"{path}:\n\t{identity} (compatibility version 0.0.0, current version 0.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n",
+            f"Load command 0\n          cmd LC_ID_DYLIB\n      cmdsize 128\n         name {identity} (offset 24)\n    minos 26.0\n",
+            "26.0",
+            f"{path}:\n{identity}\n",
+        )
+
+    def test_darwin_dylib_identity_does_not_hide_bad_dependency(self) -> None:
+        path = Path("libmicrosandbox_go_ffi.dylib")
+        identity = "/Users/runner/work/target/release/libmicrosandbox_go_ffi.dylib"
+        with self.assertRaisesRegex(ValueError, "nonportable Mach-O dependency"):
+            check_darwin_paths(
+                path,
+                f"{path}:\n\t{identity} (compatibility version 0.0.0)\n\t/Users/runner/build/libdependency.dylib (compatibility version 1.0.0)\n",
+                "    minos 26.0\n",
+                "26.0",
+                f"{path}:\n{identity}\n",
+            )
+
+    def test_darwin_requires_proven_identity_before_skipping_first_entry(self) -> None:
+        path = Path("libmicrosandbox_go_ffi.dylib")
+        for install_names in (f"{path}:\n", f"{path}:\n/some/other/identity.dylib\n"):
+            with (
+                self.subTest(install_names=install_names),
+                self.assertRaises(ValueError),
+            ):
+                check_darwin_paths(
+                    path,
+                    f"{path}:\n\t/Users/runner/build/libdependency.dylib (compatibility version 1.0.0)\n",
+                    "    minos 26.0\n",
+                    "26.0",
+                    install_names,
+                )
+
+    def test_darwin_executable_first_dependency_is_not_an_identity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "nonportable Mach-O dependency"):
+            check_darwin_paths(
+                Path("msb"),
+                "msb:\n\t/Users/runner/build/libdependency.dylib (compatibility version 1.0.0)\n",
+                "    minos 26.0\n",
+                "26.0",
+                "msb:\n",
+            )
 
 
 if __name__ == "__main__":

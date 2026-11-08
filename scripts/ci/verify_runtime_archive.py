@@ -117,19 +117,38 @@ def check_linux(path: Path, arch: str) -> None:
 
 
 def check_darwin_paths(
-    path: Path, dependencies: str, load_commands: str, deployment_target: str
+    path: Path,
+    dependencies: str,
+    load_commands: str,
+    deployment_target: str,
+    install_names: str,
 ) -> None:
     require(
         "/nix/store/" not in dependencies + load_commands,
         f"Nix Mach-O load path: {path}",
     )
+    # Apple otool -L includes a dylib's LC_ID_DYLIB before its dependencies.
+    # Prove that entry with -D rather than treating a builder's own install name
+    # as a runtime dependency, or blindly skipping an executable's first import.
+    identities = [
+        line.strip() for line in install_names.splitlines()[1:] if line.strip()
+    ]
+    require(
+        len(identities) == (0 if path.name == "msb" else 1),
+        f"unexpected dylib identity: {path}",
+    )
+    imports = [line.strip().split(" (", 1)[0] for line in dependencies.splitlines()[1:]]
+    if identities:
+        require(
+            bool(imports) and imports[0] == identities[0],
+            f"otool dylib identity mismatch: {path}",
+        )
+        imports = imports[1:]
     # Reject builder-specific dependencies/rpaths; the native load below also
     # proves that permitted relative/system paths actually resolve.
-    for line in dependencies.splitlines()[1:]:
-        dependency = line.strip().split(" (", 1)[0]
+    for dependency in imports:
         require(
-            dependency == path.name
-            or dependency.startswith(
+            dependency.startswith(
                 (
                     "/usr/lib/",
                     "/System/Library/",
@@ -167,6 +186,7 @@ def check_darwin(path: Path, deployment_target: str) -> None:
         command("otool", "-L", str(path)),
         command("otool", "-l", str(path)),
         deployment_target,
+        command("otool", "-D", str(path)),
     )
 
 

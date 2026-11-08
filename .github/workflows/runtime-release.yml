@@ -146,12 +146,14 @@ jobs:
     steps:
       # Keep toolchain defaults and verification state inside this job, including
       # on the operator's self-hosted Apple Silicon runner.
+      # RUNNER_TEMP is cleared between jobs; stable paths also keep rust-cache's
+      # built-in CARGO/RUST environment fingerprint reusable across runs.
       - name: Prepare job-local toolchain paths
         run: |
           set -euo pipefail
           {
-            echo "RUSTUP_HOME=$RUNNER_TEMP/runtime-rustup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ matrix.os }}-${{ matrix.arch }}"
-            echo "CARGO_HOME=$RUNNER_TEMP/runtime-cargo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${{ matrix.os }}-${{ matrix.arch }}"
+            echo "RUSTUP_HOME=$RUNNER_TEMP/runtime-rustup-${{ matrix.os }}-${{ matrix.arch }}"
+            echo "CARGO_HOME=$RUNNER_TEMP/runtime-cargo-${{ matrix.os }}-${{ matrix.arch }}"
             echo "TMPDIR=$RUNNER_TEMP"
           } >> "$GITHUB_ENV"
 
@@ -167,6 +169,10 @@ jobs:
         with:
           key: ${{ matrix.os }}-${{ matrix.arch }}
           cache-bin: false
+          # Keep compiler/flags/manifests/lockfile hashing, and also include
+          # the deployment floor and embedded firmware metadata.
+          add-rust-environment-hash-key: true
+          env-vars: MACOSX_DEPLOYMENT_TARGET LIBKRUNFW_
 
       - name: Install build dependencies
         if: matrix.os == 'linux'
