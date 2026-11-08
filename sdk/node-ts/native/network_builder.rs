@@ -274,6 +274,15 @@ impl JsNetworkBuilder {
         Ok(self)
     }
 
+    /// Set the active inbound TCP cap; zero is unlimited. Omitted uses the runtime default.
+    #[napi(js_name = "maxInboundTcpConnections")]
+    pub fn max_inbound_tcp_connections(&mut self, value: f64) -> Result<&Self> {
+        let value = crate::numeric::safe_integer(value, "maxInboundTcpConnections")?;
+        let prev = self.take_inner();
+        self.inner = Some(prev.max_inbound_tcp_connections(value as usize));
+        Ok(self)
+    }
+
     /// Set the accept-queue depth for published TCP port listeners, 1..=2147483647. Defaults to
     /// 1024; the host kernel clamps it to its own somaxconn.
     #[napi(js_name = "tcpAcceptQueueSize")]
@@ -359,9 +368,21 @@ impl JsNetworkBuilder {
             let prev = self.take_inner();
             self.inner = Some(prev.http(|h| h.deny_response(enabled)));
         }
+        if let Some(format) = returned.format {
+            let prev = self.take_inner();
+            self.inner = Some(prev.http(|h| h.deny_response_format(format)));
+        }
         if let Some(message) = returned.message.clone() {
             let prev = self.take_inner();
             self.inner = Some(prev.http(|h| h.deny_message(message)));
+        }
+        if let Some(message) = returned.network_message.clone() {
+            let prev = self.take_inner();
+            self.inner = Some(prev.http(|h| h.network_deny_message(message)));
+        }
+        if let Some(message) = returned.secret_message.clone() {
+            let prev = self.take_inner();
+            self.inner = Some(prev.http(|h| h.secret_deny_message(message)));
         }
         Ok(self)
     }

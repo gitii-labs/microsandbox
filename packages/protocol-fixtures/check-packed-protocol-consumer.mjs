@@ -11,7 +11,7 @@ const consumer = process.argv[2];
 if (!consumer) throw new Error("Usage: node check-packed-protocol-consumer.mjs <installed-consumer-directory>");
 const fixtures = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(path.join(fixtures, "../protocol-client/typescript/package.json"));
-const ts = require("typescript");
+const compiler = path.join(path.dirname(require.resolve("typescript/package.json")), "bin", "tsc");
 const installed = path.join(path.resolve(consumer), "node_modules/@microsandbox/protocol-client");
 if (lstatSync(installed).isSymbolicLink()) throw new Error("Consumer must install a package, not a workspace symlink");
 const installedRoot = realpathSync(installed);
@@ -23,23 +23,23 @@ const output = mkdtempSync(path.join(path.resolve(consumer), "protocol-consumer-
 const source = path.join(output, "consumer.ts");
 writeFileSync(path.join(output, "package.json"), JSON.stringify({ type: "module", private: true }));
 writeFileSync(source, readFileSync(path.join(fixtures, "consumer-typescript.ts")));
-const options = {
-  target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.NodeNext,
-  moduleResolution: ts.ModuleResolutionKind.NodeNext, strict: true,
-  noUncheckedIndexedAccess: true, types: [], lib: ["lib.es2023.d.ts", "lib.dom.d.ts"],
-};
-const program = ts.createProgram([source], options);
-const declaration = program.getSourceFiles().find(file => realpathSync(file.fileName) === path.join(installedRoot, "dist/index.d.ts"));
+const config = path.join(output, "tsconfig.json");
+writeFileSync(config, JSON.stringify({
+  compilerOptions: {
+    target: "ES2023", module: "NodeNext", moduleResolution: "NodeNext", strict: true,
+    noUncheckedIndexedAccess: true, types: [], lib: ["ES2023", "DOM"], noEmitOnError: true,
+  },
+  files: [source],
+}));
+const compiled = spawnSync(process.execPath, [compiler, "--project", config, "--listFiles"], { encoding: "utf8" });
+if (compiled.error) throw compiled.error;
+const declaration = compiled.stdout.split(/\r?\n/).some(file => path.normalize(file) === path.join(installedRoot, "dist/index.d.ts"));
 if (!declaration) throw new Error("Consumer did not resolve the installed public declarations");
-const diagnostics = ts.getPreEmitDiagnostics(program);
-if (diagnostics.length) {
-  process.stderr.write(ts.formatDiagnosticsWithColorAndContext(diagnostics, {
-    getCurrentDirectory: () => output, getCanonicalFileName: name => name, getNewLine: () => "\n",
-  }));
+// Compiler failures, including signals, must fail the packed-consumer proof.
+if (compiled.status !== 0) {
+  process.stderr.write(compiled.stdout); process.stderr.write(compiled.stderr);
   process.exitCode = 1;
 } else {
-  const emitted = program.emit();
-  if (emitted.emitSkipped) throw new Error("Consumer emit was skipped");
   const run = spawnSync(process.execPath, [path.join(output, "consumer.js")], { encoding: "utf8", timeout: 15_000 });
   process.stdout.write(run.stdout ?? ""); process.stderr.write(run.stderr ?? "");
   if (run.error) throw run.error;

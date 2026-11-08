@@ -3,9 +3,13 @@
 package ffi
 
 /*
+#cgo CFLAGS: -DMSB_GO_TCP_TEST_FIXTURE
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <dlfcn.h>
+
+void *tcp_test_library_handle(void);
 
 typedef char *(*test_dial_fn)(uint64_t, uint8_t *, size_t);
 typedef char *(*test_event_fn)(uint64_t, uint64_t, uint8_t, uint8_t *, size_t);
@@ -47,24 +51,22 @@ func tcpFixtureSymbol(name string) (unsafe.Pointer, error) {
 	if library == "" {
 		return nil, fmt.Errorf("MICROSANDBOX_FFI_PATH is required for TCP native tests")
 	}
-	// Load this exact image, rather than an SDK-materialized copy with an independent registry.
+	// Load when running internal FFI tests without the SDK auto-loader. If the SDK
+	// already loaded a materialized copy, Load retains that image instead.
 	if err := Load(library); err != nil {
 		return nil, err
 	}
-	path := C.CString(library)
-	defer C.free(unsafe.Pointer(path))
-	handle := C.dlopen(path, C.RTLD_NOW|C.RTLD_LOCAL)
+	handle := C.tcp_test_library_handle()
 	if handle == nil {
-		return nil, fmt.Errorf("load TCP test fixture: %s", C.GoString(C.dlerror()))
+		return nil, fmt.Errorf("load TCP test fixture: native SDK library is not loaded")
 	}
-	defer C.dlclose(handle)
 	symbol := C.CString(name)
 	defer C.free(unsafe.Pointer(symbol))
 	fn := C.dlsym(handle, symbol)
 	if fn == nil {
 		return nil, fmt.Errorf("TCP native library must be built with tcp-test-fixture: %s", C.GoString(C.dlerror()))
 	}
-	return fn, nil // ensureLoaded keeps this same library loaded for the process lifetime.
+	return fn, nil // The production loader retains this image for the process lifetime.
 }
 
 func fixtureDialResult(ctx context.Context) (string, error) {

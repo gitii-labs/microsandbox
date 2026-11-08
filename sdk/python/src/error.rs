@@ -15,7 +15,7 @@ pub fn consumed() -> PyErr {
 /// backend but have no SDK [`Operation`] (Python-only diagnostic hooks).
 pub fn local_only(name: &str) -> PyErr {
     let msg = format!("{name}() is not supported by this backend: use a local backend");
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let instance = py
             .import("microsandbox.errors")
             .and_then(|m| m.getattr("UnsupportedError"))
@@ -37,7 +37,7 @@ pub fn to_py_err(err: microsandbox::MicrosandboxError) -> PyErr {
         return pyo3::exceptions::PyFileNotFoundError::new_err(err.to_string());
     }
 
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let errors_mod = match py.import("microsandbox.errors") {
             Ok(m) => m,
             Err(_) => return pyo3::exceptions::PyRuntimeError::new_err(err.to_string()),
@@ -51,7 +51,7 @@ pub fn to_py_err(err: microsandbox::MicrosandboxError) -> PyErr {
                     pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
                 })?;
                 let details = py.import("json")?.call_method1("loads", (payload,))?;
-                let details = details.downcast::<pyo3::types::PyDict>()?;
+                let details = details.cast::<pyo3::types::PyDict>()?;
                 errors_mod
                     .getattr("SnapshotSourceRecoveryError")?
                     .call((err.to_string(),), Some(details))
@@ -95,9 +95,12 @@ pub fn to_py_err(err: microsandbox::MicrosandboxError) -> PyErr {
         let (cls_name, msg) = match &err {
             RuntimeNotInstalled(_) => ("RuntimeNotInstalledError", err.to_string()),
             RuntimeIncomplete(_) => ("RuntimeIncompleteError", err.to_string()),
-            InvalidConfig(_) => ("InvalidConfigError", err.to_string()),
+            InvalidConfig(_) | MissingRestoreBindings { .. } => {
+                ("InvalidConfigError", err.to_string())
+            }
             NoDefaultCommand => ("NoDefaultCommandError", err.to_string()),
             CloudHttp { .. } => ("CloudHttpError", err.to_string()),
+            ModificationNotConfirmed { .. } => ("ModificationNotConfirmedError", err.to_string()),
             SandboxNotFound(_) => ("SandboxNotFoundError", err.to_string()),
             SandboxAlreadyExists(_) => ("SandboxAlreadyExistsError", err.to_string()),
             SandboxReplaced { .. } => ("SandboxReplacedError", err.to_string()),
@@ -172,4 +175,57 @@ fn camel_to_snake(name: &str) -> String {
         }
     }
     out
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Make `microsandbox.errors` importable from the source tree without the
+    /// native module: an empty `microsandbox` package over the source dir.
+    fn import_source_errors(py: Python<'_>) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/microsandbox");
+        let package = pyo3::types::PyModule::new(py, "microsandbox").unwrap();
+        package.setattr("__path__", vec![dir]).unwrap();
+        py.import("sys")
+            .unwrap()
+            .getattr("modules")
+            .unwrap()
+            .set_item("microsandbox", package)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_unconfirmed_modification_keeps_its_class_and_message() {
+        Python::initialize();
+        Python::attach(|py| {
+            import_source_errors(py);
+            let error = microsandbox::MicrosandboxError::ModificationNotConfirmed {
+                cause: "the running sandbox does not hold the secret".to_string(),
+            };
+            let message = error.to_string();
+
+            let raised = to_py_err(error);
+            let class = py
+                .import("microsandbox.errors")
+                .unwrap()
+                .getattr("ModificationNotConfirmedError")
+                .unwrap();
+            assert!(raised.value(py).is_instance(&class).unwrap());
+            assert_eq!(raised.value(py).str().unwrap().to_string(), message);
+            assert_eq!(
+                raised
+                    .value(py)
+                    .getattr("code")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "modification-not-confirmed"
+            );
+        });
+    }
 }

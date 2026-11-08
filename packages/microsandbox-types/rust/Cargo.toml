@@ -33,7 +33,7 @@ ts = [
 
 [dependencies]
 chrono.workspace = true
-dprint-plugin-typescript = { version = "=0.95", optional = true }
+dprint-plugin-typescript = { version = "=0.98.1", optional = true }
 hex.workspace = true
 ipnetwork.workspace = true
 microsandbox-types-macros.workspace = true
@@ -47,3 +47,4 @@ utoipa = { version = "6", optional = true, features = ["chrono"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+microsandbox-utils.workspace = true

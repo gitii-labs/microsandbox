@@ -73,7 +73,8 @@ impl LocalBackend {
             .control_sessions
             .database()
             .map_err(MicrosandboxError::ControlClient)?;
-        let endpoints = crate::runtime::sandbox_agent_socket_path_candidates_for(self, name)
+        let endpoints = self
+            .agent_socket_paths(name)
             .iter()
             .map(|path| microsandbox_runtime::control::control_socket_path_for(path))
             .collect::<Vec<_>>();
@@ -233,8 +234,11 @@ async fn current_run(
     sandbox_id: i32,
     allow_starting: bool,
 ) -> ControlClientResult<run::Model> {
+    // Resident pause keeps the same host runtime and run alive. Operation-specific guards
+    // decide what is allowed while paused; identity verification must not retire its session.
     let mut statuses = vec![
         sandbox::SandboxStatus::Running,
+        sandbox::SandboxStatus::Paused,
         sandbox::SandboxStatus::Draining,
     ];
     if allow_starting {

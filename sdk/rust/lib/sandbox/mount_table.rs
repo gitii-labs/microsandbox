@@ -9,7 +9,7 @@ use crate::backend::{Backend, LocalBackend};
 use crate::error::{Operation, UnsupportedReason};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
-use super::{Sandbox, SandboxHandle, modify};
+use super::{Sandbox, SandboxHandle};
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -112,7 +112,7 @@ async fn watch_mount_writes(
         let _transition =
             LocalBackend::acquire_sandbox_transition_guard(&local.config().run_dir(), name).await?;
         let run = local.control_run_identity(name, expected_id).await?;
-        modify::control_session_for_run(local, name, run).await?
+        local.control_session_for_run(name, run).await?
     };
     // Do not retain a lifecycle guard while waiting: stop and mount changes must proceed.
     match session.watch_mount_writes(cursor).await {
@@ -151,7 +151,7 @@ async fn update_mounts(
     let _transition =
         LocalBackend::acquire_sandbox_transition_guard(&local.config().run_dir(), name).await?;
     let run = local.control_run_identity(name, expected_id).await?;
-    let session = modify::control_session_for_run(local, name, run).await?;
+    let session = local.control_session_for_run(name, run).await?;
     // Runtimes that predate mount tables, and sandboxes started without one,
     // report no capability; the request would otherwise fail less clearly.
     if !session.capabilities().mounts_update {

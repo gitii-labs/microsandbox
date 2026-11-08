@@ -1,39 +1,43 @@
 {
-  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.19.0/.schema/devbox.schema.json",
   "packages": {
-    "rustup": "1.28.2",
-    "just": "1.58.0",
-    "pre-commit": "4.3.0",
-    "gcc": "14.3.0",
+    "rustup": "1.29.3",
+    "just": "1.59.0",
+    "pre-commit": "4.7.0",
+    "gcc": "16.2.0",
     "gnumake": "4.4.1",
     "pkg-config": "0.29.2",
+    "path:./packaging/devbox/native#libclang": {
+      "outputs": ["out"]
+    },
     "libcap_ng": {
-      "version": "0.8.5",
+      "version": "0.9.6",
       "outputs": ["out", "dev"]
     },
-    "openssl": {
-      "version": "3.5.1",
+    "path:./packaging/devbox/native#openssl": {
       "outputs": ["out", "dev"]
     },
     "elfutils": {
-      "version": "0.192",
+      "version": "0.195",
       "outputs": ["out", "dev"]
     },
     "flex": "2.6.4",
     "bison": "3.8.2",
-    "bc": "1.08.1",
-    "python": "3.13.14",
-    "python313Packages.pyelftools": "0.32",
+    "bc": "1.08.2",
+    "path:./packaging/devbox/native#python": {},
     "patch": "2.8",
-    "xz": "5.8.1",
-    "perl": "5.40.0",
-    "git": "2.50.1",
-    "go": "1.26"
+    "xz": "5.8.4",
+    "perl": "5.42.3",
+    "git": "2.56.0",
+    "go": "1.27.3",
+    "ruby": "4.0.9"
   },
   "env": {
     "RUSTUP_HOME": "$DEVBOX_PROJECT_ROOT/.devbox/rustup",
     "CARGO_HOME": "$DEVBOX_PROJECT_ROOT/.devbox/cargo",
-    "RUST_TOOLCHAIN_VERSION": "1.94.0",
+    "RUST_TOOLCHAIN_VERSION": "1.99.1",
+    "LIBCLANG_PATH": "$DEVBOX_PROJECT_ROOT/.devbox/nix/profile/default/lib",
+    "BINDGEN_EXTRA_CLANG_ARGS": "-resource-dir=\"$DEVBOX_PROJECT_ROOT/.devbox/nix/profile/default/lib/clang/23\"",
     "PATH": "$DEVBOX_PROJECT_ROOT/.devbox/cargo/bin:$PATH"
   },
   "shell": {

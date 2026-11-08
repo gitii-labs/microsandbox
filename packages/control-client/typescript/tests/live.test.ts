@@ -56,17 +56,18 @@ it.skipIf(!endpoint)("live runtime: JSON and fragmented/native/raw/checked CBOR,
     const unknown = await client.request(typedMessage("extension.not_registered", { data: true }));
     expect(unknown.type).toBe("control.error");
     expect(unknown.decodePayload()).toMatchObject({ code: "unsupported_operation", effect: "none" });
-    const invalid = await client.requestRaw(0, encodeEnvelope({ v: 1, t: "control.memory.target", p: encodeRecord({ total_mib: "wrong" }) }));
+    const generation = client.ready.welcome.generation;
+    const invalid = await client.requestRaw(0, encodeEnvelope({ v: generation, t: "control.memory.target", p: encodeRecord({ total_mib: "wrong" }) }));
     expect(decodeEnvelope(invalid.body).t).toBe("control.error");
 
-    const raw = await client.openStreamRaw(0, encodeEnvelope({ v: 1, t: "control.cpu.state", p: encodeRecord({}) }));
+    const raw = await client.openStreamRaw(0, encodeEnvelope({ v: generation, t: "control.cpu.state", p: encodeRecord({}) }));
     const { sender, receiver } = raw.split();
     expect(decodeEnvelope((await receiver.next())!.body).t).toBe("control.cpu.state");
     expect(await receiver.next()).toBeNull(); receiver.close(); sender.close();
 
     // Exact packets bypass subscriptions. Their unregistered terminal replies
     // must not disrupt the next managed exchange on this same connection.
-    await client.writeUnchecked(encodeFrame({ id: 0xffffffff, flags: 0, body: encodeEnvelope({ v: 1, t: "control.capabilities", p: encodeRecord({}) }) }));
+    await client.writeUnchecked(encodeFrame({ id: 0xffffffff, flags: 0, body: encodeEnvelope({ v: generation, t: "control.capabilities", p: encodeRecord({}) }) }));
     expect(await client.requestTyped(new GetCapabilities())).toEqual(caps);
     if (caps.secrets_update) expect(await client.requestTyped(new UpdateSecrets([]))).toEqual({ outcome: "complete", applied_count: 0 });
     else await expect(client.requestTyped(new UpdateSecrets([]))).rejects.toMatchObject({ code: "peer", peerError: { code: "secrets_update_unavailable", effect: "none" } });

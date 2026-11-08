@@ -45,7 +45,7 @@ engine = [
 ]
 
 [dependencies]
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23.1", optional = true }
 bytes = { workspace = true, optional = true }
 crossbeam-queue = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
@@ -65,7 +65,7 @@ microsandbox-utils.workspace = true
 msb_krun = { workspace = true, features = ["net"], optional = true }
 msb_krun_utils = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
-pem = { version = "3", optional = true }
+pem = { version = "4.0.0", optional = true }
 percent-encoding = { version = "2", optional = true }
 rand = { workspace = true }
 rcgen = { workspace = true, optional = true }
@@ -88,6 +88,7 @@ smoltcp = { workspace = true, optional = true, features = [
     "socket-dns",
     "socket-icmp",
     "socket-tcp",
+    "socket-tcp-pause-synack",
     "socket-udp",
 ] }
 thiserror = { workspace = true }
@@ -102,10 +103,9 @@ zeroize = { workspace = true }
 # than /etc/resolv.conf. On VPN + split-DNS setups, the file version is
 # stale or incomplete. These deps let us query the live system state.
 [target.'cfg(target_os = "macos")'.dependencies]
-# Pinned to 0.9 to match system-configuration 0.7. Bumping to 0.10 would
-# create two incompatible CFString/CFArray/... types in the build.
-core-foundation = { version = "0.9", optional = true }
-system-configuration = { version = "0.7", optional = true }
+# Keep Core Foundation types aligned with system-configuration.
+core-foundation = { version = "0.10.1", optional = true }
+system-configuration = { version = "0.8.0", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_Dns", "Win32_System_LibraryLoader"], optional = true }

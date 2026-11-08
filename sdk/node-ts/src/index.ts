@@ -22,7 +22,7 @@ export {
 } from "./runtime.js";
 export type { BackendInfo, DefaultBackend } from "./runtime.js";
 export { SecretSource } from "./network-config.js";
-export type { OutboundProxy } from "./network-config.js";
+export type { OutboundProxy, SecretSubstitution } from "./network-config.js";
 export type { DeploymentProfile } from "./deployment-profile.js";
 
 // Sandbox lifecycle and execution
@@ -49,6 +49,7 @@ export type {
   SandboxPingResult,
   SandboxTouchResult,
   ExternalMountWarning,
+  ForkOptions,
   ForkOutcome,
   BranchOutcome,
 } from "./sandbox.js";
@@ -60,6 +61,8 @@ export type {
   ModificationPolicy,
   ModificationWarning,
   ModifyOptions,
+  ModifyPort,
+  ModifyPortEndpoint,
   PlannedChange,
   ResourceConvergenceState,
   ResourceKind,
@@ -477,6 +480,7 @@ export {
   MetricsDisabledError,
   MetricsUnavailableError,
   MicrosandboxError,
+  ModificationNotConfirmedError,
   NixError,
   PatchFailedError,
   ProtocolError,
@@ -630,3 +634,6 @@ export type PortRange = _Types.PortRange;
 
 export const Rule = _Factories.Rule;
 export type Rule = _Types.Rule;
+
+export { Job, JobAttachment, JobError, JobLogStream, JobListBuilder, JobAttachOptionsBuilder } from "./jobs.js";
+export type { JobInfo, JobPage, JobExit, JobLogEntry, JobLogOptions, JobEvent, JobState } from "./jobs.js";

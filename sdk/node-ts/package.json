@@ -5,7 +5,7 @@
     "url": "git+https://github.com/superradcompany/microsandbox.git",
     "directory": "sdk/node-ts"
   },
-  "version": "0.7.6",
+  "version": "0.7.13",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -49,24 +49,25 @@
     "build:ts": "npm run build --workspace @microsandbox/types && tsc -p tsconfig.json",
     "build": "npm run build:native && npm run build:ts",
     "build:ci": "npm run build:native:ci && npm run build:ts",
-    "test": "vitest run",
+    "test": "npm run test:cloud-release-probe && vitest run",
+    "test:cloud-release-probe": "node --test scripts/cloud-release-smoke.test.mts",
     "test:unit": "vitest run tests/unit",
     "test:smoke": "vitest run tests/smoke.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck:native",
-    "typecheck:native": "tsc --noEmit --skipLibCheck false --target ES2022 --moduleResolution NodeNext --module NodeNext native/index.d.ts"
+    "typecheck:native": "tsc --ignoreConfig --noEmit --skipLibCheck false --types node --target ES2022 --moduleResolution NodeNext --module NodeNext native/index.d.ts"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3",
-    "@types/node": "^25.5.2",
-    "typescript": "^5.6",
-    "vitest": "^5.0"
+    "@napi-rs/cli": "^3.10.12",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
   },
   "optionalDependencies": {
-    "@superradcompany/microsandbox-darwin-arm64": "0.7.6",
-    "@superradcompany/microsandbox-linux-arm64-gnu": "0.7.6",
-    "@superradcompany/microsandbox-linux-x64-gnu": "0.7.6",
-    "@superradcompany/microsandbox-win32-arm64-msvc": "0.7.6",
-    "@superradcompany/microsandbox-win32-x64-msvc": "0.7.6"
+    "@superradcompany/microsandbox-darwin-arm64": "0.7.13",
+    "@superradcompany/microsandbox-linux-arm64-gnu": "0.7.13",
+    "@superradcompany/microsandbox-linux-x64-gnu": "0.7.13",
+    "@superradcompany/microsandbox-win32-arm64-msvc": "0.7.13",
+    "@superradcompany/microsandbox-win32-x64-msvc": "0.7.13"
   },
   "files": [
     "dist",
@@ -76,7 +77,7 @@
     "README.md"
   ],
   "dependencies": {
-    "@microsandbox/types": "0.7.6"
+    "@microsandbox/types": "0.7.13"
   },
   "workspaces": [
     "../../packages/microsandbox-types/typescript"

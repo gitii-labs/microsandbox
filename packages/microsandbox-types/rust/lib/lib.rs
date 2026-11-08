@@ -2,10 +2,13 @@
 
 #![warn(missing_docs)]
 
+extern crate self as microsandbox_types;
+
 mod cloud;
 mod command;
 mod domain;
 mod error;
+mod exec;
 
 #[doc(hidden)]
 pub mod compat;
@@ -14,6 +17,9 @@ mod guest_flush;
 pub mod helpers;
 pub mod modify;
 mod registry;
+mod secret;
+#[doc(hidden)]
+pub mod secret_plan;
 pub mod snapshot;
 mod validation;
 
@@ -27,15 +33,22 @@ pub mod typescript;
 pub use microsandbox_types_macros::ConfigPatch;
 
 pub use cloud::{
+    CLOUD_MODIFICATION_FAILED, CLOUD_MODIFICATION_IN_PROGRESS, CLOUD_MODIFICATION_REFUSED,
+    CLOUD_MODIFICATION_UNSUPPORTED, CloudChangeKind, CloudConfigPlannedChange,
     CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudCreateSnapshotRequest,
     CloudDiskImageFormat, CloudErrorBody, CloudErrorDetails, CloudHostPattern,
-    CloudMessageResponse, CloudNetworkSpec, CloudPaginated, CloudPatch, CloudPullPolicy,
-    CloudRlimit, CloudRlimitResource, CloudRootfsSource, CloudSandboxComputeResources,
-    CloudSandboxResources, CloudSandboxRuntimeOptions, CloudSandboxSpec, CloudSandboxStatus,
-    CloudSandboxStatusReason, CloudSecretEntry, CloudSecretSource, CloudSecretsConfig,
-    CloudSnapshot, CloudSnapshotDetails, CloudSnapshotKind, CloudSnapshotLocation,
-    CloudSnapshotOperation, CloudSnapshotOperationStatus, CloudSnapshotSpec, CloudViolationAction,
-    CloudVolumeMount,
+    CloudMessageResponse, CloudModificationConflict, CloudModificationDisposition,
+    CloudModificationRejection, CloudModificationWarning, CloudNetworkSpec, CloudPaginated,
+    CloudPatch, CloudPlannedChange, CloudPullPolicy, CloudResourceConvergenceState,
+    CloudResourceKind, CloudResourceResizeStatus, CloudRlimit, CloudRlimitResource,
+    CloudRootfsSource, CloudSandboxComputeResources, CloudSandboxModificationApplyRequest,
+    CloudSandboxModificationPlan, CloudSandboxModificationPlanRequest, CloudSandboxResources,
+    CloudSandboxRuntimeOptions, CloudSandboxSpec, CloudSandboxStatus, CloudSandboxStatusReason,
+    CloudSecretApplyEntry, CloudSecretChangeKind, CloudSecretEntry, CloudSecretMaterial,
+    CloudSecretPlanEntry, CloudSecretPlannedChange, CloudSecretSource, CloudSecretValue,
+    CloudSecretsConfig, CloudSnapshot, CloudSnapshotDetails, CloudSnapshotKind,
+    CloudSnapshotLocation, CloudSnapshotOperation, CloudSnapshotOperationStatus, CloudSnapshotSpec,
+    CloudViolationAction, CloudVolumeMount,
 };
 #[doc(hidden)]
 pub use command::{CommandResolutionError, ResolvedCommand, resolve_default_command};
@@ -44,11 +57,11 @@ pub use domain::{
     DEFAULT_SANDBOX_CPUS, DEFAULT_SANDBOX_MEMORY_MIB, DeploymentProfile, Destination,
     DestinationGroup, Direction, DiskImageFormat, DnsConfig, DnsConfigPatch, EnvVar, FlatClone,
     GuestClockPolicy, HandoffInit, HostPattern, HostPermissions, HttpConfig, HttpConfigPatch,
-    InterceptCaConfig, InterfaceOverrides, InterfaceOverridesPatch, LogSource,
-    MAX_OAUTH_SENTINEL_BYTES, MAX_SECRET_PLACEHOLDER_BYTES, MemoryPlacement, MintEndpoint,
-    MountOptions, MountTableCache, MountTableChild, MountTableOwner, MountTableSpec,
-    MountWriteCursor, MountWriteRevision, MountWrites, NamedVolumeCreate, NamedVolumeMode,
-    NetworkPolicy, NetworkRateLimitDirection, NetworkRateLimiterConfig,
+    HttpConnectCredentials, HttpDenyResponseFormat, InterceptCaConfig, InterfaceOverrides,
+    InterfaceOverridesPatch, LogSource, MAX_OAUTH_SENTINEL_BYTES, MAX_SECRET_PLACEHOLDER_BYTES,
+    MemoryPlacement, MintEndpoint, MountOptions, MountTableCache, MountTableChild, MountTableOwner,
+    MountTableSpec, MountWriteCursor, MountWriteRevision, MountWrites, NamedVolumeCreate,
+    NamedVolumeMode, NetworkPolicy, NetworkRateLimitDirection, NetworkRateLimiterConfig,
     NetworkRateLimiterConfigPatch, NetworkSpec, NetworkSpecPatch, NumaPlacement, OAuthSecret,
     OciRootfsSource, OutboundProxy, OwnedVolumeStorage, Patch, PlacementProfile, PortProtocol,
     PortRange, Protocol, PublishedPortSpec, PullPolicy, RateLimitConfigError, RateLimiterConfig,
@@ -63,6 +76,7 @@ pub use domain::{
     canonicalize_volume_mounts, owned_volume_mount_id,
 };
 pub use error::{SnapshotManifestError, SnapshotManifestResult, TypesError, TypesResult};
+pub use exec::{EXEC_OUTPUT_EVENT_OVERHEAD, ExecLimits};
 pub use guest_flush::GuestFlush;
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
@@ -71,6 +85,7 @@ pub use modify::{
     SecretModificationPatch, SecretPlannedChange, SecretSource,
 };
 pub use registry::RegistryAuth;
+pub use secret::SecretValue;
 pub use snapshot::manifest::Manifest as SnapshotManifest;
 pub use snapshot::{
     DiskCompactionDiskResult, DiskCompactionResult, DiskCompactionTarget,
