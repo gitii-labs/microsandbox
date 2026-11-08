@@ -2995,7 +2995,7 @@ esac
         let created = local
             .ensure_named_volumes(
                 &crate::backend::local::creation::CreationStorage::for_test(
-                    &local.sandboxes_dir().join(&config.spec.name),
+                    local.sandboxes_dir().join(&config.spec.name),
                 ),
                 &config,
             )
@@ -4278,7 +4278,7 @@ esac
         let _volumes = local
             .ensure_named_volumes(
                 &crate::backend::local::creation::CreationStorage::for_test(
-                    &local.sandboxes_dir().join(&config.spec.name),
+                    local.sandboxes_dir().join(&config.spec.name),
                 ),
                 &config,
             )
@@ -4622,7 +4622,7 @@ esac
                 .local
                 .ensure_named_volumes(
                     &crate::backend::local::creation::CreationStorage::for_test(
-                        &fixture
+                        fixture
                             .local
                             .sandboxes_dir()
                             .join(&fixture.config.spec.name),
