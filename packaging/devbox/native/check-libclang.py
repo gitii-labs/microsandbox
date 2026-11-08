@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 
@@ -45,7 +46,7 @@ includes = [line.strip() for line in include_search.split("End of search list.",
 flags = ["-x", "c", "-std=gnu11"]
 flags += [f"-I{path}" for path in ruby]
 flags += [f"-isystem{path}" for path in includes]
-flags += [f"-resource-dir={library.resolve().parent / 'clang' / '23'}"]
+flags += shlex.split(os.environ["BINDGEN_EXTRA_CLANG_ARGS"])
 args = (ctypes.c_char_p * len(flags))(*(flag.encode() for flag in flags))
 
 clang.clang_createIndex.argtypes = [ctypes.c_int, ctypes.c_int]
