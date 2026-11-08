@@ -529,6 +529,10 @@ fn write_key_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "state_dependency_tests.rs"]
+mod dependency_regressions;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use microsandbox_types::{ScopedUpstreamCaCert, ScopedVerifyUpstream};
