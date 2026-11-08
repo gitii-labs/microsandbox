@@ -28,6 +28,9 @@
         in {
           openssl = pkgs.openssl_4_1;
           python = python.withPackages (ps: [ ps.pyelftools ]);
+        } // nixpkgs.lib.optionalAttrs (system != "x86_64-darwin") {
+          # Native bindgen tooling supports Linux and Apple Silicon development.
+          libclang = pkgs.callPackage ./libclang-prebuilt.nix {};
         });
     };
 }
