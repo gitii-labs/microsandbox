@@ -1725,7 +1725,10 @@ pub(crate) mod agent {
         guest_path: &str,
     ) -> MicrosandboxResult<()> {
         let mut file = tokio::fs::File::open(host_path).await?;
-        let small_candidate = file.metadata().await?.len() <= super::FS_INLINE_WRITE_MAX;
+        let metadata = file.metadata().await?;
+        // Source-type handling: a FIFO's zero metadata length does not promise EOF.
+        // Only regular files enter the bounded inline probe; other sources stream immediately.
+        let small_candidate = metadata.is_file() && metadata.len() <= super::FS_INLINE_WRITE_MAX;
         let first = if small_candidate {
             let mut first = Vec::with_capacity((super::FS_INLINE_WRITE_MAX + 1) as usize);
             (&mut file)
@@ -2094,6 +2097,10 @@ pub(crate) mod agent {
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(all(test, unix, feature = "local"))]
+#[path = "fs_copy_tests.rs"]
+mod copy_tests;
 
 #[cfg(test)]
 mod tests {
