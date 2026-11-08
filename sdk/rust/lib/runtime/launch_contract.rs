@@ -2525,33 +2525,35 @@ mod encoding {
 
     #[test]
     fn legacy_input_retains_guest_root_mounts_environment_and_cwd() {
-        let mut launch = LaunchConfig::default();
-        launch.bootstrap = GuestBootstrap {
-            block_root: Some(BootstrapBlockRoot::OciErofs {
-                lower: "/dev/vda".into(),
-                upper: BootstrapBlockRootUpper::Device {
-                    device: "/dev/vdb".into(),
-                    fstype: "ext4".into(),
-                },
-            }),
-            dir_mounts: vec![BootstrapDirMount {
-                tag: "work".into(),
-                guest_path: "/work".into(),
-                flags: BootstrapMountFlags {
-                    readonly: true,
-                    noexec: true,
-                    ..Default::default()
-                },
-            }],
-            default_env: vec![BootstrapEnvVar {
-                key: "APP".into(),
-                value: "value=with spaces".into(),
-            }],
-            default_cwd: Some("/work".into()),
-            security_profile: BootstrapSecurityProfile::Restricted,
-            // Real launches always carry the built-in limits; the legacy
-            // grammar must encode such a bootstrap by omitting them.
-            exec_limits: Some(microsandbox_types::ExecLimits::default()),
+        let launch = LaunchConfig {
+            bootstrap: GuestBootstrap {
+                block_root: Some(BootstrapBlockRoot::OciErofs {
+                    lower: "/dev/vda".into(),
+                    upper: BootstrapBlockRootUpper::Device {
+                        device: "/dev/vdb".into(),
+                        fstype: "ext4".into(),
+                    },
+                }),
+                dir_mounts: vec![BootstrapDirMount {
+                    tag: "work".into(),
+                    guest_path: "/work".into(),
+                    flags: BootstrapMountFlags {
+                        readonly: true,
+                        noexec: true,
+                        ..Default::default()
+                    },
+                }],
+                default_env: vec![BootstrapEnvVar {
+                    key: "APP".into(),
+                    value: "value=with spaces".into(),
+                }],
+                default_cwd: Some("/work".into()),
+                security_profile: BootstrapSecurityProfile::Restricted,
+                // Real launches always carry the built-in limits; the legacy
+                // grammar must encode such a bootstrap by omitting them.
+                exec_limits: Some(microsandbox_types::ExecLimits::default()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         for patch in [0, 4, 8, 9] {

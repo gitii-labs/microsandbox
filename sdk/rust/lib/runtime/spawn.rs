@@ -2929,7 +2929,7 @@ mod tests {
         let error = local
             .ensure_named_volumes(
                 &crate::backend::local::creation::CreationStorage::for_test(
-                    &local.sandboxes_dir().join(&config.spec.name),
+                    local.sandboxes_dir().join(&config.spec.name),
                 ),
                 &config,
             )
