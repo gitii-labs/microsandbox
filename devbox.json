@@ -8,7 +8,7 @@
     "gnumake": "4.4.1",
     "pkg-config": "0.29.2",
     "path:./packaging/devbox/native#libclang": {
-      "outputs": ["lib"]
+      "outputs": ["out"]
     },
     "libcap_ng": {
       "version": "0.9.6",
@@ -29,7 +29,8 @@
     "xz": "5.8.4",
     "perl": "5.42.3",
     "git": "2.56.0",
-    "go": "1.27.3"
+    "go": "1.27.3",
+    "ruby": "4.0.9"
   },
   "env": {
     "RUSTUP_HOME": "$DEVBOX_PROJECT_ROOT/.devbox/rustup",

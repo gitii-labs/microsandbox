@@ -11,34 +11,7 @@
     in {
       packages = nixpkgs.lib.genAttrs systems (system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ (final: prev: {
-              # Keep libclang and its LLVM dependency on the same stable release.
-              llvmPackages_23 = prev.llvmPackages_23.override {
-                version = "23.1.5";
-                # This libclang output parses native Ruby headers for bindgen;
-                # it is not the project's general-purpose cross compiler.
-                devExtraCmakeFlags = [
-                  (final.lib.cmakeFeature "LLVM_TARGETS_TO_BUILD" "Native")
-                ];
-                monorepoSrc = final.runCommand "llvm-project-23.1.5-source" {
-                  nativeBuildInputs = [ final.xz ];
-                  passthru = {
-                    owner = "llvm";
-                    repo = "llvm-project";
-                    rev = "llvmorg-23.1.5";
-                  };
-                } ''
-                  mkdir -p "$out"
-                  tar -xJf ${final.fetchurl {
-                    url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/llvm-project-23.1.5.src.tar.xz";
-                    hash = "sha256-+1Cx6sk93rOqjatM/jJN/3T0qcK97mFgyeNhiPjQam4=";
-                  }} --strip-components=1 -C "$out"
-                '';
-              };
-            }) ];
-          };
+          pkgs = import nixpkgs { inherit system; };
           pythonPkgs = import pythonNixpkgs { inherit system; };
           python = pythonPkgs.python315.override {
             packageOverrides = _final: prev: {
@@ -57,7 +30,7 @@
           python = python.withPackages (ps: [ ps.pyelftools ]);
         } // nixpkgs.lib.optionalAttrs (system != "x86_64-darwin") {
           # Native bindgen tooling supports Linux and Apple Silicon development.
-          libclang = pkgs.llvmPackages_23.libclang;
+          libclang = pkgs.callPackage ./libclang-prebuilt.nix {};
         });
     };
 }
