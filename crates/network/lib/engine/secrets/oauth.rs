@@ -450,8 +450,8 @@ impl OAuthConnection {
                 port == endpoint.port && host_allowed(endpoint.host.eq_ignore_ascii_case(sni))
             };
             let endpoint_relevant = is_relevant(&token)
-                || device_code.as_ref().is_some_and(&is_relevant)
-                || poll.as_ref().is_some_and(&is_relevant);
+                || device_code.as_ref().is_some_and(is_relevant)
+                || poll.as_ref().is_some_and(is_relevant);
             // A mint endpoint is an endpoint of the flow too, and it carries
             // its own host and port rather than a URL. Its host may be the
             // token endpoint's without being an inject host, and its port
@@ -1670,8 +1670,8 @@ impl OAuthConnection {
             |endpoint: &Endpoint| endpoint.port == port && endpoint.host.eq_ignore_ascii_case(sni);
         self.grants.iter().any(|grant| {
             here(&grant.token)
-                || grant.device_code.as_ref().is_some_and(&here)
-                || grant.poll.as_ref().is_some_and(&here)
+                || grant.device_code.as_ref().is_some_and(here)
+                || grant.poll.as_ref().is_some_and(here)
                 || grant
                     .config
                     .mint_endpoints
@@ -1695,7 +1695,7 @@ impl OAuthConnection {
                 (grant.poll.as_ref(), "poll"),
             ];
             for (endpoint, kind) in named {
-                if endpoint.is_some_and(&equivalent) {
+                if endpoint.is_some_and(equivalent) {
                     return Some(kind);
                 }
             }
