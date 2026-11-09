@@ -971,6 +971,18 @@ char *msb_fs_read_stream(uint64_t cancel_id,
                          uintptr_t buf_len);
 
 /**
+ * Open a streaming read of at most `len` bytes at `offset` in a guest file.
+ * Returns `{"stream_handle":<u64>}`; a zero length yields an empty stream.
+ */
+char *msb_fs_read_range_stream(uint64_t cancel_id,
+                               Handle handle,
+                               const char *path,
+                               uint64_t offset,
+                               uint64_t len,
+                               unsigned char *buf,
+                               uintptr_t buf_len);
+
+/**
  * Receive the next chunk from a read stream.
  * Returns `{"done":true}` at EOF, or `{"chunk_b64":"..."}` with data.
  */

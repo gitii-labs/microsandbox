@@ -24,6 +24,7 @@ type FsEntry struct {
 
 // FsStat is file metadata.
 type FsStat struct {
+	Inode   uint64 // zero if the guest did not report an inode
 	Path    string
 	Size    int64
 	Mode    uint32
@@ -103,6 +104,7 @@ func (fs *SandboxFSOps) Stat(ctx context.Context, path string) (*FsStat, error) 
 		return nil, wrapFFI(err)
 	}
 	return &FsStat{
+		Inode:   raw.Inode,
 		Path:    path,
 		Size:    raw.Size,
 		Mode:    raw.Mode,
@@ -215,6 +217,18 @@ func (s *FsReadStream) Close() error {
 // the returned FsReadStream when done.
 func (fs *SandboxFSOps) ReadStream(ctx context.Context, path string) (*FsReadStream, error) {
 	h, err := fs.sandbox.inner.FsReadStream(ctx, path)
+	if err != nil {
+		return nil, wrapFFI(err)
+	}
+	return &FsReadStream{inner: h}, nil
+}
+
+// ReadRangeStream opens a stream of at most length bytes starting at offset.
+// A zero length returns an empty stream. Ranges at or beyond EOF are empty.
+// Older agents refuse range reads; this method never falls back to byte zero.
+// The caller must close the returned stream.
+func (fs *SandboxFSOps) ReadRangeStream(ctx context.Context, path string, offset, length uint64) (*FsReadStream, error) {
+	h, err := fs.sandbox.inner.FsReadRangeStream(ctx, path, offset, length)
 	if err != nil {
 		return nil, wrapFFI(err)
 	}

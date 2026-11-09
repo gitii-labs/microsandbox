@@ -13,6 +13,9 @@ use crate::bulk::BulkOffer;
 /// This stays safely under the 4 MiB frame limit after CBOR envelope overhead.
 pub const FS_CHUNK_SIZE: usize = 3 * 1024 * 1024;
 
+/// First agent generation supporting the distinct `ReadRange` operation.
+pub const FS_READ_RANGE_PROTOCOL_VERSION: u8 = 11;
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -150,6 +153,19 @@ pub enum FsOp {
         len: Option<u64>,
     },
 
+    /// Read a bounded range from an open file handle.
+    ///
+    /// This distinct operation makes agents without range support refuse the
+    /// request rather than ignore an offset on an older operation.
+    ReadRange {
+        /// Agentd-side file handle.
+        handle: u64,
+        /// Byte offset to read from.
+        offset: u64,
+        /// Maximum bytes to read; zero is empty and `None` reads to EOF.
+        len: Option<u64>,
+    },
+
     /// Write to an open file handle.
     Write {
         /// Agentd-side file handle.
@@ -278,6 +294,14 @@ pub struct FsEntryInfo {
 
     /// Last modification time as Unix timestamp (seconds since epoch).
     pub mtime: Option<i64>,
+
+    /// Inode number, absent when not reported by the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<u64>,
+
+    /// Nanosecond fraction of `mtime`, absent on older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_nsec: Option<u32>,
 }
 
 /// Data variants that can be included in a filesystem response.
@@ -323,4 +347,52 @@ pub struct FsData {
     /// The raw file data.
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{FsEntryInfo, FsOp, FsRequest};
+
+    #[test]
+    fn range_read_has_a_distinct_operation() {
+        let req = FsRequest {
+            op: FsOp::ReadRange {
+                handle: 7,
+                offset: 13,
+                len: Some(0),
+            },
+            bulk: None,
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&req, &mut encoded).unwrap();
+        let decoded: FsRequest = ciborium::from_reader(encoded.as_slice()).unwrap();
+        assert!(matches!(
+            decoded.op,
+            FsOp::ReadRange {
+                handle: 7,
+                offset: 13,
+                len: Some(0)
+            }
+        ));
+        let json = serde_json::to_value(req).unwrap();
+        assert_eq!(json["op"]["ReadRange"]["offset"], 13);
+        assert!(json["op"].get("Read").is_none());
+    }
+
+    #[test]
+    fn old_stat_defaults_only_new_metadata_fields() {
+        let old = serde_json::json!({
+            "path": "/file", "kind": "file", "size": 13, "mode": 420,
+            "modified": 1700000000, "uid": 0, "gid": 0,
+            "atime": null, "mtime": 1700000000,
+        });
+        let info: FsEntryInfo = serde_json::from_value(old).unwrap();
+        assert_eq!(info.inode, None);
+        assert_eq!(info.mtime_nsec, None);
+        assert_eq!(info.mtime, Some(1700000000));
+    }
 }

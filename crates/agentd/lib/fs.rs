@@ -76,6 +76,13 @@ pub struct FsReadSession {
     credit_tx: Option<watch::Sender<Option<BulkCredit>>>,
 }
 
+#[derive(Clone, Copy)]
+struct FsReadBounds {
+    offset: u64,
+    len: Option<u64>,
+    range: bool,
+}
+
 /// A filesystem stream session started by a request.
 pub enum FsStreamSession {
     /// Read stream task.
@@ -343,7 +350,12 @@ pub async fn handle_fs_request(
         )?;
         return Ok(None);
     }
-    if bulk.is_some() && !matches!(&op, FsOp::Read { .. } | FsOp::Write { .. }) {
+    if bulk.is_some()
+        && !matches!(
+            &op,
+            FsOp::Read { .. } | FsOp::ReadRange { .. } | FsOp::Write { .. }
+        )
+    {
         encode_response(
             id,
             error_response("raw bulk is only valid for streaming reads and writes".into()),
@@ -352,6 +364,7 @@ pub async fn handle_fs_request(
         return Ok(None);
     }
 
+    let range_read = matches!(&op, FsOp::ReadRange { .. });
     match op {
         FsOp::RealPath { path } => {
             let resp = handle_realpath(&path).await;
@@ -438,8 +451,18 @@ pub async fn handle_fs_request(
             handle,
             offset,
             len,
+        }
+        | FsOp::ReadRange {
+            handle,
+            offset,
+            len,
         } => match state.file(id, handle, true, false) {
             Ok((file, _, _)) => {
+                let bounds = FsReadBounds {
+                    offset,
+                    len,
+                    range: range_read,
+                };
                 let tx = session_tx.clone();
                 let (task, credit_tx) = match bulk {
                     Some(offer) => {
@@ -454,14 +477,13 @@ pub async fn handle_fs_request(
                         .map_err(|error| format!("accept read bulk state: {error}"))?;
                         let (credit_tx, credit_rx) = watch::channel(None);
                         let task = tokio::spawn(async move {
-                            handle_bulk_read_stream(id, file, offset, len, sender, credit_rx, &tx)
-                                .await;
+                            handle_bulk_read_stream(id, file, bounds, sender, credit_rx, &tx).await;
                         });
                         (task, Some(credit_tx))
                     }
                     None => {
                         let task = tokio::spawn(async move {
-                            handle_read_stream(id, file, offset, len, &tx).await;
+                            handle_read_stream(id, file, bounds, &tx).await;
                         });
                         (task, None)
                     }
@@ -1142,22 +1164,47 @@ fn accept_fs_write_offer(offer: BulkOffer) -> Result<BulkAccepted, String> {
     })
 }
 
+async fn prepare_read(
+    file: &mut tokio::fs::File,
+    bounds: FsReadBounds,
+) -> std::io::Result<Option<u64>> {
+    // Caller validation: an empty range needs no seek, including offsets that
+    // cannot be represented by the OS. Existing Read operations retain their seek.
+    if bounds.range && bounds.len == Some(0) {
+        return Ok(Some(0));
+    }
+    if let Err(error) = file.seek(std::io::SeekFrom::Start(bounds.offset)).await {
+        // Caller validation: an unrepresentable position beyond EOF is empty.
+        // Never substitute a smaller position: procfs sizes and concurrent file
+        // growth must not move a requested range to earlier bytes. Other seek
+        // failures (including ESPIPE on non-seekable files) remain errors.
+        if bounds.range
+            && matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOVERFLOW))
+            && bounds.offset > file.metadata().await?.len()
+        {
+            return Ok(Some(0));
+        }
+        return Err(error);
+    }
+    Ok(bounds.len)
+}
+
 async fn handle_bulk_read_stream(
     id: u32,
     file: Arc<Mutex<tokio::fs::File>>,
-    offset: u64,
-    len: Option<u64>,
+    bounds: FsReadBounds,
     mut sender: BulkSendState,
     mut credit_rx: watch::Receiver<Option<BulkCredit>>,
     tx: &SessionOutputSender,
 ) {
     let mut file = file.lock().await;
-    if let Err(error) = file.seek(std::io::SeekFrom::Start(offset)).await {
-        send_raw_response(id, false, Some(format!("seek: {error}")), None, tx).await;
-        return;
-    }
-
-    let mut remaining = len;
+    let mut remaining = match prepare_read(&mut file, bounds).await {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            send_raw_response(id, false, Some(format!("seek: {error}")), None, tx).await;
+            return;
+        }
+    };
     loop {
         if remaining == Some(0) {
             break;
@@ -1256,17 +1303,17 @@ async fn handle_bulk_read_stream(
 async fn handle_read_stream(
     id: u32,
     file: Arc<Mutex<tokio::fs::File>>,
-    offset: u64,
-    len: Option<u64>,
+    bounds: FsReadBounds,
     tx: &SessionOutputSender,
 ) {
     let mut file = file.lock().await;
-    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-        send_raw_response(id, false, Some(format!("seek: {e}")), None, tx).await;
-        return;
-    }
-
-    let mut remaining = len;
+    let mut remaining = match prepare_read(&mut file, bounds).await {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            send_raw_response(id, false, Some(format!("seek: {error}")), None, tx).await;
+            return;
+        }
+    };
     let mut chunk = vec![0u8; FS_CHUNK_SIZE];
     let mut buf = Vec::new();
 
@@ -1644,6 +1691,8 @@ fn metadata_to_entry_info(path: &str, meta: &std::fs::Metadata) -> FsEntryInfo {
         size: meta.len(),
         mode: meta.mode(),
         modified: mtime,
+        inode: Some(meta.ino()),
+        mtime_nsec: Some(meta.mtime_nsec() as u32),
         uid: meta.uid(),
         gid: meta.gid(),
         atime,
@@ -1658,6 +1707,8 @@ fn unknown_entry_info(path: &str) -> FsEntryInfo {
         size: 0,
         mode: 0,
         modified: None,
+        inode: None,
+        mtime_nsec: None,
         uid: 0,
         gid: 0,
         atime: None,
@@ -1776,6 +1827,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn range_seek_preserves_offsets_in_zero_size_procfs_files() {
+        let path = "/proc/version";
+        let expected = tokio::fs::read(path).await.unwrap();
+        assert!(expected.len() > 12);
+        let mut file = tokio::fs::File::open(path).await.unwrap();
+        assert_eq!(file.metadata().await.unwrap().len(), 0);
+        let remaining = prepare_read(
+            &mut file,
+            FsReadBounds {
+                offset: 7,
+                len: Some(5),
+                range: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(remaining, Some(5));
+        let mut got = [0; 5];
+        file.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, expected[7..12]);
+    }
+
+    #[tokio::test]
+    async fn range_request_preserves_offset_when_file_grows_before_task_reads() {
+        let path = test_path("range-growth");
+        tokio::fs::write(&path, b"").await.unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let mut state = FsState::default();
+        let handle = state
+            .insert_file(1, file, true, false, false, path.to_str().unwrap().into())
+            .unwrap();
+        let (file, _, _) = state.file(1, handle, true, false).unwrap();
+        let guard = file.lock().await;
+        assert_eq!(guard.metadata().await.unwrap().len(), 0);
+        let (tx, mut rx) = SessionOutputSender::channel();
+        let mut out = Vec::new();
+        let request = FsRequest {
+            op: FsOp::ReadRange {
+                handle,
+                offset: 7,
+                len: Some(5),
+            },
+            bulk: Some(BulkOffer::filesystem_read()),
+        };
+        let session = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_fs_request(2, 11, request, &mut state, &mut out, &tx),
+        )
+        .await
+        .expect("range admission must not wait for the read task's file lock")
+        .unwrap()
+        .unwrap();
+        tokio::fs::write(&path, b"0123456789abcdef").await.unwrap();
+        drop(guard);
+        let mut got = Vec::new();
+        loop {
+            match rx.recv().await.unwrap().output {
+                SessionOutput::Bulk(output) => got.extend_from_slice(&output.record.payload),
+                output => {
+                    let message = decode_raw_output(output);
+                    if message.t == MessageType::FsResponse {
+                        assert!(message.payload::<FsResponse>().unwrap().ok);
+                        break;
+                    }
+                    assert_eq!(message.t, MessageType::BulkFinish);
+                }
+            }
+        }
+        let FsStreamSession::Read(session) = session else {
+            panic!("expected read session");
+        };
+        session.task.await.unwrap();
+        assert_eq!(got, b"789ab");
+        state.clear();
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn range_request_reads_exact_bytes_and_accepts_maximum_offsets() {
+        let path = test_path("range-read");
+        let data = b"0123456789abcdef";
+        tokio::fs::write(&path, data).await.unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let mut state = FsState::default();
+        let handle = state
+            .insert_file(1, file, true, false, false, path.to_str().unwrap().into())
+            .unwrap();
+        for (offset, len, expected) in [
+            (3, 5, &data[3..8]),
+            (9, 7, &data[9..]),
+            (3, 0, &data[0..0]),
+            (16, 1, &data[0..0]),
+            (u64::MAX, 1, &data[0..0]),
+            (u64::MAX, 0, &data[0..0]),
+        ] {
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let mut out = Vec::new();
+            let session = handle_fs_request(
+                2,
+                11,
+                FsRequest {
+                    op: FsOp::ReadRange {
+                        handle,
+                        offset,
+                        len: Some(len),
+                    },
+                    bulk: Some(BulkOffer::filesystem_read()),
+                },
+                &mut state,
+                &mut out,
+                &tx,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let accepted = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+            assert_eq!(accepted.t, MessageType::BulkAccepted);
+            let mut got = Vec::new();
+            loop {
+                match rx.recv().await.unwrap().output {
+                    SessionOutput::Bulk(output) => got.extend_from_slice(&output.record.payload),
+                    output => {
+                        let message = decode_raw_output(output);
+                        if message.t == MessageType::FsResponse {
+                            assert!(message.payload::<FsResponse>().unwrap().ok);
+                            break;
+                        }
+                        assert_eq!(message.t, MessageType::BulkFinish);
+                    }
+                }
+            }
+            let FsStreamSession::Read(session) = session else {
+                panic!("expected read session");
+            };
+            session.task.await.unwrap();
+            assert_eq!(got, expected, "offset {offset}, len {len}");
+        }
+        state.clear();
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn raw_bulk_read_emits_payload_exact_finish_then_terminal_response() {
         let path = test_path("bulk-read");
         tokio::fs::write(&path, b"raw-read-payload").await.unwrap();
@@ -1793,8 +1986,11 @@ mod tests {
         handle_bulk_read_stream(
             2,
             Arc::new(Mutex::new(file)),
-            0,
-            None,
+            FsReadBounds {
+                offset: 0,
+                len: None,
+                range: false,
+            },
             sender,
             credit_rx,
             &session_tx,
