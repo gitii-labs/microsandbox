@@ -573,6 +573,7 @@ impl From<CloudFileInfo> for FsEntry {
 impl From<CloudFileInfo> for FsMetadata {
     fn from(info: CloudFileInfo) -> Self {
         Self {
+            inode: None,
             kind: info.kind.into(),
             size: info.size,
             mode: info.mode,

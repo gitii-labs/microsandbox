@@ -136,6 +136,8 @@ fn fixture_entry(path: &str) -> FsEntryInfo {
     let is_directory = path == "/fixture";
 
     FsEntryInfo {
+        inode: None,
+        mtime_nsec: None,
         path: path.to_string(),
         kind: if is_directory { "dir" } else { "file" }.to_string(),
         size: if is_directory {

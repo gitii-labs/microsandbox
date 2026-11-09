@@ -462,6 +462,21 @@ pub trait SandboxBackend: Send + Sync {
         })
     }
 
+    /// Stream a bounded range of a guest file.
+    fn fs_read_range_stream<'a>(
+        &'a self,
+        backend: Arc<dyn Backend>,
+        name: &'a str,
+        path: &'a str,
+        offset: u64,
+        len: u64,
+    ) -> BoxFuture<'a, MicrosandboxResult<FsReadStream>> {
+        Box::pin(async move {
+            crate::sandbox::fs::agent::read_range_stream(backend.as_ref(), name, path, offset, len)
+                .await
+        })
+    }
+
     /// Write `data` to a guest file (overwriting if it exists).
     fn fs_write<'a>(
         &'a self,

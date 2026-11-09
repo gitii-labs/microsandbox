@@ -560,6 +560,47 @@ Open a streaming reader for a file. Use this for files too large to fit in memor
   </div>
 </div>
 
+#### <span className="msb-recv">fs.</span><span className="msb-hn">ReadRangeStream()</span>
+
+```go
+func (fs *SandboxFSOps) ReadRangeStream(ctx context.Context, path string, offset, length uint64) (*FsReadStream, error)
+```
+
+Read at most `length` bytes starting at `offset` in the guest file at `path`.
+Zero length and offsets at or beyond EOF produce an empty stream. A range crossing
+EOF ends at EOF. Close the returned stream when done. An older guest agent is
+refused with an upgrade-required error; the read never falls back to byte zero.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels opening the stream.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>offset</code><span className="msb-type">uint64</span></div>
+    <div className="msb-param-desc">Starting byte offset.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>length</code><span className="msb-type">uint64</span></div>
+    <div className="msb-param-desc">Maximum byte count, including zero.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#fsreadstream">*FsReadStream</a></div>
+    <div className="msb-param-desc">Bounded read stream; close it when done.</div>
+  </div>
+</div>
+
 #### <span className="msb-recv">fs.</span><span className="msb-hn">WriteStream()</span>
 
 ```go
@@ -739,6 +780,10 @@ Classifies a directory listing entry. Defined as `type FsEntryKind string`.
 | `FsEntryKindOther` | `"other"` | Other entry type |
 
 ### FsStat
+
+`Inode` (`uint64`) is the guest inode number, or zero when not reported.
+`ModTime` preserves the guest's nanosecond precision, and remains the zero time
+when the guest does not report a modification time.
 
 <p className="msb-backref">Returned by <a href="#fs-stat">Stat()</a></p>
 

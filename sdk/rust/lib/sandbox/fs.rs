@@ -105,6 +105,9 @@ pub enum FsEntryKind {
 /// Metadata about a filesystem entry.
 #[derive(Debug, Clone)]
 pub struct FsMetadata {
+    /// Guest inode number, absent when the guest does not report it.
+    pub inode: Option<u64>,
+
     /// Kind of entry.
     pub kind: FsEntryKind,
 
@@ -223,6 +226,20 @@ impl<'a> SandboxFsOps<'a> {
         self.backend
             .sandboxes()
             .fs_read_stream(self.backend.clone(), self.name, path)
+            .await
+    }
+
+    /// Stream at most `len` bytes starting at `offset` in a guest file.
+    /// A zero length produces an empty stream. Older agents refuse this operation.
+    pub async fn read_range_stream(
+        &self,
+        path: &str,
+        offset: u64,
+        len: u64,
+    ) -> MicrosandboxResult<FsReadStream> {
+        self.backend
+            .sandboxes()
+            .fs_read_range_stream(self.backend.clone(), self.name, path, offset, len)
             .await
     }
 
@@ -907,9 +924,12 @@ fn entry_info_to_fs_entry(info: FsEntryInfo) -> FsEntry {
 /// Convert an `FsEntryInfo` to `FsMetadata`.
 fn entry_info_to_metadata(info: &FsEntryInfo) -> FsMetadata {
     FsMetadata {
+        inode: info.inode,
         kind: parse_kind(&info.kind),
         accessed: parse_time(info.atime),
-        modified: parse_time(info.mtime.or(info.modified)),
+        modified: info.mtime.or(info.modified).and_then(|seconds| {
+            chrono::DateTime::from_timestamp(seconds, info.mtime_nsec.unwrap_or(0))
+        }),
         created: None,
         size: info.size,
         mode: info.mode,
@@ -1110,7 +1130,10 @@ pub(crate) mod agent {
             BULK_FLOW_MASK_GUEST_TO_HOST, BULK_FLOW_MASK_HOST_TO_GUEST, BulkFlow, BulkKind,
             BulkOffer, BulkReceiveState, BulkSendState,
         },
-        fs::{FS_CHUNK_SIZE, FsOp, FsOpenOptions, FsRequest, FsResponseData, FsSetAttrs},
+        fs::{
+            FS_CHUNK_SIZE, FS_READ_RANGE_PROTOCOL_VERSION, FsOp, FsOpenOptions, FsRequest,
+            FsResponseData, FsSetAttrs,
+        },
         message::MessageType,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1219,12 +1242,25 @@ pub(crate) mod agent {
         len: Option<u64>,
         close_handle: Option<FsHandle>,
     ) -> MicrosandboxResult<FsReadStream> {
-        let req = FsRequest {
-            op: FsOp::Read {
+        read_operation_stream(
+            client,
+            FsOp::Read {
                 handle,
                 offset,
                 len,
             },
+            close_handle,
+        )
+        .await
+    }
+
+    async fn read_operation_stream(
+        client: Arc<AgentClient>,
+        op: FsOp,
+        close_handle: Option<FsHandle>,
+    ) -> MicrosandboxResult<FsReadStream> {
+        let req = FsRequest {
+            op,
             bulk: client
                 .supports(MessageType::BulkAccepted)
                 .then(BulkOffer::filesystem_read),
@@ -1412,6 +1448,34 @@ pub(crate) mod agent {
         let handle = open_file(&client, path, super::read_only_open_options()).await?;
 
         read_handle_stream(client, handle, 0, None, Some(handle)).await
+    }
+
+    pub(crate) async fn read_range_stream(
+        backend: &dyn Backend,
+        name: &str,
+        path: &str,
+        offset: u64,
+        len: u64,
+    ) -> MicrosandboxResult<FsReadStream> {
+        let client = Arc::new(connect_agent(backend, name).await?);
+        // Version handling: a running guest retains its bundled agent until restart.
+        if client.negotiated_version() < FS_READ_RANGE_PROTOCOL_VERSION {
+            return Err(MicrosandboxError::SandboxFsOps(format!(
+                "file range reads require agent protocol generation {FS_READ_RANGE_PROTOCOL_VERSION}; restart the sandbox with an updated runtime"
+            )));
+        }
+        let handle = open_file(&client, path, super::read_only_open_options()).await?;
+        let op = FsOp::ReadRange {
+            handle,
+            offset,
+            len: Some(len),
+        };
+        let result = read_operation_stream(Arc::clone(&client), op, Some(handle)).await;
+        // Release the handle if stream admission failed before it could own cleanup.
+        if result.is_err() {
+            close_handle(&client, handle).await?;
+        }
+        result
     }
 
     pub(crate) async fn write(
@@ -2105,6 +2169,32 @@ mod copy_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_preserves_inode_and_nanoseconds_and_missing_mtime() {
+        let mut info = FsEntryInfo {
+            path: "/file".into(),
+            kind: "file".into(),
+            size: 13,
+            mode: 0o644,
+            modified: Some(1700000000),
+            uid: 0,
+            gid: 0,
+            atime: None,
+            mtime: Some(1700000000),
+            inode: Some(42),
+            mtime_nsec: Some(123456789),
+        };
+        let metadata = entry_info_to_metadata(&info);
+        assert_eq!(metadata.inode, Some(42));
+        assert_eq!(
+            metadata.modified.unwrap().timestamp_subsec_nanos(),
+            123456789
+        );
+        info.mtime = None;
+        info.modified = None;
+        assert!(entry_info_to_metadata(&info).modified.is_none());
+    }
 
     #[test]
     fn only_exact_owned_small_filesystem_writes_stay_inline() {

@@ -69,6 +69,14 @@ Released older SDKs retain their existing execution behavior through the legacy 
 
 Generation 10 remains unreleased. Intermediate generation-10 builds are not a compatibility target; the acknowledgement wire names replace their earlier `.credit` names without a separate capability version.
 
+### File range reads (generation 11)
+
+`FsOp::ReadRange` is a distinct bounded read operation within `core.fs.request`.
+Hosts require generation 11 before sending it. Older agents reject an unchecked
+request as an unknown operation instead of ignoring an offset. The existing
+`Read` variant and whole-file stream remain unchanged. `FsEntryInfo` adds optional
+`inode` and `mtime_nsec` fields, preserving seconds in `mtime` for existing readers.
+
 ### Bootstrap and shutdown
 
 `core.bootstrap` is a one-shot startup frame sent before the ordinary `core.ready` exchange. It configures a newly launched VM with the agent bundled by the selected build. The guest validates its minimum generation and accepts newer bootstrap generations under the existing optional-field rules. This is distinct from connecting a new SDK to an already-running old VM, and it does not prove compatibility of the host SDK/runtime launch JSON or shared database.

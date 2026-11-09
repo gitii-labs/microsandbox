@@ -91,6 +91,19 @@ Required review should include golden encoded payload bytes when serialization c
 
 PTY exec retains a guest-side slave descriptor until the direct child has exited and queued output has been read. Descendants holding the terminal continue to keep the output stream open. This prevents last-slave closure from discarding the output tail before `core.exec.exited`; it changes guest-local descriptor ownership, not message bytes, capabilities, launch inputs, or persisted state. Older hosts consume the same output and exit messages, and newer hosts continue to accept the existing sequence from older agents. Already-running guests retain their existing agent implementation until restarted.
 
+### File range reads
+
+Generation 11 adds the distinct filesystem `ReadRange` operation. The Go SDK and
+native library expose bounded streams without changing the existing whole-file
+stream ABI. A newer SDK refuses range reads before opening a file on an older
+agent. A raw `ReadRange` request sent to the v0.7.6-gitii.13 agent receives a
+terminal `core.error` with `invalid_payload` and an unknown-variant diagnostic.
+Existing file operations and runtime launch inputs are unchanged. Stat adds
+optional inode and nanosecond mtime fields; absent timestamps remain absent.
+The Go dynamic binding keeps the range symbol optional so existing operations
+remain available with an older native library; invoking the new method requires
+an updated library.
+
 ### Execution output backpressure
 
 Execution limits are fixed at sandbox creation and advertised in `Ready.exec_limits`: 128 executions, 64 KiB stdin allowance, 1 MiB combined stdout/stderr allowance, and 16 KiB stdin and output chunks. The values are built-in defaults, not user configuration; clients obey the advertised values, so the defaults can change between releases without a lockstep upgrade. The SDK has no stdin staging queue. Generation-10 cumulative `.stdin.ack` and `.output.ack` messages replenish consumed allowance. Released older SDKs retain legacy behavior outside the buffering guarantee; new SDKs fall back to historical buffering when Ready lacks limits. Existing sandboxes require no restart. Intermediate unreleased generation-10 builds are not compatibility targets. No new snapshot-manifest extension is required. Disk-only restores use the current built-in defaults, while memory restores preserve the guest limits from captured Ready; restoring a memory snapshot that captured limits requires the launch capability `exec_limits`. Disk and catalog formats are unchanged. Older relay and cross-version launch coverage must be validated separately from same-version tests.

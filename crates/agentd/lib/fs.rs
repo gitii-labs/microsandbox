@@ -343,7 +343,12 @@ pub async fn handle_fs_request(
         )?;
         return Ok(None);
     }
-    if bulk.is_some() && !matches!(&op, FsOp::Read { .. } | FsOp::Write { .. }) {
+    if bulk.is_some()
+        && !matches!(
+            &op,
+            FsOp::Read { .. } | FsOp::ReadRange { .. } | FsOp::Write { .. }
+        )
+    {
         encode_response(
             id,
             error_response("raw bulk is only valid for streaming reads and writes".into()),
@@ -352,6 +357,7 @@ pub async fn handle_fs_request(
         return Ok(None);
     }
 
+    let range_read = matches!(&op, FsOp::ReadRange { .. });
     match op {
         FsOp::RealPath { path } => {
             let resp = handle_realpath(&path).await;
@@ -438,8 +444,30 @@ pub async fn handle_fs_request(
             handle,
             offset,
             len,
+        }
+        | FsOp::ReadRange {
+            handle,
+            offset,
+            len,
         } => match state.file(id, handle, true, false) {
             Ok((file, _, _)) => {
+                // Caller validation: beyond-EOF uint64 offsets must not reach an
+                // OS seek whose signed or filesystem-specific limit is smaller.
+                let offset = if range_read {
+                    match file.lock().await.metadata().await {
+                        Ok(metadata) => offset.min(metadata.len()),
+                        Err(error) => {
+                            encode_response(
+                                id,
+                                error_response(format!("stat range file: {error}")),
+                                out_buf,
+                            )?;
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    offset
+                };
                 let tx = session_tx.clone();
                 let (task, credit_tx) = match bulk {
                     Some(offer) => {
@@ -1644,6 +1672,8 @@ fn metadata_to_entry_info(path: &str, meta: &std::fs::Metadata) -> FsEntryInfo {
         size: meta.len(),
         mode: meta.mode(),
         modified: mtime,
+        inode: Some(meta.ino()),
+        mtime_nsec: Some(meta.mtime_nsec() as u32),
         uid: meta.uid(),
         gid: meta.gid(),
         atime,
@@ -1658,6 +1688,8 @@ fn unknown_entry_info(path: &str) -> FsEntryInfo {
         size: 0,
         mode: 0,
         modified: None,
+        inode: None,
+        mtime_nsec: None,
         uid: 0,
         gid: 0,
         atime: None,
@@ -1772,6 +1804,70 @@ mod tests {
         assert_eq!(response.t, MessageType::FsResponse);
         assert!(response.payload::<FsResponse>().unwrap().ok);
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"ignored");
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn range_request_reads_exact_bytes_and_accepts_maximum_offsets() {
+        let path = test_path("range-read");
+        let data = b"0123456789abcdef";
+        tokio::fs::write(&path, data).await.unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let mut state = FsState::default();
+        let handle = state
+            .insert_file(1, file, true, false, false, path.to_str().unwrap().into())
+            .unwrap();
+        for (offset, len, expected) in [
+            (3, 5, &data[3..8]),
+            (9, 7, &data[9..]),
+            (3, 0, &data[0..0]),
+            (16, 1, &data[0..0]),
+            (u64::MAX, 1, &data[0..0]),
+            (u64::MAX, 0, &data[0..0]),
+        ] {
+            let (tx, mut rx) = SessionOutputSender::channel();
+            let mut out = Vec::new();
+            let session = handle_fs_request(
+                2,
+                11,
+                FsRequest {
+                    op: FsOp::ReadRange {
+                        handle,
+                        offset,
+                        len: Some(len),
+                    },
+                    bulk: Some(BulkOffer::filesystem_read()),
+                },
+                &mut state,
+                &mut out,
+                &tx,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let accepted = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+            assert_eq!(accepted.t, MessageType::BulkAccepted);
+            let mut got = Vec::new();
+            loop {
+                match rx.recv().await.unwrap().output {
+                    SessionOutput::Bulk(output) => got.extend_from_slice(&output.record.payload),
+                    output => {
+                        let message = decode_raw_output(output);
+                        if message.t == MessageType::FsResponse {
+                            assert!(message.payload::<FsResponse>().unwrap().ok);
+                            break;
+                        }
+                        assert_eq!(message.t, MessageType::BulkFinish);
+                    }
+                }
+            }
+            let FsStreamSession::Read(session) = session else {
+                panic!("expected read session");
+            };
+            session.task.await.unwrap();
+            assert_eq!(got, expected, "offset {offset}, len {len}");
+        }
+        state.clear();
         tokio::fs::remove_file(path).await.unwrap();
     }
 

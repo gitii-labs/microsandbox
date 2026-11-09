@@ -5215,6 +5215,8 @@ pub unsafe extern "C" fn msb_fs_stat(
                 "mode": m.mode,
                 "readonly": m.readonly,
                 "modified_unix": m.modified.map(|t| t.timestamp()),
+                "modified_nsec": m.modified.map(|t| t.timestamp_subsec_nanos()),
+                "inode": m.inode,
             })
             .to_string())
         }))
@@ -7382,6 +7384,33 @@ pub unsafe extern "C" fn msb_fs_read_stream(
             let stream = sb
                 .fs()
                 .read_stream(&path_str)
+                .await
+                .map_err(FfiError::from)?;
+            let sh = register_fs_read(stream)?;
+            Ok(format!(r#"{{"stream_handle":{sh}}}"#))
+        }))
+    })
+}
+
+/// Open a streaming read of at most `len` bytes at `offset` in a guest file.
+/// Returns `{"stream_handle":<u64>}`; a zero length yields an empty stream.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn msb_fs_read_range_stream(
+    cancel_id: u64,
+    handle: Handle,
+    path: *const c_char,
+    offset: u64,
+    len: u64,
+    buf: *mut c_uchar,
+    buf_len: usize,
+) -> *mut c_char {
+    run_c(cancel_id, buf, buf_len, || {
+        let sb = get(handle)?;
+        let path_str = unsafe { cstr(path) }?.to_owned();
+        Ok(Box::pin(async move {
+            let stream = sb
+                .fs()
+                .read_range_stream(&path_str, offset, len)
                 .await
                 .map_err(FfiError::from)?;
             let sh = register_fs_read(stream)?;

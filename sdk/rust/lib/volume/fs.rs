@@ -702,6 +702,7 @@ pub(crate) mod local {
 
     fn std_metadata_to_fs(meta: &Metadata) -> FsMetadata {
         FsMetadata {
+            inode: None,
             kind: std_kind(meta),
             size: meta.len(),
             mode: metadata_mode(meta),

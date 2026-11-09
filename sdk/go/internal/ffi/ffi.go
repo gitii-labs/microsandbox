@@ -258,6 +258,7 @@ typedef char *(*msb_snapshot_group_head_fn)(uint64_t cancel_id, const char *sele
 typedef char *(*msb_sandbox_compact_fn)(uint64_t cancel_id, uint64_t handle, const char *name, const char *opts, uint8_t *buf, size_t buf_len);
 
 typedef char *(*msb_fs_read_stream_fn)(uint64_t cancel_id, uint64_t handle, const char *path, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_fs_read_range_stream_fn)(uint64_t cancel_id, uint64_t handle, const char *path, uint64_t offset, uint64_t len, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_fs_read_stream_recv_fn)(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_fs_read_stream_close_fn)(uint64_t stream_handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_fs_write_stream_fn)(uint64_t cancel_id, uint64_t handle, const char *path, uint8_t *buf, size_t buf_len);
@@ -415,6 +416,7 @@ static msb_volume_get_fn          ptr_msb_volume_get          = NULL;
 static msb_volume_get_default_fn  ptr_msb_volume_get_default  = NULL;
 static msb_volume_fs_op_fn        ptr_msb_volume_fs_op        = NULL;
 static msb_fs_read_stream_fn       ptr_msb_fs_read_stream       = NULL;
+static msb_fs_read_range_stream_fn ptr_msb_fs_read_range_stream = NULL;
 static msb_fs_read_stream_recv_fn  ptr_msb_fs_read_stream_recv  = NULL;
 static msb_fs_read_stream_close_fn ptr_msb_fs_read_stream_close = NULL;
 static msb_fs_write_stream_fn      ptr_msb_fs_write_stream      = NULL;
@@ -645,6 +647,7 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE(msb_volume_get_default);
 	RESOLVE(msb_volume_fs_op);
 	RESOLVE(msb_fs_read_stream);
+	RESOLVE_OPTIONAL(msb_fs_read_range_stream);
 	RESOLVE(msb_fs_read_stream_recv);
 	RESOLVE(msb_fs_read_stream_close);
 	RESOLVE(msb_fs_write_stream);
@@ -1095,6 +1098,10 @@ char *call_msb_fs_read_stream(uint64_t cancel_id, uint64_t handle, const char *p
 }
 char *call_msb_fs_read_stream_recv(uint64_t cancel_id, uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_fs_read_stream_recv ? ptr_msb_fs_read_stream_recv(cancel_id, stream_handle, buf, buf_len) : NULL;
+}
+int has_msb_fs_read_range_stream(void) { return ptr_msb_fs_read_range_stream != NULL; }
+char *call_msb_fs_read_range_stream(uint64_t cancel_id, uint64_t handle, const char *path, uint64_t offset, uint64_t len, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_fs_read_range_stream(cancel_id, handle, path, offset, len, buf, buf_len);
 }
 char *call_msb_fs_read_stream_close(uint64_t stream_handle, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_fs_read_stream_close ? ptr_msb_fs_read_stream_close(stream_handle, buf, buf_len) : NULL;
@@ -4624,6 +4631,8 @@ type FsStat struct {
 	Mode         uint32 `json:"mode"`
 	Readonly     bool   `json:"readonly"`
 	ModifiedUnix *int64 `json:"modified_unix"`
+	ModifiedNsec uint32 `json:"modified_nsec"`
+	Inode        uint64 `json:"inode"`
 }
 
 // IsDir reports whether the entry is a directory.
@@ -4634,7 +4643,7 @@ func (s *FsStat) ModTime() time.Time {
 	if s.ModifiedUnix == nil {
 		return time.Time{}
 	}
-	return time.Unix(*s.ModifiedUnix, 0)
+	return time.Unix(*s.ModifiedUnix, int64(s.ModifiedNsec))
 }
 
 // FsRead reads a file from the sandbox. Files larger than ~750 KiB may
@@ -5004,6 +5013,32 @@ func (s *Sandbox) FsReadStream(ctx context.Context, path string) (*FsReadStreamH
 	}
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
 		return nil, fmt.Errorf("parse fs_read_stream: %w", err)
+	}
+	return &FsReadStreamHandle{handle: C.uint64_t(resp.StreamHandle)}, nil
+}
+
+// FsReadRangeStream opens a bounded streaming read from a guest file.
+func (s *Sandbox) FsReadRangeStream(ctx context.Context, path string, offset, length uint64) (*FsReadStreamHandle, error) {
+	if err := ensureLoaded(); err != nil {
+		return nil, err
+	}
+	// Version handling: older native libraries retain ordinary file operations.
+	if C.has_msb_fs_read_range_stream() == 0 {
+		return nil, fmt.Errorf("file range reads require an updated microsandbox native library")
+	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	out, err := call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
+		return C.call_msb_fs_read_range_stream(cancelID, s.h(), cPath, C.uint64_t(offset), C.uint64_t(length), buf, bufLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		StreamHandle uint64 `json:"stream_handle"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		return nil, fmt.Errorf("parse fs_read_range_stream: %w", err)
 	}
 	return &FsReadStreamHandle{handle: C.uint64_t(resp.StreamHandle)}, nil
 }
