@@ -49,7 +49,7 @@ There are two related values to preserve:
 | Known-operation availability gate | Minimum of host generation and ready-frame generation | Minimum of generation 1 and ready-frame generation |
 | Generation emitted in native/encoded envelopes | Host's existing `PROTOCOL_VERSION` | Generation 1 |
 
-The current path historically emits the host generation even when its availability gate is lower. The extraction preserves that behavior. Do not rewrite every outgoing agent `v` to the negotiated minimum under the assumption that this would be a neutral cleanup. The Rust agent constant is 10 (execution acknowledgements) and the standalone TypeScript client retains its existing generation 5; adding framed host control does not bump either value or imply that both client packages expose every agent operation.
+The current path historically emits the host generation even when its availability gate is lower. The extraction preserves that behavior. Do not rewrite every outgoing agent `v` to the negotiated minimum under the assumption that this would be a neutral cleanup. The Rust agent constant is 11 (bounded filesystem ranges) and the standalone TypeScript client retains its existing generation 5; adding framed host control does not bump either value or imply that both client packages expose every agent operation.
 
 Known message types have an introduction generation in `MessageType::min_protocol_version()`. `AgentProtocol::prepare` checks availability before admitting native or encoded sends. An unsupported known operation returns the shared client's unsupported-operation category without sending it or closing unrelated streams. Dynamic names and raw bytes remain available to callers who deliberately own their protocol interpretation.
 
