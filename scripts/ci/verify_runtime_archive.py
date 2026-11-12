@@ -186,6 +186,10 @@ HOMEBREW_LIBRARY_DIRECTORY = "/opt/homebrew/opt/distributed-node/libexec/runtime
 MH_MAGIC_64 = 0xFEEDFACF
 LC_SEGMENT_64 = 0x19
 LC_ID_DYLIB = 0xD
+SECTION_TYPE_MASK = 0xFF
+# S_ZEROFILL, S_GB_ZEROFILL and S_THREAD_LOCAL_ZEROFILL have no file bytes;
+# ruby-macho skips them when it finds where the load commands must end.
+ZEROFILL_SECTION_TYPES = {0x1, 0xC, 0x12}
 MACH_HEADER_64_SIZE = 32
 DYLIB_COMMAND_SIZE = 24
 
@@ -212,10 +216,12 @@ def homebrew_install_name_shortfall(image: bytes) -> int:
                 section = offset + 72 + index * 80
                 (section_size,) = struct.unpack_from("<Q", image, section + 40)
                 (section_offset,) = struct.unpack_from("<I", image, section + 48)
-                if section_size and section_offset:
+                (section_flags,) = struct.unpack_from("<I", image, section + 64)
+                section_type = section_flags & SECTION_TYPE_MASK
+                if section_size and section_type not in ZEROFILL_SECTION_TYPES:
                     first_section = min(first_section, section_offset)
         offset += size
-    # Caller validation: an executable has no install name to rewrite.
+    # Homebrew rewrites no install name for an executable, which has none.
     if not identity:
         return 0
     rewritten = f"{HOMEBREW_LIBRARY_DIRECTORY}/{identity.rsplit('/', 1)[-1]}"

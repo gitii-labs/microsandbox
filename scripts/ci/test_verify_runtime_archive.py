@@ -198,20 +198,31 @@ class RuntimeArchiveTests(unittest.TestCase):
         )
 
     @staticmethod
-    def dylib(identity: str, padding: int) -> bytes:
-        """A Mach-O header with one install name and one section after padding."""
-        name = identity.encode() + b"\0"
-        name += b"\0" * (-len(name) % 8)
-        identity_command = struct.pack("<6I", 0xD, 24 + len(name), 24, 0, 0, 0) + name
-        segment_size = 72 + 80
+    def dylib(identity: str | None, padding: int, zerofill_offset: int | None = None) -> bytes:
+        """A Mach-O header with an optional install name and __text after padding."""
+        identity_command = b""
+        if identity is not None:
+            name = identity.encode() + b"\0"
+            name += b"\0" * (-len(name) % 8)
+            identity_command = struct.pack("<6I", 0xD, 24 + len(name), 24, 0, 0, 0) + name
+        # (name, size, section type); a zero-fill section has no file bytes.
+        sections = [(b"__text", 8, 0)]
+        if zerofill_offset is not None:
+            sections.append((b"__bss", 8, 0x1))
+        segment_size = 72 + 80 * len(sections)
         commands_size = len(identity_command) + segment_size
-        section_offset = 32 + commands_size + padding
-        section = struct.pack("<16s16sQQI7I", b"__text", b"__TEXT", 0, 8, section_offset, *[0] * 7)
-        segment = (
-            struct.pack("<2I16s4Q4I", 0x19, segment_size, b"__TEXT", 0, 0, 0, 0, 0, 0, 1, 0)
-            + section
+        text_offset = 32 + commands_size + padding
+        segment = struct.pack(
+            "<2I16s4Q4I", 0x19, segment_size, b"__TEXT", 0, 0, 0, 0, 0, 0, len(sections), 0
         )
-        header = struct.pack("<8I", 0xFEEDFACF, 0, 0, 6, 2, commands_size, 0, 0)
+        for section_name, size, section_type in sections:
+            offset = zerofill_offset if section_type else text_offset
+            segment += struct.pack(
+                "<16s16sQQ8I", section_name, b"__TEXT", 0, size, offset, 0, 0, 0,
+                section_type, 0, 0, 0,
+            )
+        command_count = 2 if identity is not None else 1
+        header = struct.pack("<8I", 0xFEEDFACF, 0, 0, 6, command_count, commands_size, 0, 0)
         return header + identity_command + segment + b"\0" * (padding + 8)
 
     def test_darwin_install_name_needs_room_for_the_homebrew_path(self) -> None:
@@ -225,8 +236,18 @@ class RuntimeArchiveTests(unittest.TestCase):
         )
 
     def test_darwin_long_install_name_shrinks_into_the_homebrew_path(self) -> None:
+        # Like the published FFI: no spare bytes, but its 168-byte builder-path
+        # command shrinks to a 112-byte Homebrew command.
         builder = "/builder/work/target/release/deps/" + "x" * 80 + "/libmicrosandbox_go_ffi.dylib"
-        self.assertLessEqual(homebrew_install_name_shortfall(self.dylib(builder, 0)), 0)
+        self.assertEqual(homebrew_install_name_shortfall(self.dylib(builder, 0)), -56)
+
+    def test_darwin_executable_has_no_install_name_to_fit(self) -> None:
+        self.assertEqual(homebrew_install_name_shortfall(self.dylib(None, 0)), 0)
+
+    def test_darwin_zerofill_section_does_not_end_the_header(self) -> None:
+        # A zero-fill section's offset lies inside the header; ruby-macho ignores it.
+        image = self.dylib("libkrunfw.5.dylib", 56, zerofill_offset=32)
+        self.assertEqual(homebrew_install_name_shortfall(image), 0)
 
     def test_darwin_system_and_relative_paths(self) -> None:
         check_darwin_paths(

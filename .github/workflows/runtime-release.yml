@@ -195,7 +195,7 @@ jobs:
           cd build
           if [ "${{ matrix.os }}" = darwin ]; then
             # Homebrew rewrites the dylib's install name to its keg path at
-            # install time; the linker's default header leaves no room for it.
+            # install time; the linker's default header leaves too little room for it.
             cc -fPIC -DABI_VERSION="$LIBKRUNFW_ABI" -shared -Wl,-headerpad_max_install_names \
               -o "libkrunfw.$LIBKRUNFW_ABI.dylib" ../parts/kernel.c
             ln -sf "libkrunfw.$LIBKRUNFW_ABI.dylib" libkrunfw.dylib
