@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import os
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 from scripts.ci.verify_runtime_archive import (
     check_darwin_paths,
     extract_archive,
+    homebrew_install_name_shortfall,
     inventory,
 )
 
@@ -194,6 +196,37 @@ class RuntimeArchiveTests(unittest.TestCase):
             (self.root / "extracted/lib/libkrunfw.dylib").resolve(),
             self.root / "extracted/lib/libkrunfw.5.dylib",
         )
+
+    @staticmethod
+    def dylib(identity: str, padding: int) -> bytes:
+        """A Mach-O header with one install name and one section after padding."""
+        name = identity.encode() + b"\0"
+        name += b"\0" * (-len(name) % 8)
+        identity_command = struct.pack("<6I", 0xD, 24 + len(name), 24, 0, 0, 0) + name
+        segment_size = 72 + 80
+        commands_size = len(identity_command) + segment_size
+        section_offset = 32 + commands_size + padding
+        section = struct.pack("<16s16sQQI7I", b"__text", b"__TEXT", 0, 8, section_offset, *[0] * 7)
+        segment = (
+            struct.pack("<2I16s4Q4I", 0x19, segment_size, b"__TEXT", 0, 0, 0, 0, 0, 0, 1, 0)
+            + section
+        )
+        header = struct.pack("<8I", 0xFEEDFACF, 0, 0, 6, 2, commands_size, 0, 0)
+        return header + identity_command + segment + b"\0" * (padding + 8)
+
+    def test_darwin_install_name_needs_room_for_the_homebrew_path(self) -> None:
+        # The published v0.7.13-gitii.3 firmware: a 48-byte identity command and
+        # 32 spare bytes, where Homebrew's name needs a 104-byte command.
+        self.assertEqual(
+            homebrew_install_name_shortfall(self.dylib("libkrunfw.5.dylib", 32)), 24
+        )
+        self.assertEqual(
+            homebrew_install_name_shortfall(self.dylib("libkrunfw.5.dylib", 56)), 0
+        )
+
+    def test_darwin_long_install_name_shrinks_into_the_homebrew_path(self) -> None:
+        builder = "/builder/work/target/release/deps/" + "x" * 80 + "/libmicrosandbox_go_ffi.dylib"
+        self.assertLessEqual(homebrew_install_name_shortfall(self.dylib(builder, 0)), 0)
 
     def test_darwin_system_and_relative_paths(self) -> None:
         check_darwin_paths(
