@@ -11,6 +11,7 @@ import os
 import platform
 import plistlib
 import re
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -176,7 +177,65 @@ def check_darwin_paths(
     )
 
 
+# Where Distributed's Homebrew formula installs the runtime's libraries.
+# Homebrew rewrites each dylib's install name to this directory plus the
+# basename of the existing name, and fails the installation when the rewritten
+# load command does not fit before the first section.
+HOMEBREW_LIBRARY_DIRECTORY = "/opt/homebrew/opt/distributed-node/libexec/runtime/lib"
+
+MH_MAGIC_64 = 0xFEEDFACF
+LC_SEGMENT_64 = 0x19
+LC_ID_DYLIB = 0xD
+SECTION_TYPE_MASK = 0xFF
+# S_ZEROFILL, S_GB_ZEROFILL and S_THREAD_LOCAL_ZEROFILL have no file bytes;
+# ruby-macho skips them when it finds where the load commands must end.
+ZEROFILL_SECTION_TYPES = {0x1, 0xC, 0x12}
+MACH_HEADER_64_SIZE = 32
+DYLIB_COMMAND_SIZE = 24
+
+
+def homebrew_install_name_shortfall(image: bytes) -> int:
+    """Bytes the header lacks for Homebrew's install name; 0 or less fits."""
+    magic, _, _, _, command_count, commands_size, _, _ = struct.unpack_from(
+        "<8I", image, 0
+    )
+    require(magic == MH_MAGIC_64, "expected a thin 64-bit Mach-O")
+    offset = MACH_HEADER_64_SIZE
+    identity_size = 0
+    identity = ""
+    first_section = len(image)
+    for _ in range(command_count):
+        kind, size = struct.unpack_from("<2I", image, offset)
+        if kind == LC_ID_DYLIB:
+            (name_offset,) = struct.unpack_from("<I", image, offset + 8)
+            name = image[offset + name_offset : offset + size].split(b"\0", 1)[0]
+            identity, identity_size = name.decode(), size
+        if kind == LC_SEGMENT_64:
+            (section_count,) = struct.unpack_from("<I", image, offset + 64)
+            for index in range(section_count):
+                section = offset + 72 + index * 80
+                (section_size,) = struct.unpack_from("<Q", image, section + 40)
+                (section_offset,) = struct.unpack_from("<I", image, section + 48)
+                (section_flags,) = struct.unpack_from("<I", image, section + 64)
+                section_type = section_flags & SECTION_TYPE_MASK
+                if section_size and section_type not in ZEROFILL_SECTION_TYPES:
+                    first_section = min(first_section, section_offset)
+        offset += size
+    # Homebrew rewrites no install name for an executable, which has none.
+    if not identity:
+        return 0
+    rewritten = f"{HOMEBREW_LIBRARY_DIRECTORY}/{identity.rsplit('/', 1)[-1]}"
+    rewritten_size = (DYLIB_COMMAND_SIZE + len(rewritten.encode()) + 1 + 7) // 8 * 8
+    room = first_section - (MACH_HEADER_64_SIZE + commands_size)
+    return rewritten_size - identity_size - room
+
+
 def check_darwin(path: Path, deployment_target: str) -> None:
+    shortfall = homebrew_install_name_shortfall(path.read_bytes())
+    require(
+        shortfall <= 0,
+        f"Mach-O header is {shortfall} bytes short of Homebrew's install name: {path}",
+    )
     require(
         command("lipo", "-archs", str(path)).strip() == "arm64",
         f"expected ARM64 Mach-O: {path}",
