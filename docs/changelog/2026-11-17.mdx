@@ -1,0 +1,38 @@
+---
+title: "Distributed runtime v0.7.13-gitii.5"
+sidebarTitle: "Distributed runtime .5"
+description: "The runtime records a run's exit before anything that can fail, and a stop names an exit that was not recorded."
+icon: "bolt"
+---
+
+## Run exit recording
+
+The VM exit observer writes the run's exit code, reason and detail before it
+releases CPU and writeback allocations or removes the runtime's endpoints. Each
+exit write is retried up to three times; every failure is logged as `VM exit
+catalog write failed` with the run id and error. SQLite busy errors are also
+retried within each attempt, as before.
+
+When endpoint removal fails, the run keeps its recorded exit and a `Running`
+sandbox moves to `Draining`. SDK reconciliation and lifecycle maintenance then
+remove the endpoints and mark the sandbox `Stopped` after the process exits.
+
+## Unrecorded exits
+
+Dead-runtime cleanup only terminates a run that is still `Running`, so it never
+replaces an exit the runtime recorded. A run it terminates gets the
+`termination_detail` `runtime exited without recording its exit`.
+
+A graceful stop whose run has that detail and no exit code fails with
+`Error::SandboxExitUnrecorded` in Rust and `ErrSandboxExitUnrecorded` in Go,
+instead of the runtime error `did not confirm clean shutdown`. The VM has stopped
+and its runtime is released, but a clean guest shutdown is not confirmed.
+TypeScript keeps `RuntimeError`, and Python and Ruby keep their base error.
+
+## Runtime and SDK deployment
+
+Deploy the runtime tag `v0.7.13-gitii.5` together with the Go SDK module tag
+`sdk/go/v0.7.13-gitii.5`. The fork module is
+`github.com/gitii-labs/microsandbox/sdk/go`; its declared import path remains
+`github.com/superradcompany/microsandbox/sdk/go`. Go callers that matched this
+stop failure as `ErrInternal` now receive `ErrSandboxExitUnrecorded`.
