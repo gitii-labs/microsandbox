@@ -427,19 +427,18 @@ impl LocalBackend {
             })??;
         }
         if all_dead {
-            // A runtime that recorded its run's exit has no active run and no
-            // PID to signal here, but keeps its lifecycle lock until it has
-            // released its resources. Stopped waits for that on every platform.
-            let _ownership = crate::runtime::acquire_sandbox_lifecycle_guard(
-                &self.config().run_dir(),
-                name,
-                Duration::from_secs(5),
-            )
-            .await?;
             #[cfg(unix)]
-            microsandbox_runtime::maintenance::remove_bootstrap_trampoline(
-                &self.sandboxes_dir().join(name),
-            )?;
+            {
+                let _ownership = crate::runtime::acquire_sandbox_lifecycle_guard(
+                    &self.config().run_dir(),
+                    name,
+                    Duration::from_secs(5),
+                )
+                .await?;
+                microsandbox_runtime::maintenance::remove_bootstrap_trampoline(
+                    &self.sandboxes_dir().join(name),
+                )?;
+            }
             let db = self.db().await?.write();
             if let Err(e) = Self::update_sandbox_status(db, model.id, SandboxStatus::Stopped).await
             {
@@ -912,10 +911,8 @@ impl LocalBackend {
         // Without filesystem ownership information, retain the conservative observation.
         let Some(run) = run else {
             #[cfg(unix)]
-            if matches!(
-                sandbox.status,
-                SandboxStatus::Starting | SandboxStatus::Running
-            ) && let Some((run_dir, sandboxes_dir)) = socket_roots
+            if sandbox.status == SandboxStatus::Starting
+                && let Some((run_dir, sandboxes_dir)) = socket_roots
             {
                 let socket_paths =
                     SandboxSocketPaths::in_sandboxes_dir(run_dir, sandboxes_dir, &sandbox.name);
@@ -924,14 +921,8 @@ impl LocalBackend {
                 }
             }
 
-            // With both guards held, a Running row without an active run
-            // belongs to a runtime that recorded its run's exit and died
-            // before publishing Stopped.
             if sandbox.status == SandboxStatus::Draining
-                || (matches!(
-                    sandbox.status,
-                    SandboxStatus::Starting | SandboxStatus::Running
-                ) && socket_roots.is_some())
+                || (sandbox.status == SandboxStatus::Starting && socket_roots.is_some())
             {
                 if let Some((run_dir, sandboxes_dir)) = socket_roots {
                     crate::runtime::remove_socket_artifacts_at(
@@ -940,9 +931,7 @@ impl LocalBackend {
                         &sandbox.name,
                     )?;
                 }
-                let latest = Self::load_latest_run(pools.read(), sandbox.id).await?;
-                let (terminal_status, reason) =
-                    Self::unowned_terminal_state(sandbox.status, latest.as_ref());
+                let (terminal_status, reason) = Self::stale_runtime_terminal_state(sandbox.status);
                 Self::mark_sandbox_runtime_stale(
                     pools.write(),
                     sandbox.id,
@@ -986,7 +975,7 @@ impl LocalBackend {
         if let Some((run_dir, sandboxes_dir)) = socket_roots {
             crate::runtime::remove_socket_artifacts_at(run_dir, sandboxes_dir, &sandbox.name)?;
         }
-        let (terminal_status, reason) = Self::unowned_terminal_state(sandbox.status, Some(&run));
+        let (terminal_status, reason) = Self::stale_runtime_terminal_state(sandbox.status);
         Self::mark_sandbox_runtime_stale(
             pools.write(),
             sandbox.id,
@@ -1083,25 +1072,6 @@ impl LocalBackend {
                 run_entity::TerminationReason::InternalError,
             ),
         }
-    }
-
-    /// Terminal state for an active sandbox whose runtime is gone. A run with a
-    /// recorded exit gets the `Stopped` its runtime publishes after recording
-    /// one, and keeps its own reason (the returned reason is used only for a
-    /// run still `Running`). Otherwise the sandbox status decides, as in
-    /// [`Self::stale_runtime_terminal_state`].
-    fn unowned_terminal_state(
-        status: SandboxStatus,
-        latest_run: Option<&run_entity::Model>,
-    ) -> (SandboxStatus, run_entity::TerminationReason) {
-        let (terminal_status, reason) = Self::stale_runtime_terminal_state(status);
-        let recorded_exit = latest_run.is_some_and(|run| {
-            run.status == run_entity::RunStatus::Terminated && run.exit_code.is_some()
-        });
-        if recorded_exit {
-            return (SandboxStatus::Stopped, reason);
-        }
-        (terminal_status, reason)
     }
 
     /// Mark a stale sandbox row (and optionally its run) terminal.
@@ -2636,7 +2606,7 @@ mod tests {
             pid: Set(Some(dead_pid())),
             status: Set(run_entity::RunStatus::Terminated),
             exit_code: Set(Some(0)),
-            termination_reason: Set(Some(run_entity::TerminationReason::Completed)),
+            termination_reason: Set(Some(run_entity::TerminationReason::Signal)),
             terminated_at: Set(Some(recorded_at)),
             ..Default::default()
         };
@@ -2664,87 +2634,10 @@ mod tests {
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(
             run.termination_reason,
-            Some(run_entity::TerminationReason::Completed)
-        );
-        assert_eq!(run.termination_detail, None);
-        assert_eq!(run.terminated_at, Some(recorded_at));
-        let sandbox = sandbox_entity::Entity::find_by_id(sandbox_id)
-            .one(pools.write())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(sandbox.status, SandboxStatus::Stopped);
-    }
-
-    /// A runtime that recorded an unclean exit and died, or could not remove
-    /// its endpoints, before publishing Stopped: `Running` with no active run.
-    /// Reconciliation leaves it while the lifecycle lock is held, then stops
-    /// it and keeps the recorded run.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_reconcile_finishes_running_sandbox_after_its_runtime_releases_the_lock() {
-        let temp = tempfile::Builder::new()
-            .prefix("msb-unowned")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let run_dir = temp.path().join("run");
-        let sandboxes_dir = temp.path().join("sandboxes");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::create_dir_all(&sandboxes_dir).unwrap();
-        let pools = open_test_pools(&temp.path().join("test.db")).await;
-
-        let name = "recorded-exit";
-        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &test_config(name))
-            .await
-            .unwrap();
-        LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Running)
-            .await
-            .unwrap();
-        let run = run_entity::ActiveModel {
-            sandbox_id: Set(sandbox_id),
-            pid: Set(Some(dead_pid())),
-            status: Set(run_entity::RunStatus::Terminated),
-            exit_code: Set(Some(0)),
-            termination_reason: Set(Some(run_entity::TerminationReason::Signal)),
-            ..Default::default()
-        };
-        let run_id = run_entity::Entity::insert(run)
-            .exec(pools.write())
-            .await
-            .unwrap()
-            .last_insert_id;
-        let reconcile = || async {
-            let sandbox = sandbox_entity::Entity::find_by_id(sandbox_id)
-                .one(pools.write())
-                .await
-                .unwrap()
-                .unwrap();
-            LocalBackend::reconcile_sandbox_runtime_state_with_paths(
-                &pools,
-                sandbox,
-                Some((&run_dir, &sandboxes_dir)),
-            )
-            .await
-            .unwrap()
-        };
-
-        let runtime_lock =
-            microsandbox_runtime::ipc::acquire_lifecycle_guard(&run_dir, name).unwrap();
-        assert_eq!(reconcile().await.status, SandboxStatus::Running);
-        drop(runtime_lock);
-        assert_eq!(reconcile().await.status, SandboxStatus::Stopped);
-
-        let run = run_entity::Entity::find_by_id(run_id)
-            .one(pools.write())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(run.exit_code, Some(0));
-        assert_eq!(
-            run.termination_reason,
             Some(run_entity::TerminationReason::Signal)
         );
         assert_eq!(run.termination_detail, None);
+        assert_eq!(run.terminated_at, Some(recorded_at));
     }
 
     #[tokio::test]

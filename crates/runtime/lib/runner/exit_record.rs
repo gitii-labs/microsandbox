@@ -2,15 +2,9 @@
 //!
 //! The observer runs once, on the VMM thread, right before `_exit()`. A write
 //! it loses is never made by this process again: dead-runtime cleanup can only
-//! mark the run terminated without its exit code. So no cleanup step may skip
-//! the run's record, and every failed write is retried and logged.
-//!
-//! The run is recorded after the runtime has released its allocations and
-//! removed its endpoints, as before: SDKs that reap without the lifecycle lock
-//! (v0.6.x) finish a `Draining` sandbox as soon as its run is terminated, so a
-//! terminated run must not be visible while this process still works on the
-//! sandbox's deterministic paths. The sandbox row is not changed until
-//! `Stopped` is published.
+//! mark the run terminated without its exit code. So every catalog write here
+//! is retried a bounded number of times and every failure is logged, and
+//! `Stopped` is published only over a recorded run.
 
 use std::future::Future;
 use std::time::Duration;
@@ -65,13 +59,13 @@ pub(crate) struct RunExit {
 //--------------------------------------------------------------------------------------------------
 
 /// Write the catalog state of a VM exit: `release` allocations, then
-/// `remove_endpoints`, then record the run's exit whatever the endpoint
-/// result, then publish `Stopped`.
+/// `remove_endpoints`, then record the run's exit, then publish `Stopped`.
 ///
-/// `Stopped` is published only when the run's exit was recorded and the
-/// endpoints are gone. Otherwise the sandbox stays active, and dead-runtime
-/// cleanup finishes it after this process exits. Returns whether the sandbox
-/// was marked stopped.
+/// A sandbox whose endpoints are still present must not become restartable,
+/// so a failed endpoint removal leaves the run and the sandbox active for
+/// dead-runtime cleanup, which finishes them after this process exits. A run
+/// whose exit could not be recorded is left `Running` the same way. Returns
+/// whether the sandbox was marked stopped.
 pub(crate) async fn finish_vm_exit<R, RFut>(
     db: &DbWriteConnection,
     exit: &RunExit,
@@ -84,22 +78,22 @@ where
     RFut: Future<Output = ()>,
 {
     release().await;
-    let endpoints = remove_endpoints();
 
-    let recorded = record_run_exit(db, exit, EXIT_WRITE_RETRY_DELAY).await;
-    if !recorded {
+    if let Err(error) = remove_endpoints() {
+        tracing::error!(
+            sandbox = %sandbox_name,
+            run_id = exit.run_id,
+            %error,
+            "runtime exit socket cleanup failed; leaving the run active for reaping"
+        );
+        return false;
+    }
+
+    if !record_run_exit(db, exit, EXIT_WRITE_RETRY_DELAY).await {
         tracing::error!(
             sandbox = %sandbox_name,
             run_id = exit.run_id,
             "run exit not recorded; leaving the sandbox active for reaping"
-        );
-        return false;
-    }
-    if let Err(error) = endpoints {
-        tracing::warn!(
-            sandbox = %sandbox_name,
-            %error,
-            "runtime exit socket cleanup failed; leaving the sandbox active for reaping"
         );
         return false;
     }
@@ -377,38 +371,31 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn exit_steps_run_in_order() {
         let (_dir, db) = test_db().await;
         let (sandbox_id, run_id) = insert_running(&db, "ordered").await;
-        let exit = signal_exit(sandbox_id, run_id);
         let released = AtomicU32::new(0);
-        let unrecorded_at_removal = AtomicU32::new(0);
+        let removed = AtomicU32::new(0);
 
         let stopped = finish_vm_exit(
             &db,
-            &exit,
+            &signal_exit(sandbox_id, run_id),
             "ordered",
             || async {
+                assert_eq!(removed.load(Ordering::SeqCst), 0);
                 released.fetch_add(1, Ordering::SeqCst);
             },
             || {
-                // Endpoints go after allocations and before a terminated run
-                // becomes visible to lock-less reapers.
                 assert_eq!(released.load(Ordering::SeqCst), 1);
-                let run = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(run_of(&db, run_id))
-                });
-                if run.status == run_entity::RunStatus::Running && run.exit_code.is_none() {
-                    unrecorded_at_removal.fetch_add(1, Ordering::SeqCst);
-                }
+                removed.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
         )
         .await;
 
         assert!(stopped);
-        assert_eq!(unrecorded_at_removal.load(Ordering::SeqCst), 1);
+        assert_eq!(removed.load(Ordering::SeqCst), 1);
         assert_recorded(&run_of(&db, run_id).await);
         assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Stopped);
     }
@@ -416,7 +403,7 @@ mod tests {
     /// The common path: a requested stop moved the sandbox to Draining
     /// before the VM exited. Recording does not depend on the sandbox status.
     #[tokio::test]
-    async fn exit_of_a_draining_sandbox_is_recorded_and_stopped() {
+    async fn exit_of_a_draining_or_starting_sandbox_is_recorded_and_stopped() {
         for status in [SandboxStatus::Draining, SandboxStatus::Starting] {
             let (_dir, db) = test_db().await;
             let (sandbox_id, run_id) = insert_active(&db, "exiting", status).await;
@@ -436,51 +423,45 @@ mod tests {
         }
     }
 
-    /// The state a runtime leaves when it dies after recording its exit, or
-    /// when it cannot remove its endpoints: `Running` with no active run.
-    /// Older SDKs leave that state alone: `v0.6.9-gitii.5`'s
-    /// `reconcile_sandbox_runtime_state` (sdk/rust/lib/backend/local/sandbox/mod.rs)
-    /// finishes a sandbox without an active run only when it is `Draining`,
-    /// and treats `Running` without a run as a sandbox still starting up. A
-    /// `Draining` sandbox gets a terminated run only after the runtime has
-    /// released its allocations and endpoints (`exit_steps_run_in_order`),
-    /// as with `v0.7.13-gitii.4`.
     #[tokio::test]
-    async fn running_sandbox_with_a_recorded_exit_is_reaped_only_after_the_lock() {
-        for endpoints_removed in [true, false] {
-            let (dir, db) = test_db().await;
-            let (sandbox_id, run_id) = insert_running(&db, "died").await;
-            let run_dir = dir.path().join("run");
-            std::fs::create_dir_all(&run_dir).unwrap();
-            let lifecycle = crate::ipc::acquire_lifecycle_guard(&run_dir, "died").unwrap();
+    async fn failed_socket_removal_leaves_the_run_unrecorded_and_logs_an_error() {
+        let (dir, db) = test_db().await;
+        let (sandbox_id, run_id) = insert_running(&db, "sockets-stuck").await;
+        let log = CapturedLog::default();
+        let _default = log.install();
 
-            if endpoints_removed {
-                // The process dies right after recording its exit.
-                assert!(
-                    record_run_exit(&db, &signal_exit(sandbox_id, run_id), Duration::ZERO).await
-                );
-            } else {
-                let stopped = finish_vm_exit(
-                    &db,
-                    &signal_exit(sandbox_id, run_id),
-                    "died",
-                    || async {},
-                    || Err(io::Error::other("endpoint busy")),
-                )
-                .await;
-                assert!(!stopped);
-            }
-            assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Running);
+        let stopped = finish_vm_exit(
+            &db,
+            &signal_exit(sandbox_id, run_id),
+            "sockets-stuck",
+            || async {},
+            || Err(io::Error::other("endpoint busy")),
+        )
+        .await;
 
-            // While the runtime still holds its lifecycle lock, nothing reaps it.
-            assert_eq!(reap(&db, &dir).await, 0);
-            assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Running);
-            drop(lifecycle);
+        assert!(!stopped);
+        let run = run_of(&db, run_id).await;
+        assert_eq!(run.status, run_entity::RunStatus::Running);
+        assert_eq!(run.exit_code, None);
+        assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Running);
+        let text = log.text();
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(
+            text.contains("runtime exit socket cleanup failed"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("run_id={run_id}")), "{text}");
+        assert!(text.contains("endpoint busy"), "{text}");
 
-            assert_eq!(reap(&db, &dir).await, 1);
-            assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Stopped);
-            assert_recorded(&run_of(&db, run_id).await);
-        }
+        // As with a runtime that died, cleanup terminates the run and names
+        // the missing exit.
+        assert_eq!(reap(&db, &dir).await, 1);
+        let run = run_of(&db, run_id).await;
+        assert_eq!(run.exit_code, None);
+        assert_eq!(
+            run.termination_detail.as_deref(),
+            Some(run_entity::UNRECORDED_EXIT_DETAIL)
+        );
     }
 
     #[tokio::test]

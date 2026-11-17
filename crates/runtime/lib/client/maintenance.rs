@@ -812,36 +812,31 @@ async fn reconcile_stale_active(
     // Preserve the config (including pending restore intent) while publishing its terminal state.
     let Some(run) = run else {
         #[cfg(unix)]
-        if matches!(
-            sandbox.status,
-            SandboxStatus::Starting | SandboxStatus::Running
-        ) && socket_paths.may_be_live().await?
-        {
+        if sandbox.status == SandboxStatus::Starting && socket_paths.may_be_live().await? {
             return Ok(false);
         }
 
-        // Both guards are held, so no current runtime owns this sandbox. A
-        // Running row without an active run belongs to a runtime that
-        // recorded its run's exit and died before publishing Stopped.
-        let latest = run_entity::Entity::find()
-            .filter(run_entity::Column::SandboxId.eq(sandbox.id))
-            .order_by_desc(run_entity::Column::Id)
-            .one(db)
-            .await?;
-        socket_paths.remove_artifacts()?;
-        #[cfg(unix)]
-        remove_bootstrap_trampoline(&sandboxes_dir.join(&sandbox.name))?;
-        let now = chrono::Utc::now().naive_utc();
-        let terminal_status = unowned_terminal_status(sandbox.status, latest.as_ref());
-        let result = terminal_sandbox_update(db)
-            .await?
-            .col_expr(sandbox_entity::Column::Status, Expr::value(terminal_status))
-            .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
-            .filter(sandbox_entity::Column::Id.eq(sandbox.id))
-            .filter(sandbox_entity::Column::Status.eq(sandbox.status))
-            .exec(db)
-            .await?;
-        return Ok(result.rows_affected > 0);
+        if matches!(
+            sandbox.status,
+            SandboxStatus::Starting | SandboxStatus::Draining
+        ) {
+            socket_paths.remove_artifacts()?;
+            #[cfg(unix)]
+            remove_bootstrap_trampoline(&sandboxes_dir.join(&sandbox.name))?;
+            let now = chrono::Utc::now().naive_utc();
+            let (terminal_status, _) = stale_runtime_terminal_state(sandbox.status);
+            let result = terminal_sandbox_update(db)
+                .await?
+                .col_expr(sandbox_entity::Column::Status, Expr::value(terminal_status))
+                .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
+                .filter(sandbox_entity::Column::Id.eq(sandbox.id))
+                .filter(sandbox_entity::Column::Status.eq(sandbox.status))
+                .exec(db)
+                .await?;
+            return Ok(result.rows_affected > 0);
+        }
+
+        return Ok(false);
     };
 
     // NOTE: `pid_is_alive` treats zombies as dead, but still cannot
@@ -899,24 +894,6 @@ async fn reconcile_stale_active(
         .await?;
 
     Ok(result.rows_affected > 0)
-}
-
-/// Terminal status for an active sandbox whose runtime is gone and which has
-/// no active run. A recorded exit gets the `Stopped` the runtime itself
-/// publishes after recording one; the run row keeps the actual reason.
-/// Otherwise `Draining` becomes `Stopped` and `Starting`/`Running` become
-/// `Crashed`, as for a dead runtime with a running run.
-fn unowned_terminal_status(
-    status: SandboxStatus,
-    latest_run: Option<&run_entity::Model>,
-) -> SandboxStatus {
-    let recorded_exit = latest_run.is_some_and(|run| {
-        run.status == run_entity::RunStatus::Terminated && run.exit_code.is_some()
-    });
-    if recorded_exit {
-        return SandboxStatus::Stopped;
-    }
-    stale_runtime_terminal_state(status).0
 }
 
 fn stale_runtime_terminal_state(
