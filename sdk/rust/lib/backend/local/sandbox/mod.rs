@@ -427,18 +427,19 @@ impl LocalBackend {
             })??;
         }
         if all_dead {
+            // A runtime that recorded its run's exit has no active run and no
+            // PID to signal here, but keeps its lifecycle lock until it has
+            // released its resources. Stopped waits for that on every platform.
+            let _ownership = crate::runtime::acquire_sandbox_lifecycle_guard(
+                &self.config().run_dir(),
+                name,
+                Duration::from_secs(5),
+            )
+            .await?;
             #[cfg(unix)]
-            {
-                let _ownership = crate::runtime::acquire_sandbox_lifecycle_guard(
-                    &self.config().run_dir(),
-                    name,
-                    Duration::from_secs(5),
-                )
-                .await?;
-                microsandbox_runtime::maintenance::remove_bootstrap_trampoline(
-                    &self.sandboxes_dir().join(name),
-                )?;
-            }
+            microsandbox_runtime::maintenance::remove_bootstrap_trampoline(
+                &self.sandboxes_dir().join(name),
+            )?;
             let db = self.db().await?.write();
             if let Err(e) = Self::update_sandbox_status(db, model.id, SandboxStatus::Stopped).await
             {
@@ -911,8 +912,10 @@ impl LocalBackend {
         // Without filesystem ownership information, retain the conservative observation.
         let Some(run) = run else {
             #[cfg(unix)]
-            if sandbox.status == SandboxStatus::Starting
-                && let Some((run_dir, sandboxes_dir)) = socket_roots
+            if matches!(
+                sandbox.status,
+                SandboxStatus::Starting | SandboxStatus::Running
+            ) && let Some((run_dir, sandboxes_dir)) = socket_roots
             {
                 let socket_paths =
                     SandboxSocketPaths::in_sandboxes_dir(run_dir, sandboxes_dir, &sandbox.name);
@@ -921,8 +924,14 @@ impl LocalBackend {
                 }
             }
 
+            // With both guards held, a Running row without an active run
+            // belongs to a runtime that recorded its run's exit and died
+            // before publishing Stopped.
             if sandbox.status == SandboxStatus::Draining
-                || (sandbox.status == SandboxStatus::Starting && socket_roots.is_some())
+                || (matches!(
+                    sandbox.status,
+                    SandboxStatus::Starting | SandboxStatus::Running
+                ) && socket_roots.is_some())
             {
                 if let Some((run_dir, sandboxes_dir)) = socket_roots {
                     crate::runtime::remove_socket_artifacts_at(
@@ -931,7 +940,9 @@ impl LocalBackend {
                         &sandbox.name,
                     )?;
                 }
-                let (terminal_status, reason) = Self::stale_runtime_terminal_state(sandbox.status);
+                let latest = Self::load_latest_run(pools.read(), sandbox.id).await?;
+                let (terminal_status, reason) =
+                    Self::unowned_terminal_state(sandbox.status, latest.as_ref());
                 Self::mark_sandbox_runtime_stale(
                     pools.write(),
                     sandbox.id,
@@ -975,7 +986,7 @@ impl LocalBackend {
         if let Some((run_dir, sandboxes_dir)) = socket_roots {
             crate::runtime::remove_socket_artifacts_at(run_dir, sandboxes_dir, &sandbox.name)?;
         }
-        let (terminal_status, reason) = Self::stale_runtime_terminal_state(sandbox.status);
+        let (terminal_status, reason) = Self::unowned_terminal_state(sandbox.status, Some(&run));
         Self::mark_sandbox_runtime_stale(
             pools.write(),
             sandbox.id,
@@ -1072,6 +1083,25 @@ impl LocalBackend {
                 run_entity::TerminationReason::InternalError,
             ),
         }
+    }
+
+    /// Terminal state for an active sandbox whose runtime is gone. A run with a
+    /// recorded exit gets the `Stopped` its runtime publishes after recording
+    /// one, and keeps its own reason (the returned reason is used only for a
+    /// run still `Running`). Otherwise the sandbox status decides, as in
+    /// [`Self::stale_runtime_terminal_state`].
+    fn unowned_terminal_state(
+        status: SandboxStatus,
+        latest_run: Option<&run_entity::Model>,
+    ) -> (SandboxStatus, run_entity::TerminationReason) {
+        let (terminal_status, reason) = Self::stale_runtime_terminal_state(status);
+        let recorded_exit = latest_run.is_some_and(|run| {
+            run.status == run_entity::RunStatus::Terminated && run.exit_code.is_some()
+        });
+        if recorded_exit {
+            return (SandboxStatus::Stopped, reason);
+        }
+        (terminal_status, reason)
     }
 
     /// Mark a stale sandbox row (and optionally its run) terminal.
@@ -2646,19 +2676,28 @@ mod tests {
         assert_eq!(sandbox.status, SandboxStatus::Stopped);
     }
 
-    /// The runtime's exit handoff: a recorded, unclean run under a Draining
-    /// sandbox whose runtime died before publishing Stopped.
+    /// A runtime that recorded an unclean exit and died, or could not remove
+    /// its endpoints, before publishing Stopped: `Running` with no active run.
+    /// Reconciliation leaves it while the lifecycle lock is held, then stops
+    /// it and keeps the recorded run.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn test_reconcile_finishes_exit_handoff_and_keeps_the_recorded_run() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let pools = open_test_pools(&db_path).await;
+    async fn test_reconcile_finishes_running_sandbox_after_its_runtime_releases_the_lock() {
+        let temp = tempfile::Builder::new()
+            .prefix("msb-unowned")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run_dir = temp.path().join("run");
+        let sandboxes_dir = temp.path().join("sandboxes");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::create_dir_all(&sandboxes_dir).unwrap();
+        let pools = open_test_pools(&temp.path().join("test.db")).await;
 
-        let config = test_config("exit-handoff");
-        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config)
+        let name = "recorded-exit";
+        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &test_config(name))
             .await
             .unwrap();
-        LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Draining)
+        LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Running)
             .await
             .unwrap();
         let run = run_entity::ActiveModel {
@@ -2674,18 +2713,27 @@ mod tests {
             .await
             .unwrap()
             .last_insert_id;
-
-        let sandbox = sandbox_entity::Entity::find_by_id(sandbox_id)
-            .one(pools.write())
+        let reconcile = || async {
+            let sandbox = sandbox_entity::Entity::find_by_id(sandbox_id)
+                .one(pools.write())
+                .await
+                .unwrap()
+                .unwrap();
+            LocalBackend::reconcile_sandbox_runtime_state_with_paths(
+                &pools,
+                sandbox,
+                Some((&run_dir, &sandboxes_dir)),
+            )
             .await
             .unwrap()
-            .unwrap();
-        let reconciled =
-            LocalBackend::reconcile_sandbox_runtime_state_with_paths(&pools, sandbox, None)
-                .await
-                .unwrap();
+        };
 
-        assert_eq!(reconciled.status, SandboxStatus::Stopped);
+        let runtime_lock =
+            microsandbox_runtime::ipc::acquire_lifecycle_guard(&run_dir, name).unwrap();
+        assert_eq!(reconcile().await.status, SandboxStatus::Running);
+        drop(runtime_lock);
+        assert_eq!(reconcile().await.status, SandboxStatus::Stopped);
+
         let run = run_entity::Entity::find_by_id(run_id)
             .one(pools.write())
             .await

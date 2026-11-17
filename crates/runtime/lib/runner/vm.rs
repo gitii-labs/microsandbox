@@ -1130,8 +1130,7 @@ fn run(
             };
 
             rt_handle.block_on(async {
-                // Record the run's result first, handing the sandbox to
-                // reaping in the same write, then release allocations and
+                // Record the run's result first, then release allocations and
                 // endpoints, then publish Stopped. Runtime ownership remains
                 // live until this observer returns; every step after the first
                 // write can fail or be cut short by process death and still

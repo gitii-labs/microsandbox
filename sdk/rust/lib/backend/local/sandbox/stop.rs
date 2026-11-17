@@ -345,7 +345,8 @@ impl LocalBackend {
                     if !terminal {
                         // A crashed runtime may not have published its terminal row. Ownership
                         // and owned-disk release prove completion even if its PID is recycled.
-                        let (status, reason) = Self::stale_runtime_terminal_state(model.status);
+                        let (status, reason) =
+                            Self::unowned_terminal_state(model.status, latest.as_ref());
                         Self::mark_sandbox_runtime_stale(
                             self.db().await?.write(),
                             id,

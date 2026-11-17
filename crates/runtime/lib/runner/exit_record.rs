@@ -2,11 +2,15 @@
 //!
 //! The observer runs once, on the VMM thread, right before `_exit()`. A write
 //! it loses is never made by this process again: dead-runtime cleanup can only
-//! mark the run terminated without its exit code. So the run's own result is
-//! written first, together with a handoff of a `Running` sandbox to
-//! `Draining`. From that commit on, the catalog is in a state that
-//! dead-runtime cleanup finishes (`Draining` without an active run) if the
-//! process dies before it publishes `Stopped` itself.
+//! mark the run terminated without its exit code. So no cleanup step may skip
+//! the run's record, and every failed write is retried and logged.
+//!
+//! The run is recorded after the runtime has released its allocations and
+//! removed its endpoints, as before: SDKs that reap without the lifecycle lock
+//! (v0.6.x) finish a `Draining` sandbox as soon as its run is terminated, so a
+//! terminated run must not be visible while this process still works on the
+//! sandbox's deterministic paths. The sandbox row is not changed until
+//! `Stopped` is published.
 
 use std::future::Future;
 use std::time::Duration;
@@ -25,10 +29,11 @@ use crate::{RuntimeError, RuntimeResult};
 // Constants
 //--------------------------------------------------------------------------------------------------
 
-/// Attempts per exit write. SQLite busy/locked errors are already retried
-/// inside [`DbWriteConnection`]; a busy error that still reaches this loop has
-/// exhausted those retries and is not attempted again. The attempts here
-/// cover other failures, such as a timed-out pool acquire.
+/// Attempts per exit write. [`DbWriteConnection`] already retries SQLite
+/// `SQLITE_BUSY` (5) and `SQLITE_BUSY_SNAPSHOT` (517); such an error that
+/// still reaches this loop has exhausted those retries and is not attempted
+/// again. The attempts here cover every other failure, including
+/// `SQLITE_LOCKED` and a timed-out pool acquire.
 const EXIT_WRITE_ATTEMPTS: u32 = 3;
 
 /// Pause between exit-write attempts.
@@ -59,9 +64,9 @@ pub(crate) struct RunExit {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Write the catalog state of a VM exit in the order that keeps every crash
-/// point reapable: record the run and hand the sandbox to reaping, then
-/// `release` allocations, then `remove_endpoints`, then publish `Stopped`.
+/// Write the catalog state of a VM exit: `release` allocations, then
+/// `remove_endpoints`, then record the run's exit whatever the endpoint
+/// result, then publish `Stopped`.
 ///
 /// `Stopped` is published only when the run's exit was recorded and the
 /// endpoints are gone. Otherwise the sandbox stays active, and dead-runtime
@@ -78,11 +83,10 @@ where
     R: FnOnce() -> RFut,
     RFut: Future<Output = ()>,
 {
-    let recorded = record_run_exit(db, exit, EXIT_WRITE_RETRY_DELAY).await;
-
     release().await;
     let endpoints = remove_endpoints();
 
+    let recorded = record_run_exit(db, exit, EXIT_WRITE_RETRY_DELAY).await;
     if !recorded {
         tracing::error!(
             sandbox = %sandbox_name,
@@ -107,66 +111,39 @@ where
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
 
-/// Record the run's exit and move a `Running` sandbox to `Draining`, in one
-/// transaction. Either both are written or neither: a recorded run under a
-/// `Running` sandbox is a state no reaper finishes. Returns whether the run
-/// row now holds the exit.
+/// Record the run's exit. Returns whether the run row now holds it.
 async fn record_run_exit(db: &DbWriteConnection, exit: &RunExit, delay: Duration) -> bool {
     retry_exit_write("record run exit", exit.run_id, delay, || async {
-        db.transaction(|txn| {
-            let exit = exit.clone();
-            async move {
-                // Unconditional: the exit this process observed is the run's
-                // real result and replaces anything a reaper could have written.
-                let result = run_entity::Entity::update_many()
-                    .col_expr(
-                        run_entity::Column::Status,
-                        Expr::value(run_entity::RunStatus::Terminated),
-                    )
-                    .col_expr(
-                        run_entity::Column::TerminationReason,
-                        Expr::value(exit.reason),
-                    )
-                    .col_expr(
-                        run_entity::Column::TerminationDetail,
-                        Expr::value(exit.detail.clone()),
-                    )
-                    .col_expr(run_entity::Column::ExitCode, Expr::value(exit.exit_code))
-                    .col_expr(
-                        run_entity::Column::TerminatedAt,
-                        Expr::value(exit.terminated_at),
-                    )
-                    .filter(run_entity::Column::Id.eq(exit.run_id))
-                    .exec(&txn)
-                    .await?;
-                if result.rows_affected != 1 {
-                    return Err(RuntimeError::Custom(format!(
-                        "run {} has no catalog row",
-                        exit.run_id
-                    )));
-                }
-
-                // Draining without an active run is the state SDK
-                // reconciliation and maintenance finish as Stopped once this
-                // process has released its lifecycle lock.
-                sandbox_entity::Entity::update_many()
-                    .col_expr(
-                        sandbox_entity::Column::Status,
-                        Expr::value(SandboxStatus::Draining),
-                    )
-                    .col_expr(
-                        sandbox_entity::Column::UpdatedAt,
-                        Expr::value(exit.terminated_at),
-                    )
-                    .filter(sandbox_entity::Column::Id.eq(exit.sandbox_id))
-                    .filter(sandbox_entity::Column::Status.eq(SandboxStatus::Running))
-                    .exec(&txn)
-                    .await?;
-
-                Ok((txn, ()))
-            }
-        })
-        .await
+        // Unconditional: the exit this process observed is the run's real
+        // result and replaces anything a reaper could have written.
+        let result = run_entity::Entity::update_many()
+            .col_expr(
+                run_entity::Column::Status,
+                Expr::value(run_entity::RunStatus::Terminated),
+            )
+            .col_expr(
+                run_entity::Column::TerminationReason,
+                Expr::value(exit.reason),
+            )
+            .col_expr(
+                run_entity::Column::TerminationDetail,
+                Expr::value(exit.detail.clone()),
+            )
+            .col_expr(run_entity::Column::ExitCode, Expr::value(exit.exit_code))
+            .col_expr(
+                run_entity::Column::TerminatedAt,
+                Expr::value(exit.terminated_at),
+            )
+            .filter(run_entity::Column::Id.eq(exit.run_id))
+            .exec(db)
+            .await?;
+        if result.rows_affected != 1 {
+            return Err(RuntimeError::Custom(format!(
+                "run {} has no catalog row",
+                exit.run_id
+            )));
+        }
+        Ok(())
     })
     .await
 }
@@ -195,8 +172,8 @@ async fn publish_stopped(db: &DbWriteConnection, exit: &RunExit, delay: Duration
 }
 
 /// Run `write` up to [`EXIT_WRITE_ATTEMPTS`] times, logging each failure.
-/// A busy/locked error already exhausted the connection's own retries and
-/// ends the loop. Returns whether a write succeeded.
+/// A `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` error already exhausted the
+/// connection's own retries and ends the loop. Returns whether a write succeeded.
 async fn retry_exit_write<F, Fut>(
     operation: &'static str,
     run_id: i32,
@@ -274,11 +251,19 @@ mod tests {
     }
 
     async fn insert_running(db: &DbWriteConnection, name: &str) -> (i32, i32) {
+        insert_active(db, name, SandboxStatus::Running).await
+    }
+
+    async fn insert_active(
+        db: &DbWriteConnection,
+        name: &str,
+        status: SandboxStatus,
+    ) -> (i32, i32) {
         let now = chrono::Utc::now().naive_utc();
         let sandbox_id = sandbox_entity::ActiveModel {
             name: Set(name.to_string()),
             config: Set("{}".to_string()),
-            status: Set(SandboxStatus::Running),
+            status: Set(status),
             created_at: Set(Some(now)),
             updated_at: Set(Some(now)),
             ..Default::default()
@@ -392,104 +377,135 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn exit_steps_run_in_reapable_order() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_steps_run_in_order() {
         let (_dir, db) = test_db().await;
         let (sandbox_id, run_id) = insert_running(&db, "ordered").await;
         let exit = signal_exit(sandbox_id, run_id);
         let released = AtomicU32::new(0);
+        let unrecorded_at_removal = AtomicU32::new(0);
 
         let stopped = finish_vm_exit(
             &db,
             &exit,
             "ordered",
             || async {
-                // Allocations are released only after the exit is recorded
-                // and the sandbox handed to reaping.
-                assert_recorded(&run_of(&db, run_id).await);
-                assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Draining);
                 released.fetch_add(1, Ordering::SeqCst);
             },
             || {
+                // Endpoints go after allocations and before a terminated run
+                // becomes visible to lock-less reapers.
                 assert_eq!(released.load(Ordering::SeqCst), 1);
+                let run = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(run_of(&db, run_id))
+                });
+                if run.status == run_entity::RunStatus::Running && run.exit_code.is_none() {
+                    unrecorded_at_removal.fetch_add(1, Ordering::SeqCst);
+                }
                 Ok(())
             },
         )
         .await;
 
         assert!(stopped);
+        assert_eq!(unrecorded_at_removal.load(Ordering::SeqCst), 1);
         assert_recorded(&run_of(&db, run_id).await);
         assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Stopped);
     }
 
+    /// The common path: a requested stop moved the sandbox to Draining
+    /// before the VM exited. Recording does not depend on the sandbox status.
     #[tokio::test]
-    async fn process_death_after_the_exit_record_is_reaped_with_the_exit_kept() {
-        let (dir, db) = test_db().await;
-        let (sandbox_id, run_id) = insert_running(&db, "died").await;
+    async fn exit_of_a_draining_sandbox_is_recorded_and_stopped() {
+        for status in [SandboxStatus::Draining, SandboxStatus::Starting] {
+            let (_dir, db) = test_db().await;
+            let (sandbox_id, run_id) = insert_active(&db, "exiting", status).await;
 
-        // The process dies right after the combined write.
-        assert!(record_run_exit(&db, &signal_exit(sandbox_id, run_id), Duration::ZERO).await);
-        assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Draining);
+            let stopped = finish_vm_exit(
+                &db,
+                &signal_exit(sandbox_id, run_id),
+                "exiting",
+                || async {},
+                || Ok(()),
+            )
+            .await;
 
-        // While the runtime still holds its lifecycle lock, nothing reaps it.
-        let run_dir = dir.path().join("run");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let lifecycle = crate::ipc::acquire_lifecycle_guard(&run_dir, "died").unwrap();
-        assert_eq!(reap(&db, &dir).await, 0);
-        assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Draining);
-        drop(lifecycle);
-
-        assert_eq!(reap(&db, &dir).await, 1);
-        assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Stopped);
-        assert_recorded(&run_of(&db, run_id).await);
+            assert!(stopped, "{status:?}");
+            assert_recorded(&run_of(&db, run_id).await);
+            assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Stopped);
+        }
     }
 
+    /// The state a runtime leaves when it dies after recording its exit, or
+    /// when it cannot remove its endpoints: `Running` with no active run.
+    /// Older SDKs leave that state alone: `v0.6.9-gitii.5`'s
+    /// `reconcile_sandbox_runtime_state` (sdk/rust/lib/backend/local/sandbox/mod.rs)
+    /// finishes a sandbox without an active run only when it is `Draining`,
+    /// and treats `Running` without a run as a sandbox still starting up. A
+    /// `Draining` sandbox gets a terminated run only after the runtime has
+    /// released its allocations and endpoints (`exit_steps_run_in_order`),
+    /// as with `v0.7.13-gitii.4`.
     #[tokio::test]
-    async fn socket_cleanup_failure_leaves_the_sandbox_to_reaping() {
-        let (dir, db) = test_db().await;
-        let (sandbox_id, run_id) = insert_running(&db, "sockets-stuck").await;
+    async fn running_sandbox_with_a_recorded_exit_is_reaped_only_after_the_lock() {
+        for endpoints_removed in [true, false] {
+            let (dir, db) = test_db().await;
+            let (sandbox_id, run_id) = insert_running(&db, "died").await;
+            let run_dir = dir.path().join("run");
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let lifecycle = crate::ipc::acquire_lifecycle_guard(&run_dir, "died").unwrap();
 
-        let stopped = finish_vm_exit(
-            &db,
-            &signal_exit(sandbox_id, run_id),
-            "sockets-stuck",
-            || async {},
-            || Err(io::Error::other("endpoint busy")),
-        )
-        .await;
+            if endpoints_removed {
+                // The process dies right after recording its exit.
+                assert!(
+                    record_run_exit(&db, &signal_exit(sandbox_id, run_id), Duration::ZERO).await
+                );
+            } else {
+                let stopped = finish_vm_exit(
+                    &db,
+                    &signal_exit(sandbox_id, run_id),
+                    "died",
+                    || async {},
+                    || Err(io::Error::other("endpoint busy")),
+                )
+                .await;
+                assert!(!stopped);
+            }
+            assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Running);
 
-        assert!(!stopped);
-        assert_recorded(&run_of(&db, run_id).await);
-        assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Draining);
-        assert_eq!(reap(&db, &dir).await, 1);
-        assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Stopped);
-        assert_recorded(&run_of(&db, run_id).await);
+            // While the runtime still holds its lifecycle lock, nothing reaps it.
+            assert_eq!(reap(&db, &dir).await, 0);
+            assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Running);
+            drop(lifecycle);
+
+            assert_eq!(reap(&db, &dir).await, 1);
+            assert_eq!(status_of(&db, sandbox_id).await, SandboxStatus::Stopped);
+            assert_recorded(&run_of(&db, run_id).await);
+        }
     }
 
     #[tokio::test]
     async fn unrecorded_exit_is_not_published_and_is_reaped_as_unrecorded() {
         let (dir, db) = test_db().await;
-        let (sandbox_id, run_id) = insert_running(&db, "atomic").await;
-        // The sandbox half of the combined write fails every time.
+        let (sandbox_id, run_id) = insert_running(&db, "unrecorded").await;
+        // Every attempt to record the exit fails; the reaper's own update,
+        // which writes no exit code, is not affected.
         execute(
             &db,
-            &["CREATE TRIGGER refuse_handoff BEFORE UPDATE ON sandbox \
-               WHEN NEW.status = 'Draining' \
-               BEGIN SELECT RAISE(ABORT, 'injected handoff failure'); END"],
+            &["CREATE TRIGGER refuse_exit BEFORE UPDATE ON run \
+               WHEN NEW.exit_code IS NOT NULL \
+               BEGIN SELECT RAISE(ABORT, 'injected exit record failure'); END"],
         )
         .await;
 
         let stopped = finish_vm_exit(
             &db,
             &signal_exit(sandbox_id, run_id),
-            "atomic",
+            "unrecorded",
             || async {},
             || Ok(()),
         )
         .await;
 
-        // Atomic: the run update rolled back with the failed sandbox update,
-        // and Stopped was not published over a Running run.
         assert!(!stopped);
         let run = run_of(&db, run_id).await;
         assert_eq!(run.status, run_entity::RunStatus::Running);
