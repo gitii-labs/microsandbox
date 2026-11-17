@@ -3381,9 +3381,12 @@ mod tests {
         let baseline_terminals = terminal_fds_above_stdio(&list_child_fds(39, false).await);
 
         let (holder_tx, mut holder_rx) = SessionOutputSender::channel();
+        // The holder only keeps its PTY open. Its terminal is read from
+        // /proc, not printed by `tty`: implementations differ in whether they
+        // end the name with a newline (rust-coreutils 0.10 does not).
         let holder_req = ExecRequest {
             cmd: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), "tty; read _".to_string()],
+            args: vec!["-c".to_string(), "read _".to_string()],
             env: Vec::new(),
             cwd: None,
             user: None,
@@ -3404,20 +3407,13 @@ mod tests {
             )
             .expect("spawn PTY holder session"),
         );
-        let mut holder_out = Vec::new();
-        time::timeout(DEADLINE, async {
-            while !holder_out.contains(&b'\n') {
-                match holder_rx.recv().await.expect("holder output").output {
-                    SessionOutput::Stdout(data) => holder_out.extend_from_slice(&data),
-                    SessionOutput::Exited(code) => panic!("holder exited with {code}"),
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("holder prints its terminal");
-        let holder_tty = String::from_utf8(holder_out).expect("holder tty is UTF-8");
-        let holder_tty = holder_tty.trim().to_string();
+        // Spawning returns after the child's exec, so its stdin is already
+        // the PTY slave.
+        let holder_tty = std::fs::read_link(format!("/proc/{}/fd/0", holder.0.pid()))
+            .expect("read holder stdin link")
+            .into_os_string()
+            .into_string()
+            .expect("holder tty is UTF-8");
         assert!(
             holder_tty.starts_with("/dev/pts/"),
             "holder terminal: {holder_tty:?}"
