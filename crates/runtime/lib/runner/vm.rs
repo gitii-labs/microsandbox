@@ -44,6 +44,7 @@ use msb_krun::VmBuilder;
 use sea_orm::{ColumnTrait, EntityTrait, Set};
 use serde::Serialize;
 
+use super::exit_record::{self, RunExit};
 #[cfg(windows)]
 use crate::bootstrap_fs::AgentBootstrapFs;
 #[cfg(windows)]
@@ -1101,10 +1102,6 @@ fn run(
         &mut config,
         console_backends,
         move |exit_code: i32| {
-            use microsandbox_db::entity::sandbox as sandbox_entity;
-            use sea_orm::QueryFilter;
-            use sea_orm::sea_query::Expr;
-
             // Claim the verdict before anything else: a sleeper waking on an
             // expired deadline at this same instant must not retag a shutdown
             // the guest completed on its own.
@@ -1133,61 +1130,43 @@ fn run(
             };
 
             rt_handle.block_on(async {
-                let now = chrono::Utc::now().naive_utc();
-
-                if let Err(error) = exit_writeback_guard.release(&exit_db).await {
-                    tracing::warn!(%error, "release writeback pressure membership at VM exit");
-                }
-                if let Err(error) = exit_cpu_guard.release(&exit_db).await {
-                    tracing::warn!(%error, "release CPU placement at VM exit");
-                }
-
+                let run_exit = RunExit {
+                    run_id: exit_run_id,
+                    sandbox_id: exit_sandbox_id,
+                    reason,
+                    detail: termination_detail.clone(),
+                    exit_code,
+                    terminated_at: chrono::Utc::now().naive_utc(),
+                };
                 // Runtime ownership remains live until this observer returns.
                 // Remove its deterministic endpoints before publishing a
-                // restartable terminal state; on failure, leave the active row
-                // for dead-PID maintenance to retry after the process exits.
-                let bound_result = crate::ipc::remove_socket_pair(&exit_sock_path);
-                let owned_result = exit_socket_paths.remove_artifacts();
-                if let Err(error) = bound_result.and(owned_result) {
-                    tracing::warn!(
-                        sandbox = %exit_sandbox_name,
-                        error = %error,
-                        "runtime exit socket cleanup failed; leaving lifecycle active for reaping"
-                    );
+                // restartable terminal state; on failure, leave the run and
+                // sandbox active for dead-PID maintenance to retry after the
+                // process exits. Then record the run and publish Stopped.
+                let stopped = exit_record::finish_vm_exit(
+                    &exit_db,
+                    &run_exit,
+                    &exit_sandbox_name,
+                    || async {
+                        if let Err(error) = exit_writeback_guard.release(&exit_db).await {
+                            tracing::warn!(
+                                %error,
+                                "release writeback pressure membership at VM exit"
+                            );
+                        }
+                        if let Err(error) = exit_cpu_guard.release(&exit_db).await {
+                            tracing::warn!(%error, "release CPU placement at VM exit");
+                        }
+                    },
+                    || {
+                        let bound_result = crate::ipc::remove_socket_pair(&exit_sock_path);
+                        let owned_result = exit_socket_paths.remove_artifacts();
+                        bound_result.and(owned_result)
+                    },
+                )
+                .await;
+                if !stopped {
                     return;
-                }
-
-                // Mark run as terminated with exit code and reason.
-                let _ = run_entity::Entity::update_many()
-                    .col_expr(
-                        run_entity::Column::Status,
-                        Expr::value(run_entity::RunStatus::Terminated),
-                    )
-                    .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
-                    .col_expr(
-                        run_entity::Column::TerminationDetail,
-                        Expr::value(termination_detail.clone()),
-                    )
-                    .col_expr(run_entity::Column::ExitCode, Expr::value(exit_code))
-                    .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
-                    .filter(run_entity::Column::Id.eq(exit_run_id))
-                    .exec(&exit_db)
-                    .await;
-
-                // Preserve old catalogs while releasing current runtime-owned fields.
-                match crate::maintenance::terminal_sandbox_update(&exit_db).await {
-                    Ok(update) => {
-                        let _ = update
-                            .col_expr(
-                                sandbox_entity::Column::Status,
-                                Expr::value(sandbox_entity::SandboxStatus::Stopped),
-                            )
-                            .col_expr(sandbox_entity::Column::UpdatedAt, Expr::value(now))
-                            .filter(sandbox_entity::Column::Id.eq(exit_sandbox_id))
-                            .exec(&exit_db)
-                            .await;
-                    }
-                    Err(error) => tracing::warn!(%error, "terminal sandbox update failed"),
                 }
 
                 // Self-clean: if this sandbox was created ephemeral, drop its

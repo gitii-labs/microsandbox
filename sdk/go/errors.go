@@ -177,6 +177,11 @@ const (
 	// its result is unknown. The message says whether sending the same change
 	// again retries it.
 	ErrModificationNotConfirmed
+
+	// ErrSandboxExitUnrecorded indicates a requested stop ended the runtime
+	// process, but the process exited without recording the run's exit, so a
+	// clean guest shutdown is not confirmed.
+	ErrSandboxExitUnrecorded
 )
 
 func (k ErrorKind) String() string {
@@ -191,6 +196,8 @@ func (k ErrorKind) String() string {
 		return "SandboxReplaced"
 	case ErrSandboxStopTimedOut:
 		return "SandboxStopTimedOut"
+	case ErrSandboxExitUnrecorded:
+		return "SandboxExitUnrecorded"
 	case ErrSandboxStillRunning:
 		return "SandboxStillRunning"
 	case ErrVolumeNotFound:
@@ -388,6 +395,8 @@ func kindFromFFI(kind string) ErrorKind {
 		return ErrSandboxReplaced
 	case ffi.KindSandboxStopTimedOut:
 		return ErrSandboxStopTimedOut
+	case ffi.KindSandboxExitUnrecorded:
+		return ErrSandboxExitUnrecorded
 	case ffi.KindSandboxStillRunning:
 		return ErrSandboxStillRunning
 	case ffi.KindVolumeNotFound:

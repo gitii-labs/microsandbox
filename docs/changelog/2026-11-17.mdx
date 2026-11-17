@@ -1,0 +1,41 @@
+---
+title: "Distributed runtime v0.7.13-gitii.5"
+sidebarTitle: "Distributed runtime .5"
+description: "The runtime retries and logs its exit record, and a stop names an exit that was not recorded."
+icon: "bolt"
+---
+
+## Run exit recording
+
+The VM exit observer no longer ignores a failed catalog write. Its run record
+and its `Stopped` update are attempted up to three times, and every failure is
+logged as `VM exit catalog write failed` with the run id and error. When the
+run cannot be recorded, the sandbox is not marked `Stopped`. A failed removal
+of the runtime's endpoints still leaves the run for dead-runtime cleanup, and is
+now logged at error level with the run id. These messages reach the runtime
+log only when a runtime log level of `error` or more verbose is set; with no
+level set, runtime logging is off except for network policy denials and
+credential-response warnings.
+
+## Unrecorded exits
+
+Dead-runtime cleanup only terminates a run that is still `Running`, so it never
+replaces an exit the runtime recorded. A run it terminates gets the
+`termination_detail` `runtime exited without recording its exit`.
+
+A graceful stop whose run has that detail and no exit code fails with
+`Error::SandboxExitUnrecorded` in Rust and `ErrSandboxExitUnrecorded` in Go,
+instead of the runtime error `did not confirm clean shutdown`. The VM has stopped
+and its runtime is released, but a clean guest shutdown is not confirmed.
+TypeScript keeps `RuntimeError`, and Python and Ruby keep their base error.
+
+## Runtime and SDK deployment
+
+Deploy the runtime tag `v0.7.13-gitii.5` together with the Go SDK module tag
+`sdk/go/v0.7.13-gitii.5`. The fork module is
+`github.com/gitii-labs/microsandbox/sdk/go`; its declared import path remains
+`github.com/superradcompany/microsandbox/sdk/go`. Go callers that matched this
+stop failure as `ErrInternal` now receive `ErrSandboxExitUnrecorded`.
+
+The runtime leaves the same catalog states as `v0.7.13-gitii.4`, so it works
+with older SDKs as before. See `COMPATIBILITY.md`.

@@ -170,6 +170,17 @@ pub enum MicrosandboxError {
         timeout: std::time::Duration,
     },
 
+    /// A requested stop ended the runtime process, but the process exited
+    /// without recording the run's exit, so a clean guest shutdown cannot be
+    /// confirmed. The runtime's log for that run may say why.
+    #[error(
+        "sandbox run {run_id} stopped, but its runtime exited without recording its exit; clean shutdown is not confirmed"
+    )]
+    SandboxExitUnrecorded {
+        /// The run whose exit was not recorded.
+        run_id: i32,
+    },
+
     /// A runtime error occurred.
     #[error("runtime error: {0}")]
     Runtime(String),

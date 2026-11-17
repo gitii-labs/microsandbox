@@ -43,7 +43,9 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         MicrosandboxError::SandboxStillRunning(_) => "SandboxStillRunning",
         MicrosandboxError::SandboxNotRunning(_) => "SandboxNotRunning",
         MicrosandboxError::SandboxStopTimedOut { .. } => "SandboxStopTimedOut",
-        MicrosandboxError::Runtime(_) => "Runtime",
+        MicrosandboxError::Runtime(_) | MicrosandboxError::SandboxExitUnrecorded { .. } => {
+            "Runtime"
+        }
         MicrosandboxError::BootStart { .. } => "BootStart",
         MicrosandboxError::Json(_) => "Json",
         MicrosandboxError::Protocol(_) => "Protocol",

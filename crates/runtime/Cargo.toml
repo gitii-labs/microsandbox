@@ -91,3 +91,4 @@ microsandbox-migration.workspace = true
 msb_krun_utils.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true

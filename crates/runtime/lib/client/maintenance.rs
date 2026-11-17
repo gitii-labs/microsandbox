@@ -859,13 +859,19 @@ async fn reconcile_stale_active(
     let now = chrono::Utc::now().naive_utc();
     let (terminal_status, reason) = stale_runtime_terminal_state(sandbox.status);
 
-    // Mark the dead run Terminated only while still Running.
+    // Mark the dead run Terminated only while still Running: a run its
+    // runtime already terminated keeps the exit it recorded. A run that is
+    // still Running here lost its exit with the process, so say so.
     run_entity::Entity::update_many()
         .col_expr(
             run_entity::Column::Status,
             Expr::value(run_entity::RunStatus::Terminated),
         )
         .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
+        .col_expr(
+            run_entity::Column::TerminationDetail,
+            Expr::value(run_entity::UNRECORDED_EXIT_DETAIL),
+        )
         .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
         .filter(run_entity::Column::Id.eq(run.id))
         .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
@@ -1489,6 +1495,42 @@ mod tests {
             assert_socket_artifacts_absent(dir.path(), &draining_sockets, "draining");
             assert_socket_artifacts_absent(dir.path(), &draining_no_run_sockets, "draining-no-run");
         }
+    }
+
+    #[tokio::test]
+    async fn reaping_a_dead_runtime_says_its_exit_was_not_recorded() {
+        let (dir, db) = test_db().await;
+        let run_dir = dir.path().join("run");
+        let id = insert_sandbox(&db, "unrecorded", SandboxStatus::Draining, false).await;
+        insert_run(&db, id, Some(DEAD_PID), run_entity::RunStatus::Running).await;
+
+        let report = run_sandbox_lifecycle_maintenance(
+            &db,
+            dir.path(),
+            &run_dir,
+            MaintenanceLimits::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.errors, 0);
+        assert_eq!(status_of(&db, id).await, Some(SandboxStatus::Stopped));
+        let run = run_entity::Entity::find()
+            .filter(run_entity::Column::SandboxId.eq(id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, run_entity::RunStatus::Terminated);
+        assert_eq!(run.exit_code, None);
+        assert_eq!(
+            run.termination_reason,
+            Some(run_entity::TerminationReason::ShutdownRequested)
+        );
+        assert_eq!(
+            run.termination_detail.as_deref(),
+            Some(run_entity::UNRECORDED_EXIT_DETAIL)
+        );
     }
 
     #[tokio::test]

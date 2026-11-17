@@ -3,6 +3,15 @@
 use sea_orm::entity::prelude::*;
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// `termination_detail` written when dead-runtime cleanup terminates a run
+/// whose runtime process exited without recording the run's exit. Readers
+/// compare against this exact value, so it must not change.
+pub const UNRECORDED_EXIT_DETAIL: &str = "runtime exited without recording its exit";
+
+//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
