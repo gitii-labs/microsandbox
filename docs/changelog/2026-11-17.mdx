@@ -7,18 +7,18 @@ icon: "bolt"
 
 ## Run exit recording
 
-The VM exit observer writes the run's exit code, reason and detail first, in
-the same transaction that moves a `Running` sandbox to `Draining`. It then
-releases CPU and writeback allocations, removes the runtime's endpoints and
-marks the sandbox `Stopped`. Each exit write is attempted up to three times and
-every failure is logged as `VM exit catalog write failed` with the run id and
-error. SQLite busy errors are retried within the connection and end the
-attempts once those retries are exhausted.
+The VM exit observer no longer skips the run's record when it cannot remove
+its endpoints. It releases its allocations, removes its endpoints, then writes
+the run's exit code, reason and detail, and marks the sandbox `Stopped` only
+when both the record and the endpoint removal succeeded. Each exit write is
+attempted up to three times and every failure is logged as `VM exit catalog
+write failed` with the run id and error.
 
-If the first write fails, the observer leaves the sandbox active. If endpoint
-removal fails, or the process dies after the first write, the sandbox stays
-`Draining`; SDK reconciliation and lifecycle maintenance remove the endpoints
-and mark it `Stopped` after the process exits, keeping the recorded exit.
+SDK reconciliation and lifecycle maintenance now also finish a `Starting` or
+`Running` sandbox that has no active run once they hold its lifecycle lock: they
+remove its endpoints and mark it `Stopped` when its run recorded an exit, or
+`Crashed` otherwise. Kill waits for the lifecycle lock before marking a sandbox
+`Stopped` on every platform.
 
 ## Unrecorded exits
 
@@ -40,8 +40,6 @@ Deploy the runtime tag `v0.7.13-gitii.5` together with the Go SDK module tag
 `github.com/superradcompany/microsandbox/sdk/go`. Go callers that matched this
 stop failure as `ErrInternal` now receive `ErrSandboxExitUnrecorded`.
 
-Pair the runtime with an SDK from the same release. SDKs older than fork
-`v0.7.6-gitii.1` can report a stop complete while the runtime is still
-releasing its allocations and endpoints, and Windows SDKs before this release
-can rewrite the reason of a run whose runtime exited without marking its
-sandbox stopped. See `COMPATIBILITY.md`.
+Older SDKs leave a `Running` sandbox whose runtime recorded its run but could
+not remove its endpoints in place until an SDK or maintenance from this
+release reaps it. See `COMPATIBILITY.md`.
