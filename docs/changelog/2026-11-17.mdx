@@ -7,15 +7,18 @@ icon: "bolt"
 
 ## Run exit recording
 
-The VM exit observer writes the run's exit code, reason and detail before it
-releases CPU and writeback allocations or removes the runtime's endpoints. Each
-exit write is retried up to three times; every failure is logged as `VM exit
-catalog write failed` with the run id and error. SQLite busy errors are also
-retried within each attempt, as before.
+The VM exit observer writes the run's exit code, reason and detail first, in
+the same transaction that moves a `Running` sandbox to `Draining`. It then
+releases CPU and writeback allocations, removes the runtime's endpoints and
+marks the sandbox `Stopped`. Each exit write is attempted up to three times and
+every failure is logged as `VM exit catalog write failed` with the run id and
+error. SQLite busy errors are retried within the connection and end the
+attempts once those retries are exhausted.
 
-When endpoint removal fails, the run keeps its recorded exit and a `Running`
-sandbox moves to `Draining`. SDK reconciliation and lifecycle maintenance then
-remove the endpoints and mark the sandbox `Stopped` after the process exits.
+If the first write fails, the observer leaves the sandbox active. If endpoint
+removal fails, or the process dies after the first write, the sandbox stays
+`Draining`; SDK reconciliation and lifecycle maintenance remove the endpoints
+and mark it `Stopped` after the process exits, keeping the recorded exit.
 
 ## Unrecorded exits
 
@@ -36,3 +39,9 @@ Deploy the runtime tag `v0.7.13-gitii.5` together with the Go SDK module tag
 `github.com/gitii-labs/microsandbox/sdk/go`; its declared import path remains
 `github.com/superradcompany/microsandbox/sdk/go`. Go callers that matched this
 stop failure as `ErrInternal` now receive `ErrSandboxExitUnrecorded`.
+
+Pair the runtime with an SDK from the same release. SDKs older than fork
+`v0.7.6-gitii.1` can report a stop complete while the runtime is still
+releasing its allocations and endpoints, and Windows SDKs before this release
+can rewrite the reason of a run whose runtime exited without marking its
+sandbox stopped. See `COMPATIBILITY.md`.
