@@ -1,24 +1,19 @@
 ---
 title: "Distributed runtime v0.7.13-gitii.5"
 sidebarTitle: "Distributed runtime .5"
-description: "The runtime records a run's exit before anything that can fail, and a stop names an exit that was not recorded."
+description: "The runtime retries and logs its exit record, and a stop names an exit that was not recorded."
 icon: "bolt"
 ---
 
 ## Run exit recording
 
-The VM exit observer no longer skips the run's record when it cannot remove
-its endpoints. It releases its allocations, removes its endpoints, then writes
-the run's exit code, reason and detail, and marks the sandbox `Stopped` only
-when both the record and the endpoint removal succeeded. Each exit write is
-attempted up to three times and every failure is logged as `VM exit catalog
-write failed` with the run id and error.
-
-SDK reconciliation and lifecycle maintenance now also finish a `Starting` or
-`Running` sandbox that has no active run once they hold its lifecycle lock: they
-remove its endpoints and mark it `Stopped` when its run recorded an exit, or
-`Crashed` otherwise. Kill waits for the lifecycle lock before marking a sandbox
-`Stopped` on every platform.
+The VM exit observer no longer ignores a failed catalog write. Its run record
+and its `Stopped` update are attempted up to three times, and every failure is
+logged as `VM exit catalog write failed` with the run id and error. When the
+run cannot be recorded, the sandbox is not marked `Stopped`. A failed removal
+of the runtime's endpoints still leaves the run for dead-runtime cleanup, and is
+now logged at error level with the run id. Runtime logs disabled with quiet
+logs include neither message.
 
 ## Unrecorded exits
 
@@ -40,6 +35,5 @@ Deploy the runtime tag `v0.7.13-gitii.5` together with the Go SDK module tag
 `github.com/superradcompany/microsandbox/sdk/go`. Go callers that matched this
 stop failure as `ErrInternal` now receive `ErrSandboxExitUnrecorded`.
 
-Older SDKs leave a `Running` sandbox whose runtime recorded its run but could
-not remove its endpoints in place until an SDK or maintenance from this
-release reaps it. See `COMPATIBILITY.md`.
+The runtime leaves the same catalog states as `v0.7.13-gitii.4`, so it works
+with older SDKs as before. See `COMPATIBILITY.md`.
