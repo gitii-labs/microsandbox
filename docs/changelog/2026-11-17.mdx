@@ -12,8 +12,10 @@ and its `Stopped` update are attempted up to three times, and every failure is
 logged as `VM exit catalog write failed` with the run id and error. When the
 run cannot be recorded, the sandbox is not marked `Stopped`. A failed removal
 of the runtime's endpoints still leaves the run for dead-runtime cleanup, and is
-now logged at error level with the run id. Runtime logs disabled with quiet
-logs include neither message.
+now logged at error level with the run id. These messages reach the runtime
+log only when a runtime log level of `error` or more verbose is set; with no
+level set, runtime logging is off except for network policy denials and
+credential-response warnings.
 
 ## Unrecorded exits
 
