@@ -1130,37 +1130,40 @@ fn run(
             };
 
             rt_handle.block_on(async {
-                // Record the run's result before anything that can fail or
-                // return early: this observer is the only writer of the exit
-                // code, and dead-runtime cleanup cannot recover it.
+                // Record the run's result first, handing the sandbox to
+                // reaping in the same write, then release allocations and
+                // endpoints, then publish Stopped. Runtime ownership remains
+                // live until this observer returns; every step after the first
+                // write can fail or be cut short by process death and still
+                // leave a state dead-PID maintenance finishes.
                 let run_exit = RunExit {
                     run_id: exit_run_id,
+                    sandbox_id: exit_sandbox_id,
                     reason,
                     detail: termination_detail.clone(),
                     exit_code,
                     terminated_at: chrono::Utc::now().naive_utc(),
                 };
-                exit_record::record_run_exit(&exit_db, &run_exit).await;
-
-                if let Err(error) = exit_writeback_guard.release(&exit_db).await {
-                    tracing::warn!(%error, "release writeback pressure membership at VM exit");
-                }
-                if let Err(error) = exit_cpu_guard.release(&exit_db).await {
-                    tracing::warn!(%error, "release CPU placement at VM exit");
-                }
-
-                // Runtime ownership remains live until this observer returns.
-                // Remove its deterministic endpoints before publishing a
-                // restartable terminal state; on failure, the sandbox stays
-                // active for dead-PID maintenance to retry after the process exits.
-                let bound_result = crate::ipc::remove_socket_pair(&exit_sock_path);
-                let owned_result = exit_socket_paths.remove_artifacts();
-                let stopped = exit_record::publish_sandbox_exit(
+                let stopped = exit_record::finish_vm_exit(
                     &exit_db,
-                    exit_run_id,
-                    exit_sandbox_id,
+                    &run_exit,
                     &exit_sandbox_name,
-                    bound_result.and(owned_result),
+                    || async {
+                        if let Err(error) = exit_writeback_guard.release(&exit_db).await {
+                            tracing::warn!(
+                                %error,
+                                "release writeback pressure membership at VM exit"
+                            );
+                        }
+                        if let Err(error) = exit_cpu_guard.release(&exit_db).await {
+                            tracing::warn!(%error, "release CPU placement at VM exit");
+                        }
+                    },
+                    || {
+                        let bound_result = crate::ipc::remove_socket_pair(&exit_sock_path);
+                        let owned_result = exit_socket_paths.remove_artifacts();
+                        bound_result.and(owned_result)
+                    },
                 )
                 .await;
                 if !stopped {

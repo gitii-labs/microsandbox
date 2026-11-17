@@ -2646,6 +2646,59 @@ mod tests {
         assert_eq!(sandbox.status, SandboxStatus::Stopped);
     }
 
+    /// The runtime's exit handoff: a recorded, unclean run under a Draining
+    /// sandbox whose runtime died before publishing Stopped.
+    #[tokio::test]
+    async fn test_reconcile_finishes_exit_handoff_and_keeps_the_recorded_run() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("test.db");
+        let pools = open_test_pools(&db_path).await;
+
+        let config = test_config("exit-handoff");
+        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config)
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Draining)
+            .await
+            .unwrap();
+        let run = run_entity::ActiveModel {
+            sandbox_id: Set(sandbox_id),
+            pid: Set(Some(dead_pid())),
+            status: Set(run_entity::RunStatus::Terminated),
+            exit_code: Set(Some(0)),
+            termination_reason: Set(Some(run_entity::TerminationReason::Signal)),
+            ..Default::default()
+        };
+        let run_id = run_entity::Entity::insert(run)
+            .exec(pools.write())
+            .await
+            .unwrap()
+            .last_insert_id;
+
+        let sandbox = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.write())
+            .await
+            .unwrap()
+            .unwrap();
+        let reconciled =
+            LocalBackend::reconcile_sandbox_runtime_state_with_paths(&pools, sandbox, None)
+                .await
+                .unwrap();
+
+        assert_eq!(reconciled.status, SandboxStatus::Stopped);
+        let run = run_entity::Entity::find_by_id(run_id)
+            .one(pools.write())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(
+            run.termination_reason,
+            Some(run_entity::TerminationReason::Signal)
+        );
+        assert_eq!(run.termination_detail, None);
+    }
+
     #[tokio::test]
     async fn test_reconcile_sandbox_runtime_state_marks_draining_without_run_stopped() {
         let temp = tempdir().unwrap();
