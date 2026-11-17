@@ -1398,6 +1398,7 @@ const (
 	KindSandboxAlreadyExists     = "sandbox_already_exists"
 	KindSandboxReplaced          = "sandbox_replaced"
 	KindSandboxStopTimedOut      = "sandbox_stop_timed_out"
+	KindSandboxExitUnrecorded    = "sandbox_exit_unrecorded"
 	KindSandboxStillRunning      = "sandbox_still_running"
 	KindVolumeNotFound           = "volume_not_found"
 	KindVolumeAlreadyExists      = "volume_already_exists"

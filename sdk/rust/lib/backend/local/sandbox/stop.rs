@@ -414,6 +414,13 @@ fn ensure_clean_run(run: &run::Model) -> MicrosandboxResult<()> {
     if run.exit_code == Some(0) && run.exit_signal.is_none() && clean_reason {
         return Ok(());
     }
+    // Dead-runtime cleanup terminated the run: the VM is gone, but its exit
+    // code was never written, so the shutdown stays unconfirmed.
+    if run.exit_code.is_none()
+        && run.termination_detail.as_deref() == Some(run::UNRECORDED_EXIT_DETAIL)
+    {
+        return Err(MicrosandboxError::SandboxExitUnrecorded { run_id: run.id });
+    }
     Err(MicrosandboxError::Runtime(format!(
         "sandbox run {} did not confirm clean shutdown: reason {:?}, exit code {:?}, signal {:?}, detail {:?}",
         run.id, run.termination_reason, run.exit_code, run.exit_signal, run.termination_detail
@@ -633,6 +640,45 @@ mod tests {
         run.exit_code = Some(0);
         run.exit_signal = Some(9);
         assert!(ensure_clean_run(&run).is_err());
+    }
+
+    #[test]
+    fn unrecorded_exit_is_a_distinct_stop_error() {
+        let mut run = run::Model {
+            id: 12,
+            sandbox_id: 1,
+            pid: None,
+            status: run::RunStatus::Terminated,
+            exit_code: None,
+            exit_signal: None,
+            termination_reason: Some(run::TerminationReason::ShutdownRequested),
+            termination_detail: Some(run::UNRECORDED_EXIT_DETAIL.to_string()),
+            signals_sent: None,
+            started_at: None,
+            terminated_at: None,
+        };
+
+        let error = ensure_clean_run(&run).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MicrosandboxError::SandboxExitUnrecorded { run_id: 12 }
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("runtime exited without recording its exit"),
+            "{error}"
+        );
+
+        // An older reaper wrote no detail: the generic unclean-stop error remains.
+        run.termination_detail = None;
+        assert!(matches!(
+            ensure_clean_run(&run),
+            Err(MicrosandboxError::Runtime(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

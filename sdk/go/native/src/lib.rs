@@ -463,6 +463,7 @@ mod error_kind {
     pub const SANDBOX_ALREADY_EXISTS: &str = "sandbox_already_exists";
     pub const SANDBOX_REPLACED: &str = "sandbox_replaced";
     pub const SANDBOX_STOP_TIMED_OUT: &str = "sandbox_stop_timed_out";
+    pub const SANDBOX_EXIT_UNRECORDED: &str = "sandbox_exit_unrecorded";
     pub const VOLUME_NOT_FOUND: &str = "volume_not_found";
     pub const VOLUME_ALREADY_EXISTS: &str = "volume_already_exists";
     pub const EXEC_TIMEOUT: &str = "exec_timeout";
@@ -565,6 +566,7 @@ impl From<MicrosandboxError> for FfiError {
             MicrosandboxError::SandboxAlreadyExists(_) => error_kind::SANDBOX_ALREADY_EXISTS,
             MicrosandboxError::SandboxReplaced { .. } => error_kind::SANDBOX_REPLACED,
             MicrosandboxError::SandboxStopTimedOut { .. } => error_kind::SANDBOX_STOP_TIMED_OUT,
+            MicrosandboxError::SandboxExitUnrecorded { .. } => error_kind::SANDBOX_EXIT_UNRECORDED,
             MicrosandboxError::VolumeNotFound(_) => error_kind::VOLUME_NOT_FOUND,
             MicrosandboxError::VolumeAlreadyExists(_) => error_kind::VOLUME_ALREADY_EXISTS,
             MicrosandboxError::ExecTimeout(_) => error_kind::EXEC_TIMEOUT,
@@ -8109,6 +8111,17 @@ mod tests {
         let ffi = FfiError::from(error);
 
         assert_eq!(ffi.kind, super::error_kind::INVALID_CONFIG);
+        assert_eq!(ffi.message, message);
+    }
+
+    #[test]
+    fn unrecorded_exit_has_its_own_ffi_kind() {
+        let error = MicrosandboxError::SandboxExitUnrecorded { run_id: 12 };
+        let message = error.to_string();
+
+        let ffi = FfiError::from(error);
+
+        assert_eq!(ffi.kind, super::error_kind::SANDBOX_EXIT_UNRECORDED);
         assert_eq!(ffi.message, message);
     }
 

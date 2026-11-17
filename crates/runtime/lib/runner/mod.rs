@@ -12,6 +12,7 @@ pub(crate) mod control;
 pub mod cpu;
 pub(crate) mod exec_control;
 pub mod exec_log;
+pub(crate) mod exit_record;
 pub(crate) mod finished_ids;
 pub mod heartbeat;
 pub(crate) mod jobs;

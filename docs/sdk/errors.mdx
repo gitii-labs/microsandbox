@@ -344,6 +344,12 @@ Cloud reports this with `SandboxStopTimedOutError` in TypeScript and Python, `Er
 
 After a Cloud timeout, poll the sandbox status or call the wait-until-stopped method if you still need confirmation. Calling `request_stop` first is useful when the application wants to submit the stop and control its own observation deadline.
 
+## Unrecorded runtime exit
+
+On Local, a graceful stop succeeds only when the stopped run recorded a clean exit. When the runtime process ended but did not record the run's exit, the VM is stopped and its runtime released, but a clean guest shutdown is not confirmed. The run's `termination_detail` reads `runtime exited without recording its exit`.
+
+Rust reports this as `Error::SandboxExitUnrecorded` and Go as `ErrSandboxExitUnrecorded`. TypeScript raises `RuntimeError`, and Python and Ruby raise their base error, each with the same message. Any other unclean run still fails with a runtime error that names its reason, exit code and signal. The runtime's log for that run may show why the exit was not recorded.
+
 ## Modification not confirmed
 
 On Cloud, a `modify` apply that did not complete as asked fails with `ModificationNotConfirmedError` in TypeScript and Python, `MicrosandboxError::ModificationNotConfirmed` in Rust, and `ErrModificationNotConfirmed` in Go. The change may be saved without being in effect on the running sandbox, or its result is unknown. The message reads `the change did not complete as asked: <cause>`, where the cause says which is known and, when sending the same change again retries it, says so. If another change arrived in between, the resend overwrites it.

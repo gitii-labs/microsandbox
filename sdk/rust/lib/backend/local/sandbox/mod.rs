@@ -1086,14 +1086,21 @@ impl LocalBackend {
             let now = chrono::Utc::now().naive_utc();
 
             if let Some(run_id) = run_id {
+                // Only a run still Running lost its exit with the process; a
+                // run its runtime terminated keeps the exit it recorded.
                 run_entity::Entity::update_many()
                     .col_expr(
                         run_entity::Column::Status,
                         Expr::value(run_entity::RunStatus::Terminated),
                     )
                     .col_expr(run_entity::Column::TerminationReason, Expr::value(reason))
+                    .col_expr(
+                        run_entity::Column::TerminationDetail,
+                        Expr::value(run_entity::UNRECORDED_EXIT_DETAIL),
+                    )
                     .col_expr(run_entity::Column::TerminatedAt, Expr::value(now))
                     .filter(run_entity::Column::Id.eq(run_id))
+                    .filter(run_entity::Column::Status.eq(run_entity::RunStatus::Running))
                     .exec(&txn)
                     .await?;
             }
@@ -2569,7 +2576,74 @@ mod tests {
             run.termination_reason,
             Some(run_entity::TerminationReason::ShutdownRequested)
         );
+        assert_eq!(run.exit_code, None);
+        assert_eq!(
+            run.termination_detail.as_deref(),
+            Some(run_entity::UNRECORDED_EXIT_DETAIL)
+        );
         assert!(run.terminated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_stale_marker_keeps_a_recorded_exit() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("test.db");
+        let pools = open_test_pools(&db_path).await;
+
+        let config = test_config("recorded-exit");
+        let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config)
+            .await
+            .unwrap();
+        LocalBackend::update_sandbox_status(pools.write(), sandbox_id, SandboxStatus::Draining)
+            .await
+            .unwrap();
+        let recorded_at = chrono::NaiveDate::from_ymd_opt(2026, 1, 2)
+            .unwrap()
+            .and_hms_opt(3, 4, 5)
+            .unwrap();
+        let run = run_entity::ActiveModel {
+            sandbox_id: Set(sandbox_id),
+            pid: Set(Some(dead_pid())),
+            status: Set(run_entity::RunStatus::Terminated),
+            exit_code: Set(Some(0)),
+            termination_reason: Set(Some(run_entity::TerminationReason::Completed)),
+            terminated_at: Set(Some(recorded_at)),
+            ..Default::default()
+        };
+        let run_id = run_entity::Entity::insert(run)
+            .exec(pools.write())
+            .await
+            .unwrap()
+            .last_insert_id;
+
+        LocalBackend::mark_sandbox_runtime_stale(
+            pools.write(),
+            sandbox_id,
+            Some(run_id),
+            SandboxStatus::Stopped,
+            run_entity::TerminationReason::ShutdownRequested,
+        )
+        .await
+        .unwrap();
+
+        let run = run_entity::Entity::find_by_id(run_id)
+            .one(pools.write())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(
+            run.termination_reason,
+            Some(run_entity::TerminationReason::Completed)
+        );
+        assert_eq!(run.termination_detail, None);
+        assert_eq!(run.terminated_at, Some(recorded_at));
+        let sandbox = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.write())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::Stopped);
     }
 
     #[tokio::test]
