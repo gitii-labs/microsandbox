@@ -15,6 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use console::{Key, Term, style};
+use futures::TryStreamExt;
+use microsandbox::SandboxConfig;
 use microsandbox::config::load_persisted_config_or_default;
 use microsandbox_db::compat::config::{
     self, requires_downgrade as requires_saved_config_downgrade,
@@ -22,7 +24,9 @@ use microsandbox_db::compat::config::{
 };
 use microsandbox_migration::schema_metadata;
 use microsandbox_migration::{Migrator, MigratorTrait};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, Statement, StreamTrait,
+};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
@@ -1073,6 +1077,7 @@ async fn run_downgrade_with_db(
         refuse_irreversible_rollback(&fresh_plan)?;
         if ctx.operation.phase() < DowngradePhase::DatabaseReverted {
             ensure_applied_unchanged(ctx.planned_applied_migrations, &fresh_applied)?;
+            refuse_oauth_omission_downgrade(ctx.db.inner(), ctx.operation.target_dir()).await?;
             ensure_plan_unchanged(ctx.rollback_plan, &fresh_plan)?;
         }
         renew_install_lease_if_present(ctx.db, &mut ctx.install_lease).await?;
@@ -2475,6 +2480,76 @@ async fn load_staged_schema_baseline(
         }
         Err(err) => Err(err.into()),
     }
+}
+
+async fn refuse_oauth_omission_downgrade(
+    db: &DatabaseConnection,
+    staged_dir: &Path,
+) -> anyhow::Result<()> {
+    let Some((sandbox, column)) = saved_oauth_omission(db).await? else {
+        return Ok(());
+    };
+    let msb = staged_dir.join(microsandbox_utils::BIN_SUBDIR).join(
+        microsandbox_utils::msb_binary_filename(std::env::consts::OS),
+    );
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TokioCommand::new(msb)
+            .kill_on_drop(true)
+            .arg("__launch-protocol")
+            .output(),
+    )
+    .await;
+    let supports_omission = matches!(output, Ok(Ok(output)) if output.status.success()
+        && serde_json::from_slice::<microsandbox_runtime::launch::LaunchCapabilities>(&output.stdout)
+            .is_ok_and(|caps| caps.protocols.contains(&2) && caps.oauth_token_response_omission));
+    if !supports_omission {
+        anyhow::bail!(
+            "sandbox {sandbox} {column} requires OAuth token response field omission, which the downgrade target does not support"
+        );
+    }
+    Ok(())
+}
+
+async fn saved_oauth_omission(
+    db: &DatabaseConnection,
+) -> anyhow::Result<Option<(i64, &'static str)>> {
+    let columns = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA table_info(sandbox)",
+        ))
+        .await?;
+    let mut first_protected = None;
+    for column in ["config", "active_config"] {
+        if !columns.iter().any(|row| {
+            row.try_get::<String>("", "name")
+                .is_ok_and(|name| name == column)
+        }) {
+            continue;
+        }
+        let mut rows = db
+            .stream_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("SELECT id, {column} AS payload FROM sandbox WHERE {column} IS NOT NULL"),
+            ))
+            .await?;
+        while let Some(row) = rows.try_next().await? {
+            let id: i64 = row.try_get("", "id")?;
+            let raw: String = row.try_get("", "payload")?;
+            // Check every row before probing: a capable target does not make an
+            // ambiguous or malformed config safe to rewrite during rollback.
+            let protected = SandboxConfig::stored_requires_oauth_omission(&raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "sandbox {id} {column} has invalid saved configuration; downgrade refused"
+                )
+            })?;
+            if protected && first_protected.is_none() {
+                first_protected = Some((id, column));
+            }
+        }
+    }
+    Ok(first_protected)
 }
 
 fn floor_0_6_0_baseline() -> SchemaBaseline {

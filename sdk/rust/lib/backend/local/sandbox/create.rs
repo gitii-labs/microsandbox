@@ -2086,7 +2086,7 @@ impl LocalBackend {
         config: &SandboxConfig,
     ) -> MicrosandboxResult<()> {
         launch_contract::validate_runtime_config(config, self.config()).await?;
-        let config_json = serde_json::to_string(config)?;
+        let config_json = config.encode_stored()?;
         let caller_config_overrides_json = config.caller_config_overrides_json(&config_json)?;
         db.transaction(|txn| {
             let config_json = config_json.clone();
@@ -2199,7 +2199,7 @@ impl LocalBackend {
         status: SandboxStatus,
         reserve: bool,
     ) -> MicrosandboxResult<i32> {
-        let config_json = serde_json::to_string(config)?;
+        let config_json = config.encode_stored()?;
         let caller_config_overrides_json = config.caller_config_overrides_json(&config_json)?;
         let labels = config.spec.labels.clone();
 

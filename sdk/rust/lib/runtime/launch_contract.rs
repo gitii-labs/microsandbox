@@ -16,6 +16,11 @@ use std::{
 
 #[cfg(feature = "net")]
 use microsandbox_network::policy::{Action, Destination, Direction};
+#[cfg(feature = "net")]
+use microsandbox_network::{
+    ResolvedNetworkConfig,
+    config::{EnvNetworkSecretResolver, NetworkConfig},
+};
 use microsandbox_protocol::bootstrap::*;
 use microsandbox_runtime::launch::{LaunchCapabilities, LaunchConfig};
 #[cfg(feature = "net")]
@@ -161,8 +166,16 @@ impl LaunchContract {
         network.secrets.validate().map_err(|error| {
             MicrosandboxError::InvalidConfig(format!("invalid secret configuration: {error}"))
         })?;
+        network
+            .secrets
+            .validate_oauth_token_response_omission(&network.tls, profile)
+            .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))?;
         if self.machine {
             return Ok(());
+        }
+
+        if network.secrets.has_oauth_token_response_omission() {
+            return unsupported("OAuth token response field omission");
         }
 
         if matches!(
@@ -489,6 +502,18 @@ impl LaunchContract {
 
     /// Check SDK launch intent before preparation can replace an existing sandbox.
     pub(crate) fn validate_launch_intent(self, config: &SandboxConfig) -> MicrosandboxResult<()> {
+        #[cfg(not(feature = "net"))]
+        if config
+            .spec
+            .network
+            .secrets
+            .as_ref()
+            .is_some_and(microsandbox_types::SecretsConfig::has_oauth_token_response_omission)
+        {
+            return Err(MicrosandboxError::Runtime(
+                "OAuth token response field omission requires a networking-enabled SDK".into(),
+            ));
+        }
         #[cfg(feature = "net")]
         self.validate_network(
             &config.local_network_config()?,
@@ -637,12 +662,23 @@ impl FileIdentity {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Check launch intent before create can replace an existing sandbox.
+/// Check launch intent before create or restart can stop an existing sandbox.
 /// Host paths, named volumes and network slots are checked again in the final encoder.
 pub(crate) async fn validate_runtime_config(
     config: &SandboxConfig,
     global: &GlobalConfig,
 ) -> MicrosandboxResult<()> {
+    // A saved profile may predate current host policy. Validate protected intent
+    // against the same override as start, without changing the caller's saved config.
+    let profile = global.effective_deployment_profile(config.spec.deployment_profile);
+    let effective = (config.requires_oauth_omission() && profile != config.spec.deployment_profile)
+        .then(|| {
+            let mut effective = config.clone();
+            effective.spec.deployment_profile = profile;
+            effective
+        });
+    let config = effective.as_ref().unwrap_or(config);
+
     #[cfg(feature = "net")]
     let network = config.local_network_config()?;
     #[cfg(feature = "net")]
@@ -653,10 +689,10 @@ pub(crate) async fn validate_runtime_config(
         Ok(runtime) => runtime,
         #[cfg(feature = "embed-binaries")]
         Err(MicrosandboxError::RuntimeNotInstalled(_))
-            if config.spec.resources.nested_virt == Some(true) =>
+            if config.spec.resources.nested_virt == Some(true)
+                || config.requires_oauth_omission() =>
         {
-            // Keep first-use installation working, but discover host support
-            // before replacement can remove the existing sandbox.
+            // Keep first-use installation working, but probe the runtime before replacement.
             crate::setup::ensure_runtime(
                 global,
                 crate::setup::InstallOptions {
@@ -667,12 +703,14 @@ pub(crate) async fn validate_runtime_config(
             .await?
         }
         Err(MicrosandboxError::RuntimeNotInstalled(_))
-            if config.spec.resources.nested_virt != Some(true) =>
+            if config.spec.resources.nested_virt != Some(true)
+                && !config.requires_oauth_omission() =>
         {
             return Ok(());
         }
         Err(error) => return Err(error),
     };
+    require_oauth_omission(&runtime.msb_path, config.requires_oauth_omission()).await?;
     require_protected_guest_state(&runtime.msb_path).await?;
     let contract = resolve(&runtime.msb_path).await?;
     validate_nested_virt(&runtime.msb_path, config, contract).await?;
@@ -684,11 +722,31 @@ pub(crate) async fn validate_runtime_config(
     contract
         .require_network_capabilities(&runtime.msb_path, &network)
         .await?;
+    #[cfg(feature = "net")]
+    if config.requires_oauth_omission() {
+        // Check launch inputs without persisting them or touching the default CA.
+        // Launch checks them again; an external source can change in between.
+        let resolved = resolve_launch_network(network)?;
+        let network = resolved.config();
+        if network.enabled && network.tls.enabled {
+            microsandbox_network::tls::validate_explicit_intercept_ca(&network.tls)
+                .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))?;
+        }
+    }
     validate_exec_limits(&runtime.msb_path, config).await?;
     validate_guest_clock(&runtime.msb_path, config).await?;
     validate_mount_table(&runtime.msb_path, config).await?;
     validate_fs_state_limit(&runtime.msb_path, global).await?;
     Ok(())
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn resolve_launch_network(
+    network: NetworkConfig,
+) -> MicrosandboxResult<ResolvedNetworkConfig> {
+    network
+        .resolve(&EnvNetworkSecretResolver)
+        .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))
 }
 
 pub(crate) async fn resolve(path: &Path) -> MicrosandboxResult<LaunchContract> {
@@ -980,6 +1038,23 @@ pub(crate) async fn require_protected_guest_state(path: &Path) -> MicrosandboxRe
     )))
 }
 
+/// Check opted-in launches first, including runtimes that predate the probe itself.
+pub(crate) async fn require_oauth_omission(path: &Path, required: bool) -> MicrosandboxResult<()> {
+    if !required {
+        return Ok(());
+    }
+
+    let feature = "OAuth token response field omission";
+    match capabilities(path).await {
+        Ok(caps) if caps.protocols.contains(&2) && caps.oauth_token_response_omission => Ok(()),
+        Ok(_) => Err(MicrosandboxError::Runtime(upgrade_required(feature))),
+        Err(error) => Err(MicrosandboxError::Runtime(format!(
+            "{}. Capability probe failed: {error}",
+            upgrade_required(feature)
+        ))),
+    }
+}
+
 async fn require_capability(
     path: &Path,
     advertised: impl FnOnce(&LaunchCapabilities) -> bool,
@@ -1217,6 +1292,81 @@ mod tests {
             "printf '%s' '{\"protocols\":[2],\"required_restore_backing\":\"true\"}'",
         );
         assert!(require_restore_backing(&malformed).await.is_err());
+    }
+
+    #[cfg(all(unix, feature = "net"))]
+    #[tokio::test]
+    async fn oauth_omission_requires_runtime_capability_only_when_requested() {
+        use microsandbox_network::config::{EnvNetworkSecretResolver, NetworkConfig};
+        use microsandbox_types::DeploymentProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = script(dir.path(), "old", "printf '%s' '{\"protocols\":[2,1]}'");
+        let current = script(
+            dir.path(),
+            "current",
+            r#"printf '%s' '{"protocols":[2,1],"oauth_token_response_omission":true}'"#,
+        );
+        let machine = LaunchContract {
+            patch: 0,
+            machine: true,
+        };
+        let previous = LaunchContract {
+            patch: 18,
+            machine: false,
+        };
+        let mut network = NetworkConfig::default();
+        let grant = serde_json::from_value(serde_json::json!({
+            "broker_endpoint": "/nonexistent/oauth-broker.sock",
+            "grant_id": "fixture",
+            "token_endpoint": "https://provider.invalid/token",
+            "inject_hosts": [{"Exact": "provider.invalid"}],
+            "access_token_field": "access_token",
+            "refresh_token_field": "refresh_token",
+            "access_env_var": "ACCESS",
+            "refresh_env_var": "REFRESH",
+            "access_sentinel": "$ACCESS",
+            "refresh_sentinel": "$REFRESH"
+        }))
+        .unwrap();
+        network.secrets.oauth.push(grant);
+        let requested = || network.secrets.has_oauth_token_response_omission();
+        require_oauth_omission(&dir.path().join("no-probe-needed"), requested())
+            .await
+            .unwrap();
+
+        network.secrets.oauth[0].omit_token_response_fields = vec!["id_token".into()];
+        network.tls.enabled = true;
+        previous
+            .validate_network(&network, DeploymentProfile::default())
+            .unwrap_err();
+        let pre_oauth = script(dir.path(), "pre-oauth", "exit 2");
+        let requested = network.secrets.has_oauth_token_response_omission();
+        for binary in [old, pre_oauth] {
+            let error = require_oauth_omission(&binary, requested)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("does not support OAuth token response field omission; upgrade msb"),
+                "{error}"
+            );
+        }
+        require_oauth_omission(&current, requested).await.unwrap();
+        let launch = LaunchConfig {
+            network: Some(network.resolve(&EnvNetworkSecretResolver).unwrap()),
+            ..Default::default()
+        };
+        let encoded = machine.encode(&launch).unwrap();
+        assert_eq!(
+            encoded["network"]["config"]["secrets"]["oauth"][0]["omit_token_response_fields"],
+            json!(["id_token"])
+        );
+        let runtime: LaunchConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            runtime.network.unwrap().config().secrets.oauth[0].omit_token_response_fields,
+            ["id_token"]
+        );
     }
 
     #[cfg(all(unix, feature = "net"))]

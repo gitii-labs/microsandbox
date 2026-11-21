@@ -34,6 +34,7 @@ local = [
     "dep:microsandbox-image",
     "dep:microsandbox-metrics",
     "dep:microsandbox-migration",
+    "microsandbox-network?/intercept-ca",
     "dep:microsandbox-runtime",
     "dep:nix",
     "dep:rand",

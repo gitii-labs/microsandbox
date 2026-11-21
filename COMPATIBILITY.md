@@ -189,6 +189,18 @@ OAuth connections to keep markers, injected tokens and raw provider responses
 out of logs; other connections retain their existing tracing. Agent framing, storage and leases are
 unchanged.
 
+OAuth `omit_token_response_fields` is opt-in per grant. The SDK probes
+`oauth_token_response_omission` through `__launch-protocol` before starting or
+replacing a sandbox that uses it. Older local runtimes return an upgrade-required
+error, and managed cloud does not accept the option. The Go loader requires the
+optional `msb_supports_oauth_token_response_omission` symbol before sending it
+to the native library. Old SDKs and existing grants do not need either capability.
+The new policy is single-tenant and requires intercepted TCP ports with QUIC
+blocked and no TLS bypass for the token or poll hosts.
+
+Rust callers using exhaustive `OAuthSecret` literals must initialize the added
+field. Go callers using keyed `OAuthSecretConfig` literals can leave it unset.
+
 OAuth token forwarding observes the existing acquired broker socket until the
 provider response is complete. EOF, socket errors or unsolicited broker data
 cancel the upstream connection; a lease already closed before dispatch refuses
@@ -283,6 +295,33 @@ The SQLite database under `MSB_HOME` is a durable protocol between releases. Hos
 On Unix, catalog identity checks read filesystem metadata without opening an extra descriptor. Control and metrics lookups share one database identity per backend. On macOS, that identity retains a dedicated read-only SQLite connection, including after ordinary pool connections expire. SQLite owns that connection's close so verification and identity teardown preserve other connections' POSIX locks. Linux retains its `O_PATH` handles and Windows retains its file handles. Database replacement detection, schemas, journal modes, and SDK/runtime protocols are unchanged.
 
 Compatibility-sensitive elements include migration IDs and order, migration semantics, schema columns and constraints, persisted enum/tag spellings, JSON configuration shapes, desired versus active configuration, install and maintenance leases, allocation state, recovery journals, and the downgrade floor.
+
+For a local sandbox with OAuth token response omission, both desired and active
+configuration writers encode `network.enabled` as
+`{"oauth_token_response_omission_v1": <bool>}`. Historical typed config readers
+require a boolean there and refuse the protected row before using its config,
+even if they do not recognize `network.secrets.oauth`. The current catalog
+decoder requires the marker and a nonempty omission policy together and rejects
+duplicate keys before normalization. Public configuration input and launch JSON
+retain the normal boolean and grant shapes.
+Other sandboxes retain their existing bytes; no schema migration or catalog-wide
+admission gate is added. The current `self downgrade` scans both saved columns
+for omission without interpreting ordinary rows as current configuration. It
+validates protected rows with the catalog decoder and requires support from
+the staged binary. Both direct restart and restart-backed edits check the
+selected runtime and effective host profile before stopping a sandbox whose
+desired policy opts in. They resolve host-backed network sources and validate
+explicit interception signing inputs before stopping and again at launch; a
+source can change between these checks. Preflight does not touch the default CA.
+`connect_or_create` refuses an opted-in effective creation policy or rejected
+opt-in builder input before looking up or joining an existing sandbox. It also
+propagates a network configuration error if an explicitly supplied network
+closure could not run; it cannot know what policy that closure requested.
+
+The raw handle accessors expose the stored marker: Rust `config_json()`, Go
+`ConfigJSON()`, and Node `configJson`. Python's parsed handle `config()` and
+CLI `inspect --format json` also surface it. These views show saved JSON, not
+the result of typed policy validation.
 
 Evolution rules:
 
@@ -675,4 +714,7 @@ Incoming unversioned launch/cloud requests retain detection of previous formats.
 
 The runtime dispatcher selects the current reader when `execution` is present, `v0_6_10/launch.rs` when `bootstrap` is present, and `v0_5_9/launch.rs` otherwise. `client/launch.rs` contains both `LaunchConfig` and the `LaunchCapabilities` probe response. The launch type remains in the runtime crate to avoid a dependency cycle. SDK tests exercise its encoder against the runtime decoder; runtime tests also consume independently captured release payloads.
 
-Launch and cloud requests reject duplicate recognized fields and conflicting previous/current spellings. Previous saved-format decoding and the duplicate-key JSON fixture reader in the SDK are test-only.
+Launch and cloud requests reject duplicate recognized fields and conflicting
+previous/current spellings. Previous saved-format fixture decoding is test-only.
+The SDK's duplicate-key JSON reader also runs in production for protected catalog
+decoding and the downgrade policy scan.

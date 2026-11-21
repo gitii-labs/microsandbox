@@ -278,9 +278,7 @@ impl LocalBackend {
         name: &str,
         requested: DeploymentProfile,
     ) -> DeploymentProfile {
-        let Some(profile) = self.config().deployment_profile else {
-            return requested;
-        };
+        let profile = self.config().effective_deployment_profile(requested);
 
         if requested != profile {
             if requested == DeploymentProfile::MultiTenant

@@ -5,7 +5,7 @@
 //! per-domain certificate and re-originating a TLS connection to the real
 //! server.
 
-pub(crate) mod ca;
+pub(crate) use crate::intercept_ca as ca;
 pub(crate) mod certgen;
 pub(crate) mod host_cas;
 pub(crate) mod proxy;

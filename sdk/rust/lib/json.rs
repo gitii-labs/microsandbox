@@ -13,7 +13,7 @@ use serde_json::{Map, Number, Value};
 //--------------------------------------------------------------------------------------------------
 
 /// JSON document that rejects repeated object keys without exposing their contents.
-pub struct UniqueValue(pub Value);
+pub(crate) struct UniqueValue(pub Value);
 struct UniqueVisitor;
 
 //--------------------------------------------------------------------------------------------------

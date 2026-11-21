@@ -308,6 +308,12 @@ impl NetworkBuilder {
         self
     }
 
+    /// Report omission intent before validation can reject the network configuration.
+    #[doc(hidden)]
+    pub fn requests_oauth_token_response_omission(&self) -> bool {
+        self.config.secrets.has_oauth_token_response_omission()
+    }
+
     /// Shorthand: add a secret with env var, value, placeholder, and allowed host.
     pub fn secret_env(
         mut self,

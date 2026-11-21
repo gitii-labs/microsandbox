@@ -27,7 +27,7 @@ impl ControlSession {
             .await
             .map_err(|_| conflict())?;
         let key = self.entry.key;
-        let json = serde_json::to_string(active)?;
+        let json = active.encode_stored()?;
         // Verification alone would leave a restart race before the write. This
         // single statement compares the latest run and the exact snapshot in
         // the same SQLite write. A concurrent modifier is also detected rather

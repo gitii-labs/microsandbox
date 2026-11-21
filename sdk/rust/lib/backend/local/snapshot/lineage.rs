@@ -161,7 +161,7 @@ pub(crate) async fn begin(local: &LocalBackend, name: &str) -> MicrosandboxResul
         ));
     }
     let config: SandboxConfig =
-        serde_json::from_str(current.active_config.as_deref().unwrap_or(&current.config))?;
+        SandboxConfig::decode_stored(current.active_config.as_deref().unwrap_or(&current.config))?;
     let parent = match cursor.1 {
         Some(cursor) if cursor.sandbox_id == current.id => Some(cursor.snapshot_id),
         Some(_) => {

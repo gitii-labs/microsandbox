@@ -12,7 +12,9 @@ path = "lib/lib.rs"
 
 [features]
 default = ["engine"]
+intercept-ca = ["dep:rcgen", "dep:rustls"]
 engine = [
+    "intercept-ca",
     "dep:base64",
     "dep:bytes",
     "dep:core-foundation",
@@ -28,9 +30,7 @@ engine = [
     "dep:parking_lot",
     "dep:pem",
     "dep:percent-encoding",
-    "dep:rcgen",
     "dep:resolv-conf",
-    "dep:rustls",
     "dep:rustls-native-certs",
     "dep:rustls-pki-types",
     "dep:serde_json",

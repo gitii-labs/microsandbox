@@ -98,6 +98,10 @@ pub struct LaunchCapabilities {
     #[serde(default)]
     pub http_connect_proxy_auth: bool,
 
+    /// The network engine honors OAuth token-response field omission.
+    #[serde(default)]
+    pub oauth_token_response_omission: bool,
+
     /// The launch field `guest_clock` is honored by the runtime.
     /// Older runtimes omit this capability.
     #[serde(default)]

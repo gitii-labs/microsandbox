@@ -1128,6 +1128,7 @@ mod tests {
             device_code_endpoint: None,
             poll_endpoint: None,
             poll_secret_fields: vec![],
+            omit_token_response_fields: vec![],
             mint_endpoints: vec![],
             inject_hosts: vec![microsandbox_types::HostPattern::Any],
             access_token_field: "access_token".into(),

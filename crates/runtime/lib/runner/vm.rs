@@ -2872,6 +2872,11 @@ fn build_vm(
             .secrets
             .validate()
             .map_err(|err| RuntimeError::Custom(format!("invalid network secrets: {err}")))?;
+        vm.network
+            .config()
+            .secrets
+            .validate_oauth_token_response_omission(&vm.network.config().tls, vm.deployment_profile)
+            .map_err(|err| RuntimeError::Custom(format!("invalid network secrets: {err}")))?;
         let rate_limiters = to_krun_network_rate_limiters(vm.network.config());
 
         let mut network =

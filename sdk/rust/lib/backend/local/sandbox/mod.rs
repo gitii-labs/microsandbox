@@ -1183,7 +1183,7 @@ impl LocalBackend {
         if !microsandbox_db::catalog::has_column(db, "sandbox", "active_config").await? {
             return Ok(());
         }
-        let config_json = serde_json::to_string(config)?;
+        let config_json = config.encode_stored()?;
         let result = sandbox_entity::Entity::update_many()
             .col_expr(
                 sandbox_entity::Column::ActiveConfig,

@@ -50,7 +50,7 @@ use windows_sys::Win32::System::Threading::{
 use microsandbox_image::{Digest, GlobalCache};
 use microsandbox_metrics::{MetricsRegistry, ReserveSlot, SlotReservation};
 #[cfg(feature = "net")]
-use microsandbox_network::{ResolvedNetworkConfig, config::EnvNetworkSecretResolver};
+use microsandbox_network::ResolvedNetworkConfig;
 use microsandbox_protocol::{
     bootstrap::{
         BootstrapBlockRoot, BootstrapBlockRootUpper, BootstrapDirMount, BootstrapDiskMount,
@@ -297,10 +297,8 @@ impl LocalBackend {
         // them into the private runtime configuration before the sandbox process
         // is spawned.
         #[cfg(feature = "net")]
-        let resolved_network = config
-            .local_network_config()?
-            .resolve(&EnvNetworkSecretResolver)
-            .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))?;
+        let resolved_network =
+            launch_contract::resolve_launch_network(config.local_network_config()?)?;
 
         // Resolve the already-layered runtime paths as one compatible pair before launch.
         let global = self.config();
@@ -315,6 +313,11 @@ impl LocalBackend {
         .await?;
         #[cfg(not(feature = "embed-binaries"))]
         let resolved_runtime = crate::setup::resolve_runtime(global)?;
+        launch_contract::require_oauth_omission(
+            &resolved_runtime.msb_path,
+            config.requires_oauth_omission(),
+        )
+        .await?;
         ensure_sigchld_handler_uses_alt_stack_before_spawn().await?;
         launch_contract::require_protected_guest_state(&resolved_runtime.msb_path).await?;
         let launch_contract = launch_contract::resolve(&resolved_runtime.msb_path).await?;

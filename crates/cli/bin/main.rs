@@ -308,6 +308,7 @@ fn main() {
                     http_deny_json: cfg!(feature = "net"),
                     http_connect_proxy: cfg!(feature = "net"),
                     http_connect_proxy_auth: cfg!(feature = "net"),
+                    oauth_token_response_omission: cfg!(feature = "net"),
                     guest_clock: true,
                     mount_table: cfg!(unix),
                     fs_state_limit: true,

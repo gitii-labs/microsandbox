@@ -639,6 +639,17 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     if !config.spec.network.host_alias_ipv4_ports.is_empty() {
         return Err(unsupported("network.host_alias_ipv4_ports"));
     }
+    if config
+        .spec
+        .network
+        .secrets
+        .as_ref()
+        .is_some_and(microsandbox_types::SecretsConfig::has_oauth_token_response_omission)
+    {
+        return Err(unsupported(
+            "OAuth token response field omission (local-only)",
+        ));
+    }
 
     if config
         .spec

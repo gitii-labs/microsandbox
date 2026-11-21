@@ -438,11 +438,8 @@ pub(super) async fn apply(
         prospective.update_secrets(&builder.patch)?;
         serde_json::to_string(&prospective)?;
 
-        // A restart-backed modification must be launchable on the selected
-        // runtime before the VM is stopped. Otherwise a capability gap (for
-        // example HTTP CONNECT proxy authentication) is only discovered by
-        // the start that follows `stop`, which leaves the workload down and
-        // the rejected change already persisted.
+        // Use the same effective host policy and runtime preflight as start,
+        // before stopping the VM or persisting the proposed patch.
         if restart_required && let Some(local) = builder.backend.as_local() {
             crate::runtime::launch_contract::validate_runtime_config(&prospective, local.config())
                 .await?;
@@ -595,7 +592,7 @@ pub(super) async fn apply(
             active.update_labels(&builder.patch);
             Some(ActiveLabelsUpdate {
                 expected_json,
-                active_config_json: serde_json::to_string(active)?,
+                active_config_json: active.encode_stored()?,
             })
         } else {
             None
@@ -1224,7 +1221,7 @@ async fn persist_config(
 
     let labels = config.spec.labels.clone();
     let write_db = local_backend.db().await?.write();
-    let config_json = serde_json::to_string(config)?;
+    let config_json = config.encode_stored()?;
     let caller_config_overrides_json = config.caller_config_overrides_json(&config_json)?;
 
     write_db
@@ -5249,6 +5246,7 @@ mod tests {
         // from it, and a long macOS temporary directory can exceed the socket limit.
         let temp = tempfile::Builder::new()
             .prefix("msb-restart-preflight-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in("/tmp")
             .unwrap();
         let home = temp.path().join("home");

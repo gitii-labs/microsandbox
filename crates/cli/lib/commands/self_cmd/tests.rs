@@ -1147,6 +1147,146 @@ async fn scoped_header_downgrade_refuses_without_changing_the_catalog() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[tokio::test]
+async fn oauth_omission_downgrade_refuses_either_saved_column_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_downgrade_db(&dir.path().join("source.db"))
+        .await
+        .unwrap();
+    db.inner()
+        .execute_unprepared(
+            "CREATE TABLE sandbox(id INTEGER PRIMARY KEY, config TEXT, active_config TEXT)",
+        )
+        .await
+        .unwrap();
+    let grant = r#""broker_endpoint":"/synthetic/broker.sock","grant_id":"fixture",
+        "token_endpoint":"https://provider.invalid/token","access_token_field":"access_token",
+        "refresh_token_field":"refresh_token","access_env_var":"ACCESS","refresh_env_var":"REFRESH",
+        "access_sentinel":"access-placeholder","refresh_sentinel":"refresh-placeholder""#;
+    let saved = |enabled: &str, fields: &str| {
+        format!(
+            r#"{{"network":{{"enabled":{enabled},"secrets":{{"oauth":[{{{grant},"omit_token_response_fields":{fields}}}]}}}}}}"#
+        )
+    };
+    let ordinary = saved("true", "[]");
+    let protected = saved(
+        r#"{"oauth_token_response_omission_v1":true}"#,
+        r#"["id_token"]"#,
+    );
+    let marker_only = r#"{"network":{"enabled":{"oauth_token_response_omission_v1":true}}}"#;
+    let plain = saved("true", r#"["id_token"]"#);
+    let duplicate = protected.replacen(r#""enabled":"#, r#""enabled":true,"enabled":"#, 1);
+    let staged = std::env::var_os("MSB_OAUTH_OLD_TARGET")
+        .map_or_else(|| dir.path().join("missing-target"), PathBuf::from);
+
+    for (config, active, expected) in [
+        (ordinary.as_str(), ordinary.as_str(), None),
+        (
+            &protected,
+            &ordinary,
+            Some("config requires OAuth token response field omission"),
+        ),
+        (
+            &ordinary,
+            &protected,
+            Some("active_config requires OAuth token response field omission"),
+        ),
+        (
+            marker_only,
+            &ordinary,
+            Some("config has invalid saved configuration"),
+        ),
+        (
+            &ordinary,
+            &plain,
+            Some("active_config has invalid saved configuration"),
+        ),
+        (
+            &duplicate,
+            &ordinary,
+            Some("config has invalid saved configuration"),
+        ),
+        (
+            &protected,
+            &duplicate,
+            Some("active_config has invalid saved configuration"),
+        ),
+    ] {
+        db.inner()
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT OR REPLACE INTO sandbox VALUES (1, ?, ?)",
+                [config.into(), active.into()],
+            ))
+            .await
+            .unwrap();
+        let result = refuse_oauth_omission_downgrade(db.inner(), &staged).await;
+        if let Some(expected) = expected {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(&format!("sandbox 1 {expected}")), "{error}");
+        } else {
+            result.unwrap();
+        }
+        let row = db
+            .inner()
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT * FROM sandbox",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "config").unwrap(), config);
+        assert_eq!(row.try_get::<String>("", "active_config").unwrap(), active);
+    }
+}
+
+#[tokio::test]
+async fn oauth_omission_downgrade_admits_historical_bind_without_rewriting_it() {
+    // Written by the released v0.6.0 CLI after a local BusyBox boot and stop.
+    // Only the scratch rootfs path has been normalized.
+    let historical =
+        include_str!("../../../../../sdk/rust/lib/db/fixtures/bind-config-0.6.0.json").trim_end();
+    assert!(serde_json::from_str::<SandboxConfig>(historical).is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_downgrade_db(&dir.path().join("source.db"))
+        .await
+        .unwrap();
+    db.inner()
+        .execute_unprepared(
+            "CREATE TABLE sandbox(id INTEGER PRIMARY KEY, config TEXT, active_config TEXT)",
+        )
+        .await
+        .unwrap();
+    db.inner()
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO sandbox VALUES (1, ?, ?)",
+            [historical.into(), historical.into()],
+        ))
+        .await
+        .unwrap();
+
+    // No staged binary exists; reading an ordinary row must not probe it.
+    refuse_oauth_omission_downgrade(db.inner(), &dir.path().join("unstaged"))
+        .await
+        .unwrap();
+    prepare(db.inner(), &Version::new(0, 6, 0)).await.unwrap();
+
+    let row = db
+        .inner()
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT * FROM sandbox WHERE id = 1",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    for column in ["config", "active_config"] {
+        assert_eq!(row.try_get::<String>("", column).unwrap(), historical);
+    }
+}
+
 /// Uses catalogs created and upgraded by real release/candidate binaries.
 #[tokio::test]
 #[ignore = "requires MSB_TEST_CATALOG_MATRIX containing isolated release fixture homes"]

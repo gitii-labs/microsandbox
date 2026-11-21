@@ -2683,7 +2683,8 @@ pub struct OAuthSecret {
     /// [`access_token_field`](Self::access_token_field) is committed to the
     /// broker and sanitized like a token-endpoint response, while the
     /// `authorization_pending`, `slow_down`, `expired_token` and
-    /// `access_denied` errors are forwarded untouched. May be the same URL as
+    /// `access_denied` errors are forwarded untouched unless configured fields
+    /// must be omitted. May be the same URL as
     /// [`token_endpoint`](Self::token_endpoint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_endpoint: Option<String>,
@@ -2701,6 +2702,11 @@ pub struct OAuthSecret {
     /// listed here, stays on the verbatim path and reaches the sandbox.
     #[serde(default)]
     pub poll_secret_fields: Vec<String>,
+    /// Exact top-level JSON keys to remove from token and poll responses,
+    /// including errors, before forwarding or retaining any field for replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>", optional))]
+    pub omit_token_response_fields: Vec<String>,
     /// Endpoints that mint a new long-lived secret in their response.
     ///
     /// A token endpoint hands back the grant's own tokens; these hand back
@@ -3035,6 +3041,69 @@ pub enum SecretConfigError {
 }
 
 impl SecretsConfig {
+    /// Whether a grant requires OAuth token response field omission.
+    pub fn has_oauth_token_response_omission(&self) -> bool {
+        self.oauth
+            .iter()
+            .any(|grant| !grant.omit_token_response_fields.is_empty())
+    }
+
+    /// Reject settings that would leave an opted-in token or poll endpoint
+    /// outside the sandbox's TLS interception path.
+    pub fn validate_oauth_token_response_omission(
+        &self,
+        tls: &TlsConfig,
+        profile: DeploymentProfile,
+    ) -> Result<(), SecretConfigError> {
+        for (grant_index, grant) in self.oauth.iter().enumerate() {
+            if grant.omit_token_response_fields.is_empty() {
+                continue;
+            }
+            let invalid = |reason| SecretConfigError::InvalidOAuth {
+                grant_index,
+                reason,
+            };
+            if profile == DeploymentProfile::MultiTenant {
+                return Err(invalid(
+                    "token response field omission is not supported in the multi-tenant profile",
+                ));
+            }
+            if !tls.enabled || !tls.block_quic_on_intercept {
+                return Err(invalid(
+                    "token response field omission requires TLS interception with QUIC blocked on intercepted ports",
+                ));
+            }
+            for endpoint in
+                std::iter::once(grant.token_endpoint.as_str()).chain(grant.poll_endpoint.as_deref())
+            {
+                let (host, port, _) = oauth_endpoint_parts(endpoint)
+                    .filter(|(host, _, _)| !host.contains('@'))
+                    .ok_or_else(|| invalid("invalid HTTPS token or poll endpoint"))?;
+                let port = port
+                    .map(str::parse::<u16>)
+                    .transpose()
+                    .map_err(|_| invalid("invalid token or poll endpoint port"))?
+                    .unwrap_or(443);
+                if port == 0 || !tls.intercepted_ports.contains(&port) {
+                    return Err(invalid(
+                        "the token and poll endpoint ports must be intercepted",
+                    ));
+                }
+                if tls.bypass.iter().any(|pattern| {
+                    let pattern = pattern.trim_end_matches('.');
+                    // TLS bypass treats `*` as an exact name, not a catch-all.
+                    pattern != "*"
+                        && HostPattern::parse(pattern).matches(host.trim_end_matches('.'))
+                }) {
+                    return Err(invalid(
+                        "the token and poll endpoint hosts must not bypass TLS interception",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether any configured secret requires verified TLS identity.
     pub fn has_tls_identity_secrets(&self) -> bool {
         self.secrets
@@ -3078,6 +3147,23 @@ impl SecretsConfig {
 }
 
 impl OAuthSecret {
+    /// Whether an OAuth endpoint path can be compared without normalization.
+    /// Request matching calls this on the path alone, after removing the query.
+    pub fn is_normalized_endpoint_path(path: &str) -> bool {
+        path.starts_with('/')
+            && !path.contains(['%', ';', '#', '?'])
+            && !path.contains("//")
+            && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+    }
+
+    /// Whether a protected OAuth endpoint path is safe to compare as-is.
+    pub fn is_protected_endpoint_path(path: &str) -> bool {
+        Self::is_normalized_endpoint_path(path)
+            && path
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b'\\')
+    }
+
     /// Validate durable OAuth metadata without contacting the broker.
     pub fn validate(&self, grant_index: usize) -> Result<(), SecretConfigError> {
         let invalid = |reason| SecretConfigError::InvalidOAuth {
@@ -3120,6 +3206,36 @@ impl OAuthSecret {
                 grant_index,
             )?;
         }
+        if !self.omit_token_response_fields.is_empty() {
+            for endpoint in
+                std::iter::once(self.token_endpoint.as_str()).chain(self.poll_endpoint.as_deref())
+            {
+                let (host, port, path) = oauth_endpoint_parts(endpoint)
+                    .ok_or_else(|| invalid("invalid HTTPS token or poll endpoint"))?;
+                // TLS and CONNECT name DNS destinations without a trailing
+                // dot. Reject spellings the connection matcher cannot select.
+                if host.parse::<std::net::IpAddr>().is_ok()
+                    || !host.split('.').all(|label| {
+                        !label.is_empty()
+                            && !label.starts_with('-')
+                            && !label.ends_with('-')
+                            && label
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    })
+                {
+                    return Err(invalid("token and poll endpoints must use a DNS hostname"));
+                }
+                if port.is_some_and(|port| !port.parse::<u16>().is_ok_and(|port| port != 0)) {
+                    return Err(invalid("invalid token or poll endpoint port"));
+                }
+                if !Self::is_protected_endpoint_path(path) {
+                    return Err(invalid(
+                        "token and poll endpoints must use a normalized path without a query or fragment",
+                    ));
+                }
+            }
+        }
         if self.inject_hosts.is_empty() {
             return Err(invalid("at least one inject host is required"));
         }
@@ -3135,6 +3251,19 @@ impl OAuthSecret {
             }
             if *field == self.access_token_field || *field == self.refresh_token_field {
                 return Err(invalid("poll secret fields must not be token fields"));
+            }
+        }
+        for field in &self.omit_token_response_fields {
+            if field.is_empty() {
+                return Err(invalid(
+                    "omitted token response field names must not be empty",
+                ));
+            }
+            if *field == self.access_token_field || *field == self.refresh_token_field {
+                return Err(invalid("cannot omit mapped access or refresh token fields"));
+            }
+            if self.poll_secret_fields.contains(field) {
+                return Err(invalid("cannot both omit and retain a poll secret field"));
             }
         }
         for mint in &self.mint_endpoints {
@@ -3372,11 +3501,16 @@ fn validate_mint_endpoint(
 
 /// The bare hostname of an `https://host[:port]/path` endpoint.
 fn oauth_endpoint_host(endpoint: &str) -> Option<&str> {
-    let authority = endpoint.strip_prefix("https://")?.split('/').next()?;
-    let host = authority
+    oauth_endpoint_parts(endpoint).map(|(host, _, _)| host)
+}
+
+fn oauth_endpoint_parts(endpoint: &str) -> Option<(&str, Option<&str>, &str)> {
+    let rest = endpoint.strip_prefix("https://")?;
+    let (authority, path) = rest.split_at(rest.find('/')?);
+    let (host, port) = authority
         .rsplit_once(':')
-        .map_or(authority, |(host, _)| host);
-    (!host.is_empty()).then_some(host)
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    (!host.is_empty()).then_some((host, port, path))
 }
 
 fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), SecretConfigError> {
@@ -4333,6 +4467,7 @@ mod tests {
             device_code_endpoint: Some("https://github.com/login/device/code".into()),
             poll_endpoint: Some("https://github.com/login/oauth/access_token".into()),
             poll_secret_fields: vec![],
+            omit_token_response_fields: vec![],
             mint_endpoints: vec![],
             inject_hosts: vec![HostPattern::Exact("api.github.com".into())],
             access_token_field: "access_token".into(),
@@ -4649,6 +4784,89 @@ mod tests {
                 reason: "poll secret fields must not be token fields",
             })
         );
+    }
+
+    #[test]
+    fn oauth_omission_validates_custom_mappings_and_poll_secrets() {
+        let mut grant = device_flow_oauth();
+        grant.access_token_field = "mapped-access".into();
+        grant.refresh_token_field = "mapped-refresh".into();
+        grant.poll_secret_fields = vec!["authorization_code".into()];
+        for field in ["", "mapped-access", "mapped-refresh", "authorization_code"] {
+            grant.omit_token_response_fields = vec![field.into()];
+            assert!(grant.validate(0).is_err(), "accepted {field:?}");
+        }
+        grant.device_code_endpoint = None;
+        grant.poll_endpoint = None;
+        grant.poll_secret_fields.clear();
+        grant.omit_token_response_fields = vec!["id_token".into()];
+        assert_eq!(grant.validate(0), Ok(()));
+    }
+
+    #[test]
+    fn oauth_omission_requires_intercepting_token_and_poll_endpoints() {
+        let mut grant = device_flow_oauth();
+        grant.poll_endpoint = Some("https://poll.example.org:8443/token".into());
+        let mut config = SecretsConfig {
+            oauth: vec![grant],
+            ..Default::default()
+        };
+        let mut tls = TlsConfig::default();
+        assert_eq!(
+            config.validate_oauth_token_response_omission(&tls, DeploymentProfile::MultiTenant),
+            Ok(())
+        );
+        config.oauth[0].omit_token_response_fields = vec!["id_token".into()];
+        let validate = |tls: &TlsConfig| {
+            config.validate_oauth_token_response_omission(tls, DeploymentProfile::SingleTenant)
+        };
+        assert!(validate(&tls).is_err());
+        tls.enabled = true;
+        assert!(validate(&tls).is_err());
+        tls.intercepted_ports.push(8443);
+        assert_eq!(validate(&tls), Ok(()));
+        tls.bypass = vec!["*.EXAMPLE.org.".into()];
+        assert!(validate(&tls).is_err());
+        tls.bypass.clear();
+        tls.block_quic_on_intercept = false;
+        assert!(validate(&tls).is_err());
+        tls.block_quic_on_intercept = true;
+        assert!(
+            config
+                .validate_oauth_token_response_omission(&tls, DeploymentProfile::MultiTenant)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_omission_refuses_urls_that_cannot_be_matched_safely() {
+        for url in [
+            "https://auth.example.com/token?code=secret",
+            "https://auth.example.com/token#fragment",
+            "https://auth.example.com/%74oken",
+            "https://auth.example.com/oauth//token",
+            "https://auth.example.com/oauth/../token",
+            "https://auth.example.com/oauth;/token",
+            "https://auth.example.com/oauth\\token",
+            "https://auth.example.com./token",
+            "https://auth.example.com:0/token",
+            "https://user@auth.example.com/token",
+            "https://127.0.0.1/token",
+        ] {
+            for token in [true, false] {
+                let mut grant = device_flow_oauth();
+                if token {
+                    grant.token_endpoint = url.into();
+                } else {
+                    grant.poll_endpoint = Some(url.into());
+                }
+                grant.omit_token_response_fields = vec!["id_token".into()];
+                assert!(grant.validate(0).is_err(), "{url}");
+            }
+        }
+        let mut grant = device_flow_oauth();
+        grant.token_endpoint = "https://auth.example.com/token?legacy=true".into();
+        assert_eq!(grant.validate(0), Ok(()));
     }
 
     #[test]

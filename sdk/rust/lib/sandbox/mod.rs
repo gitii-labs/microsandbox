@@ -52,6 +52,7 @@ pub mod tcp;
 // Windows-only in shipping builds, but kept compiled under `test` so the
 // platform-independent encoding logic is covered on every host.
 mod status;
+mod stored_config;
 #[cfg(any(windows, test))]
 pub(crate) mod terminal;
 mod types;

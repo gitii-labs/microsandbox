@@ -562,18 +562,17 @@ pub(crate) async fn intercept_relay(
     }
     .with_guest_dst(guest_dst);
     let connect_dst = connect_target.primary();
+    // CONNECT's host socket belongs to the HTTP proxy, not the authenticated
+    // tunnel authority. Match the token endpoint on the tunnel's port.
+    let oauth_port = guest_dst.port();
     let mut oauth = if via_connect {
-        OAuthConnection::new_tls_intercepted_via_connect(
-            &secrets.oauth,
-            sni_name,
-            connect_dst.port(),
-        )
-        .await?
+        OAuthConnection::new_tls_intercepted_via_connect(&secrets.oauth, sni_name, oauth_port)
+            .await?
     } else {
         OAuthConnection::new_tls_intercepted(
             &secrets.oauth,
             sni_name,
-            connect_dst.port(),
+            oauth_port,
             guest_dst.ip(),
             &shared,
         )
@@ -583,12 +582,8 @@ pub(crate) async fn intercept_relay(
     // Nothing on this connection substitutes or sanitizes when no grant is
     // relevant to it, so that is exactly where a credential-shaped response
     // means the catalogue is missing an endpoint.
-    let mut detector = CredentialDetector::new(
-        &secrets.oauth,
-        sni_name,
-        connect_dst.port(),
-        oauth.is_empty(),
-    );
+    let mut detector =
+        CredentialDetector::new(&secrets.oauth, sni_name, oauth_port, oauth.is_empty());
 
     // Get or generate per-domain certificate (includes cached ServerConfig).
     let domain_cert = tls_state
@@ -985,13 +980,17 @@ mod tests {
     async fn oauth_lease_relay(end: LeaseEnd) {
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_oauth_lease_relay(end),
+            run_oauth_lease_relay(end, false),
         )
         .await
         .expect("OAuth lease relay did not finish");
     }
 
-    async fn run_oauth_lease_relay(end: LeaseEnd) {
+    async fn run_oauth_lease_relay(end: LeaseEnd, via_connect: bool) {
+        const CONNECT_PORT: u16 = 443;
+        const CONNECT_REQUEST: &[u8] =
+            b"CONNECT auth.example.com:443 HTTP/1.1\r\nHost: auth.example.com:443\r\n\r\n";
+        const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
         assert!(
             rustls::crypto::ring::default_provider()
                 .install_default()
@@ -1006,15 +1005,22 @@ mod tests {
         let broker_listener = UnixListener::bind(&socket).unwrap();
         let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = provider_listener.local_addr().unwrap();
+        let token_port = if via_connect {
+            CONNECT_PORT
+        } else {
+            addr.port()
+        };
+        assert!(!via_connect || addr.port() != token_port);
         let config = SecretsConfig {
             oauth: vec![crate::secrets::config::OAuthSecret {
                 broker_endpoint: socket.to_string_lossy().into_owned(),
                 grant_id: "lease-test".into(),
-                token_endpoint: format!("https://auth.example.com:{}/token", addr.port()),
+                token_endpoint: format!("https://auth.example.com:{token_port}/token"),
                 require_grant_marker: false,
                 device_code_endpoint: None,
                 poll_endpoint: None,
                 poll_secret_fields: vec![],
+                omit_token_response_fields: vec!["id_token".into()],
                 mint_endpoints: vec![],
                 inject_hosts: vec![],
                 access_token_field: "access_token".into(),
@@ -1032,7 +1038,7 @@ mod tests {
                     verify_upstream: false,
                     ..Default::default()
                 },
-                SecretsHandle::new(config),
+                SecretsHandle::new(config.clone()),
             )
             .unwrap(),
         );
@@ -1081,6 +1087,7 @@ mod tests {
             assert_eq!(commit["action"], "commit");
             assert_eq!(commit["access"], "new-test-access");
             assert_eq!(commit["refresh"], "new-test-refresh");
+            assert!(!line.contains("synthetic-id"));
             lease
                 .get_mut()
                 .write_all(b"{\"ok\":true,\"generation\":8}\n")
@@ -1090,7 +1097,13 @@ mod tests {
             assert_eq!(lease.read_line(&mut line).await.unwrap(), 0);
         });
         let provider = tokio::spawn(async move {
-            let (stream, _) = provider_listener.accept().await.unwrap();
+            let (mut stream, _) = provider_listener.accept().await.unwrap();
+            if via_connect {
+                let mut connect = vec![0; CONNECT_REQUEST.len()];
+                stream.read_exact(&mut connect).await.unwrap();
+                assert_eq!(connect, CONNECT_REQUEST);
+                stream.write_all(CONNECT_OK).await.unwrap();
+            }
             let stream = tokio_rustls::TlsAcceptor::from(cert.server_config.clone())
                 .accept(stream)
                 .await
@@ -1109,8 +1122,7 @@ mod tests {
                 let mut body = vec![0; "refresh_token=test-refresh".len()];
                 stream.read_exact(&mut body).await.unwrap();
                 assert_eq!(body, b"refresh_token=test-refresh");
-                let body =
-                    br#"{"access_token":"new-test-access","refresh_token":"new-test-refresh"}"#;
+                let body = br#"{"access_token":"new-test-access","refresh_token":"new-test-refresh","id_token":"synthetic-id"}"#;
                 if matches!(end, LeaseEnd::PendingBody | LeaseEnd::AfterCommit) {
                     stream
                         .get_mut()
@@ -1164,20 +1176,48 @@ mod tests {
         guest.write_tls(&mut hello).unwrap();
         let (from_tx, from_rx) = mpsc::channel(16);
         let (to_tx, mut to_rx) = mpsc::channel(16);
-        let relay = tokio::spawn(intercept_relay(
-            addr,
-            UpstreamTcpTarget::direct(addr),
-            "auth.example.com",
-            true,
-            hello,
-            from_rx,
-            to_tx,
-            Arc::new(SharedState::new(16)),
-            state,
-            Arc::new(ProxyConnectState::default()),
-            None,
-            None,
-        ));
+        let relay = if via_connect {
+            let relay = crate::tcp::proxy::TcpProxy::new(
+                None,
+                addr,
+                UpstreamTcpTarget::direct(addr),
+                from_rx,
+                to_tx,
+                Arc::new(SharedState::new(16)),
+                Arc::new(NetworkPolicy::allow_all()),
+                Arc::new(config),
+                Some(state),
+                false,
+                Arc::new(ProxyConnectState::default()),
+                None,
+            );
+            let handle = tokio::spawn(async move {
+                relay.run().await;
+                Ok(())
+            });
+            from_tx
+                .send(Bytes::from_static(CONNECT_REQUEST))
+                .await
+                .unwrap();
+            assert_eq!(to_rx.recv().await.unwrap().as_ref(), CONNECT_OK);
+            from_tx.send(Bytes::from(hello)).await.unwrap();
+            handle
+        } else {
+            tokio::spawn(intercept_relay(
+                addr,
+                UpstreamTcpTarget::direct(addr),
+                "auth.example.com",
+                true,
+                hello,
+                from_rx,
+                to_tx,
+                Arc::new(SharedState::new(16)),
+                state,
+                Arc::new(ProxyConnectState::default()),
+                None,
+                None,
+            ))
+        };
         let mut sent = false;
         let mut response = Vec::new();
         while let Some(data) = to_rx.recv().await {
@@ -1211,6 +1251,8 @@ mod tests {
             assert!(response.contains("$MSB_OAUTH_ACCESS_test"));
             assert!(response.contains("$MSB_OAUTH_REFRESH_test"));
             assert!(!response.contains("new-test-"));
+            assert!(!response.contains("id_token"));
+            assert!(!response.contains("synthetic-id"));
         } else {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             assert!(response.is_empty());
@@ -1239,6 +1281,87 @@ mod tests {
     #[tokio::test]
     async fn oauth_lease_live_commit_has_exclusive_response_reader() {
         oauth_lease_relay(LeaseEnd::AfterCommit).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_applies_on_connect_when_proxy_and_token_ports_differ() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_oauth_lease_relay(LeaseEnd::AfterCommit, true),
+        )
+        .await
+        .expect("OAuth CONNECT relay did not finish");
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_refuses_missing_dns_evidence_without_payload_trace() {
+        use tracing::instrument::WithSubscriber;
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = origin.local_addr().unwrap();
+        let mut grant =
+            serde_json::from_value::<microsandbox_types::OAuthSecret>(serde_json::json!({
+                "broker_endpoint": "/unused-synthetic-broker.sock",
+                "grant_id": "fixture",
+                "token_endpoint": format!("https://example.com:{}/token", addr.port()),
+                "inject_hosts": [{"exact":"example.com"}],
+                "access_token_field": "access_token",
+                "refresh_token_field": "refresh_token",
+                "access_env_var": "ACCESS",
+                "refresh_env_var": "REFRESH",
+                "access_sentinel": "$ACCESS",
+                "refresh_sentinel": "$REFRESH"
+            }))
+            .unwrap();
+        let shared = Arc::new(SharedState::new(4));
+        assert!(
+            OAuthConnection::new_tls_intercepted(
+                std::slice::from_ref(&grant),
+                "example.com",
+                addr.port(),
+                addr.ip(),
+                &shared
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "an ordinary grant keeps its DNS relevance behavior"
+        );
+        grant.omit_token_response_fields = vec!["id_token".into()];
+        let state = test_tls_state(SecretsConfig {
+            oauth: vec![grant],
+            ..Default::default()
+        });
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let (_from_tx, from_rx) = mpsc::channel(4);
+        let (to_tx, mut to_rx) = mpsc::channel(4);
+        let error = intercept_relay(
+            addr,
+            UpstreamTcpTarget::direct(addr),
+            "example.com",
+            false,
+            b"synthetic-payload".to_vec(),
+            from_rx,
+            to_tx,
+            shared,
+            state,
+            Arc::new(ProxyConnectState::default()),
+            None,
+            None,
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("requires DNS evidence"));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(to_rx.recv().await.is_none());
+        assert!(futures::poll!(Box::pin(origin.accept())).is_pending());
+        let logs = buffer.0.lock().unwrap();
+        assert!(!String::from_utf8_lossy(&logs).contains("synthetic-payload"));
     }
 
     #[tokio::test]

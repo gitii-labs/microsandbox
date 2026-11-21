@@ -45,7 +45,7 @@ impl SandboxConfig {
         resolved_json: &str,
         caller_config_overrides_json: Option<&str>,
     ) -> MicrosandboxResult<Self> {
-        let mut config: Self = serde_json::from_str(resolved_json)?;
+        let mut config = Self::decode_stored(resolved_json)?;
         if let Some(json) = caller_config_overrides_json {
             // Check the envelope before interpreting the patch: an older writer
             // may have invalidated overrides whose shape we no longer support.

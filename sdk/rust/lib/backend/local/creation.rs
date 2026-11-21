@@ -275,8 +275,7 @@ pub(crate) async fn complete(
             "SELECT config FROM sandbox WHERE id = ?",
             [id.into()],
         )).await?.ok_or_else(|| MicrosandboxError::Runtime("creation owner disappeared".into()))?;
-        let config: crate::sandbox::SandboxConfig =
-            serde_json::from_str(&row.try_get::<String>("", "config")?)?;
+        let config = crate::sandbox::SandboxConfig::decode_stored(&row.try_get::<String>("", "config")?)?;
         let expected = if status == SandboxStatus::Running {
             "status = 'Starting'"
         } else {

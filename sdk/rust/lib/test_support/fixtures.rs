@@ -3,7 +3,7 @@
 use microsandbox_db::compat as db_compat;
 use serde_json::{Value, json};
 
-use crate::test_support::json::UniqueValue;
+use crate::json::UniqueValue;
 use crate::{MicrosandboxError, MicrosandboxResult, SandboxConfig};
 
 //--------------------------------------------------------------------------------------------------

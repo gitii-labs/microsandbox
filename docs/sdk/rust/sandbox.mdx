@@ -1052,6 +1052,8 @@ async fn connect_or_create(self) -> MicrosandboxResult<Sandbox>
 
 Reuse or create the sandbox with this name. The method connects when it is running, waits while it is starting, starts it when it is created, stopped, or crashed, and creates it only when the name is unused. Builder configuration applies only to a new sandbox. Concurrent callers reuse the same sandbox. Combining this method with [`replace()`](#sandbox-replace) returns `InvalidConfig`.
 
+If invalid initial network settings prevent a supplied `.network(...)` closure from running, the method returns that configuration error before lookup. Use `create()` to request OAuth token response field omission.
+
 <p className="msb-label">Returns</p>
 
 `MicrosandboxResult<`[`Sandbox`](#instance-methods)`>`

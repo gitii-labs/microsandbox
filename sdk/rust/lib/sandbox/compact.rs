@@ -102,7 +102,7 @@ impl DiskCompactionBuilder {
             .one(local.db().await?.read())
             .await?
             .ok_or_else(|| MicrosandboxError::SandboxNotFound(self.name.clone()))?;
-        let config: SandboxConfig = serde_json::from_str(&model.config)?;
+        let config = SandboxConfig::decode_stored(&model.config)?;
         crate::LocalBackend::validate_completed_restore(&config)?;
         validate_root_selection(&config, &target)?;
         if model.status == SandboxStatus::Running {
@@ -148,7 +148,7 @@ impl DiskCompactionBuilder {
 
         let storage = CreationStorage::acquire(local, &self.name)?;
         let runtime_dir = storage.join("runtime");
-        let current_config: SandboxConfig = serde_json::from_str(&current.config)?;
+        let current_config = SandboxConfig::decode_stored(&current.config)?;
         crate::LocalBackend::validate_completed_restore(&current_config)?;
         crate::runtime::protected_state::prepare(local, &current_config, &storage).await?;
         // The configuration can change before ownership is acquired. Classify the root from

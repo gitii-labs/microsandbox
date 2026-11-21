@@ -36,7 +36,7 @@ use super::{
 };
 #[cfg(feature = "local")]
 use crate::UnsupportedReason;
-use crate::backend::default_backend;
+use crate::backend::{default_backend, with_backend};
 use crate::config::layers::BackendConfig;
 #[cfg(feature = "local")]
 use crate::config::{GlobalConfig, GlobalConfigPatch};
@@ -55,6 +55,8 @@ pub struct SandboxBuilder {
     pub(crate) config: SandboxConfigPatch,
     detached: bool,
     pub(crate) build_error: Option<crate::MicrosandboxError>,
+    #[cfg(feature = "net")]
+    network_error_blocks_join: bool,
     /// Raw script snippets supplied through construction patches. They are materialized only when
     /// building so later shell overrides determine their shebang.
     config_scripts: BTreeMap<String, String>,
@@ -137,6 +139,8 @@ impl SandboxBuilder {
             config,
             detached: false,
             build_error: None,
+            #[cfg(feature = "net")]
+            network_error_blocks_join: false,
             config_scripts: BTreeMap::new(),
             config_source: ConfigSource::default(),
         }
@@ -749,26 +753,12 @@ impl SandboxBuilder {
         let network = match self.local_network_config() {
             Ok(network) => network,
             Err(err) => {
-                if self.build_error.is_none() {
-                    self.build_error = Some(err);
-                }
+                // The caller's closure did not run, so its policy intent is unknown.
+                self.record_network_build_error(err, true);
                 return self;
             }
         };
-        match f(NetworkBuilder::from_config(network)).build() {
-            Ok(net) => {
-                if let Err(err) = self.set_local_network_config(net)
-                    && self.build_error.is_none()
-                {
-                    self.build_error = Some(err);
-                }
-            }
-            Err(err) => {
-                if self.build_error.is_none() {
-                    self.build_error = Some(err.into());
-                }
-            }
-        }
+        self.apply_network_builder(f(NetworkBuilder::from_config(network)), |_| {});
         self
     }
 
@@ -993,28 +983,16 @@ impl SandboxBuilder {
         oauth: microsandbox_network::secrets::config::OAuthSecret,
     ) -> Self {
         match self.local_network_config() {
-            Ok(network) => {
-                let network = microsandbox_network::builder::NetworkBuilder::from_config(network)
-                    .oauth_secret(oauth)
-                    .build();
-                let mut network = match network {
-                    Ok(network) => network,
-                    Err(err) => {
-                        if self.build_error.is_none() {
-                            self.build_error = Some(err.into());
-                        }
-                        return self;
-                    }
-                };
-                network.tls.enabled = true;
-                if let Err(err) = self.set_local_network_config(network)
-                    && self.build_error.is_none()
-                {
-                    self.build_error = Some(err);
-                }
+            Ok(network) => self.apply_network_builder(
+                NetworkBuilder::from_config(network).oauth_secret(oauth),
+                |network| network.tls.enabled = true,
+            ),
+            Err(error) => {
+                self.record_network_build_error(
+                    error,
+                    !oauth.omit_token_response_fields.is_empty(),
+                );
             }
-            Err(err) if self.build_error.is_none() => self.build_error = Some(err),
-            Err(_) => {}
         }
         self
     }
@@ -1573,6 +1551,33 @@ impl SandboxBuilder {
         Ok(())
     }
 
+    #[cfg(feature = "net")]
+    fn apply_network_builder(
+        &mut self,
+        builder: NetworkBuilder,
+        finish: impl FnOnce(&mut microsandbox_network::config::NetworkConfig),
+    ) {
+        let omission = builder.requests_oauth_token_response_omission();
+        let result = builder
+            .build()
+            .map_err(MicrosandboxError::from)
+            .and_then(|mut network| {
+                finish(&mut network);
+                self.set_local_network_config(network)
+            });
+        if let Err(error) = result {
+            self.record_network_build_error(error, omission);
+        }
+    }
+
+    #[cfg(feature = "net")]
+    fn record_network_build_error(&mut self, error: MicrosandboxError, blocks_join: bool) {
+        self.network_error_blocks_join |= blocks_join;
+        if self.build_error.is_none() {
+            self.build_error = Some(error);
+        }
+    }
+
     /// Apply raw scripts loaded from configuration after the final shell is known.
     #[doc(hidden)]
     pub fn config_scripts(mut self, scripts: BTreeMap<String, String>) -> Self {
@@ -1777,31 +1782,64 @@ impl SandboxBuilder {
     /// are connected and stopped ones are started. Builder configuration is
     /// used only when this call creates the sandbox. A concurrent creator is
     /// handled by connecting to and converging on the winner.
+    ///
+    /// If invalid initial network settings prevent a supplied `network` closure
+    /// from running, this method returns the configuration error before lookup.
+    /// Use [`Self::create`] when requesting OAuth token response field omission.
     pub async fn connect_or_create(self) -> MicrosandboxResult<Sandbox> {
         if self.config.replace_existing.unwrap_or(false) {
             return Err(MicrosandboxError::InvalidConfig(
                 "connect_or_create cannot be combined with replace_existing".to_string(),
             ));
         }
-
+        #[cfg(feature = "net")]
+        if self.network_error_blocks_join {
+            return Err(self.build_error.unwrap_or_else(oauth_omission_join_error));
+        }
+        refuse_oauth_omission_on_join(&self.config)?;
+        let backend = default_backend();
+        self.validate_connect_or_create_policy(backend.as_ref())?;
         let name = self.config.spec.name.clone().unwrap_or_default();
         let detached = self.detached;
-        match Sandbox::get(&name).await {
-            Ok(handle) => return handle.connect_or_start_with_mode(detached).await,
-            Err(MicrosandboxError::SandboxNotFound(_)) => {}
-            Err(error) => return Err(error),
-        }
-
-        match self.create().await {
-            Ok(sandbox) => Ok(sandbox),
-            Err(MicrosandboxError::SandboxAlreadyExists(_)) => {
-                Sandbox::get(&name)
-                    .await?
-                    .connect_or_start_with_mode(detached)
-                    .await
+        with_backend(backend, async move {
+            match Sandbox::get(&name).await {
+                Ok(handle) => return handle.connect_or_start_with_mode(detached).await,
+                Err(MicrosandboxError::SandboxNotFound(_)) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
-        }
+
+            match self.create().await {
+                Ok(sandbox) => Ok(sandbox),
+                Err(MicrosandboxError::SandboxAlreadyExists(_)) => {
+                    Sandbox::get(&name)
+                        .await?
+                        .connect_or_start_with_mode(detached)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await
+    }
+
+    fn validate_connect_or_create_policy(
+        &self,
+        backend: &dyn crate::Backend,
+    ) -> MicrosandboxResult<()> {
+        // Resolve just the policy before either lookup. Image and portable
+        // snapshot metadata cannot supply OAuth grants.
+        let options = match &self.config_source {
+            ConfigSource::ExistingConfig(resolved) => {
+                (**resolved).clone().overlay(self.rebuild_overrides())
+            }
+            ConfigSource::ResolvedSnapshot(resolved) => (**resolved).clone(),
+            ConfigSource::Fresh | ConfigSource::Snapshot(_) => self.config.clone(),
+        };
+        let effective = match BackendConfig::for_backend(backend) {
+            Some(config) => config.sandbox_layers().options(options).build(),
+            None => options,
+        };
+        refuse_oauth_omission_on_join(&effective)
     }
 
     /// Create the sandbox for detached/background use.
@@ -2328,6 +2366,31 @@ impl SandboxBuilder {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+fn refuse_oauth_omission_on_join(options: &SandboxConfigPatch) -> MicrosandboxResult<()> {
+    // The winner of a lookup or name race can have a different network policy.
+    if options
+        .spec
+        .network
+        .secrets
+        .as_ref()
+        .and_then(|secrets| secrets.oauth.as_ref())
+        .is_some_and(|grants| {
+            grants
+                .iter()
+                .any(|grant| !grant.omit_token_response_fields.is_empty())
+        })
+    {
+        return Err(oauth_omission_join_error());
+    }
+    Ok(())
+}
+
+fn oauth_omission_join_error() -> MicrosandboxError {
+    MicrosandboxError::InvalidConfig(
+        "OAuth token response field omission requires create, not connect_or_create".into(),
+    )
+}
+
 /// Populate local restore inputs without changing capture semantics during backend dispatch.
 #[cfg(feature = "local")]
 pub(crate) fn prepare_local_snapshot_restore(
@@ -2723,6 +2786,8 @@ impl From<SandboxConfig> for SandboxBuilder {
             config: caller_overrides,
             detached: false,
             build_error: None,
+            #[cfg(feature = "net")]
+            network_error_blocks_join: false,
             config_scripts: BTreeMap::new(),
             config_source: ConfigSource::ExistingConfig(Box::new(patch)),
         }

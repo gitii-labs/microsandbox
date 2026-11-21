@@ -135,9 +135,10 @@ fn format_ts(source: &str) -> String {
     let options = FormatTextOptions {
         config: &config,
         path: Path::new("bindings.ts"),
-        text: source.to_string(),
+        text: source.into(),
         extension: None,
         external_formatter: None,
+        arena_pool: None,
     };
     match format_text(options) {
         Ok(Some(formatted)) => formatted,

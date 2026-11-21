@@ -16,6 +16,8 @@
 
 #[cfg(feature = "engine")]
 mod engine;
+#[cfg(feature = "intercept-ca")]
+mod intercept_ca;
 mod model;
 pub mod proxy;
 
