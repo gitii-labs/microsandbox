@@ -345,7 +345,7 @@ async fn capture_installed(
         ));
     }
 
-    let sandbox_config: SandboxConfig = serde_json::from_str(&current.config)?;
+    let sandbox_config = SandboxConfig::decode_stored(&current.config)?;
     creation::require_complete(db, current.id, &source_sandbox).await?;
     LocalBackend::validate_completed_restore(&sandbox_config)?;
 
@@ -688,7 +688,7 @@ pub(super) async fn create_snapshot_archive(
         return Err(MicrosandboxError::SnapshotSandboxRunning(source_sandbox));
     }
 
-    let sandbox_config: SandboxConfig = serde_json::from_str(&current.config)?;
+    let sandbox_config = SandboxConfig::decode_stored(&current.config)?;
     creation::require_complete(db, current.id, &source_sandbox).await?;
     LocalBackend::validate_completed_restore(&sandbox_config)?;
 
@@ -896,7 +896,7 @@ async fn capture_full_snapshot(
         ));
     }
     crate::runtime::protected_state::require_running(local, source_sandbox)?;
-    let sandbox_config: SandboxConfig = serde_json::from_str(&model.config)?;
+    let sandbox_config = SandboxConfig::decode_stored(&model.config)?;
     LocalBackend::validate_completed_restore(&sandbox_config)?;
     let manifest_digest = sandbox_config.manifest_digest.clone().ok_or_else(|| {
         MicrosandboxError::InvalidConfig(format!(

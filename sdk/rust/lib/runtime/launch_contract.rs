@@ -1317,7 +1317,7 @@ mod tests {
         };
         let encoded = machine.encode(&launch).unwrap();
         assert_eq!(
-            encoded["network"]["config"]["secrets"]["oauth"][0]["token_response_omission_v1"]["omit_token_response_fields"],
+            encoded["network"]["config"]["secrets"]["oauth"][0]["omit_token_response_fields"],
             json!(["id_token"])
         );
         let runtime: LaunchConfig = serde_json::from_value(encoded).unwrap();

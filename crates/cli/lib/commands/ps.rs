@@ -120,7 +120,7 @@ fn print_json(handles: &[SandboxHandle], single: bool) -> anyhow::Result<()> {
 }
 
 fn status_row(handle: &SandboxHandle) -> StatusRow {
-    let config = serde_json::from_str::<SandboxConfig>(handle.config_json()).ok();
+    let config = display_config(handle);
     let image = config
         .as_ref()
         .map(extract_image)
@@ -152,7 +152,7 @@ fn status_row(handle: &SandboxHandle) -> StatusRow {
 }
 
 fn status_json(handle: &SandboxHandle) -> serde_json::Value {
-    let config = serde_json::from_str::<SandboxConfig>(handle.config_json()).ok();
+    let config = display_config(handle);
     let status = format!("{:?}", handle.status_snapshot());
     let resources = resource_config(handle, config.as_ref());
     let resources = resources.as_ref().map(|c| &c.spec.resources);
@@ -169,6 +169,12 @@ fn status_json(handle: &SandboxHandle) -> serde_json::Value {
         "thp": resources.map(|r| r.thp.as_str()),
         "ports": config.as_ref().map(format_ports_raw).unwrap_or_default(),
     })
+}
+
+fn display_config(handle: &SandboxHandle) -> Option<SandboxConfig> {
+    serde_json::from_str(handle.config_json())
+        .or_else(|_| handle.config())
+        .ok()
 }
 
 /// Resolve the config whose resource allocations describe the sandbox now:

@@ -595,7 +595,7 @@ pub(super) async fn apply(
             active.update_labels(&builder.patch);
             Some(ActiveLabelsUpdate {
                 expected_json,
-                active_config_json: serde_json::to_string(active)?,
+                active_config_json: active.encode_stored()?,
             })
         } else {
             None
@@ -1224,7 +1224,7 @@ async fn persist_config(
 
     let labels = config.spec.labels.clone();
     let write_db = local_backend.db().await?.write();
-    let config_json = serde_json::to_string(config)?;
+    let config_json = config.encode_stored()?;
     let caller_config_overrides_json = config.caller_config_overrides_json(&config_json)?;
 
     write_db

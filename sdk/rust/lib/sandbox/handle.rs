@@ -310,7 +310,7 @@ impl SandboxHandle {
     pub fn active_config(&self) -> MicrosandboxResult<Option<SandboxConfig>> {
         Ok(self
             .active_config_json()
-            .map(serde_json::from_str::<SandboxConfig>)
+            .map(SandboxConfig::decode_stored)
             .transpose()?)
     }
 
@@ -994,7 +994,7 @@ fn is_local_ephemeral_handle(inner: &SandboxHandleInner) -> bool {
         return false;
     };
 
-    serde_json::from_str::<SandboxConfig>(&state.config_json)
+    SandboxConfig::decode_stored(&state.config_json)
         .map(|config| config.spec.lifecycle.ephemeral)
         .unwrap_or(false)
 }

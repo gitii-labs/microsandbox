@@ -198,19 +198,8 @@ to the native library. Old SDKs and existing grants do not need either capabilit
 The new policy is single-tenant and requires intercepted TCP ports with QUIC
 blocked and no TLS bypass for the token or poll hosts.
 
-Local saved and launch policies encode only an opted-in grant in a
-`token_response_omission_v1` envelope. Older readers that recognize `oauth`
-require routing fields at the top level and reject the entry, as verified
-with the fork's `v0.7.13-gitii.5`. Pre-OAuth readers, such as v0.6.0, can
-ignore the whole `oauth` key. Do not point those executables directly at an
-opted-in catalog. Use a separate home for old tooling or keep all catalog
-operators on a supporting release. Current `self downgrade` checks both
-saved config columns and requires the staged target to advertise omission
-before changing the installation. Other sandboxes in the same catalog and
-grants with no omission retain their previous representation. No schema migration, guest protocol, or broker
-protocol change is required. Rust callers using exhaustive `OAuthSecret`
-literals must initialize the added field. Go callers using keyed
-`OAuthSecretConfig` literals can leave it unset.
+Rust callers using exhaustive `OAuthSecret` literals must initialize the added
+field. Go callers using keyed `OAuthSecretConfig` literals can leave it unset.
 
 OAuth token forwarding observes the existing acquired broker socket until the
 provider response is complete. EOF, socket errors or unsolicited broker data
@@ -306,6 +295,17 @@ The SQLite database under `MSB_HOME` is a durable protocol between releases. Hos
 On Unix, catalog identity checks read filesystem metadata without opening an extra descriptor. Control and metrics lookups share one database identity per backend. On macOS, that identity retains a dedicated read-only SQLite connection, including after ordinary pool connections expire. SQLite owns that connection's close so verification and identity teardown preserve other connections' POSIX locks. Linux retains its `O_PATH` handles and Windows retains its file handles. Database replacement detection, schemas, journal modes, and SDK/runtime protocols are unchanged.
 
 Compatibility-sensitive elements include migration IDs and order, migration semantics, schema columns and constraints, persisted enum/tag spellings, JSON configuration shapes, desired versus active configuration, install and maintenance leases, allocation state, recovery journals, and the downgrade floor.
+
+For a local sandbox with OAuth token response omission, both desired and active
+configuration writers encode `network.enabled` as
+`{"oauth_token_response_omission_v1": <bool>}`. Historical typed config readers
+require a boolean there and refuse the protected row before using its config,
+even if they do not recognize `network.secrets.oauth`. The current catalog
+decoder requires the marker and a nonempty omission policy together. Public
+configuration input and launch JSON retain the normal boolean and grant shapes.
+Other sandboxes retain their existing bytes; no schema migration or catalog-wide
+admission gate is added. The current `self downgrade` checks both saved columns
+and requires support from the staged binary before applying the downgrade.
 
 Evolution rules:
 

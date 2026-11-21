@@ -455,7 +455,7 @@ async fn authorized_source_mount(
         return Ok(None);
     };
     let source: SandboxConfig =
-        serde_json::from_str(model.active_config.as_deref().unwrap_or(&model.config))?;
+        SandboxConfig::decode_stored(model.active_config.as_deref().unwrap_or(&model.config))?;
     Ok(source
         .spec
         .mounts

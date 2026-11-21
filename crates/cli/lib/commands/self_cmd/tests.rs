@@ -1161,16 +1161,17 @@ async fn oauth_omission_downgrade_refuses_either_saved_column_without_mutation()
         .unwrap();
     let ordinary = r#"{"network":{"secrets":{"oauth":[{"grant_id":"ordinary","omit_token_response_fields":[]}]}}}"#;
     let saved = |grant: &str| format!(r#"{{"network":{{"secrets":{{"oauth":[{grant}]}}}}}}"#);
-    let protected =
-        saved(r#"{"token_response_omission_v1":{"omit_token_response_fields":["id_token"]}}"#);
+    let protected = r#"{"network":{"enabled":{"oauth_token_response_omission_v1":true},"secrets":{"oauth":[{"omit_token_response_fields":["id_token"]}]}}}"#;
+    let marker_only = r#"{"network":{"enabled":{"oauth_token_response_omission_v1":true}}}"#;
     let plain = saved(r#"{"grant_id":"synthetic","omit_token_response_fields":["id_token"]}"#);
     let staged = std::env::var_os("MSB_OAUTH_OLD_TARGET")
         .map_or_else(|| dir.path().join("missing-target"), PathBuf::from);
 
     for (config, active, refused_column) in [
         (ordinary, ordinary, None),
-        (&protected, ordinary, Some("config")),
-        (ordinary, &protected, Some("active_config")),
+        (protected, ordinary, Some("config")),
+        (ordinary, protected, Some("active_config")),
+        (marker_only, ordinary, Some("config")),
         (ordinary, &plain, Some("active_config")),
     ] {
         db.inner()

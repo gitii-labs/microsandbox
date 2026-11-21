@@ -319,7 +319,7 @@ impl LocalBackend {
                 // additionally prove exit; a legacy runtime's unused lock proves nothing.
                 let _disk_guards = if let Some(model) = model.as_ref() {
                     let config: crate::sandbox::SandboxConfig =
-                        serde_json::from_str::<SandboxConfig>(&model.config)?;
+                        SandboxConfig::decode_stored(&model.config)?;
                     match crate::runtime::owned_volumes::try_acquire_disk_guards(
                         &self.sandboxes_dir().join(name),
                         &config.spec.mounts,

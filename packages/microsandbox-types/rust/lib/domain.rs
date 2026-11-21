@@ -2640,11 +2640,7 @@ pub struct SecretsConfig {
     pub secrets: Vec<SecretEntry>,
 
     /// OAuth grants whose token material is held by a host broker.
-    #[serde(default, with = "crate::compat::oauth_response_policy")]
-    #[cfg_attr(
-        feature = "ts",
-        ts(type = "Array<OAuthSecret | { token_response_omission_v1: OAuthSecret }>")
-    )]
+    #[serde(default)]
     pub oauth: Vec<OAuthSecret>,
 
     /// Default action when a placeholder leaks to a disallowed host.
@@ -4871,43 +4867,6 @@ mod tests {
         let mut grant = device_flow_oauth();
         grant.token_endpoint = "https://auth.example.com/token?legacy=true".into();
         assert_eq!(grant.validate(0), Ok(()));
-    }
-
-    #[test]
-    fn oauth_omission_wraps_only_protected_grants_in_saved_config_and_patches() {
-        let ordinary = device_flow_oauth();
-        let mut protected = ordinary.clone();
-        protected.omit_token_response_fields = vec!["id_token".into()];
-        let plain = serde_json::to_value(&ordinary).unwrap();
-        assert!(plain.get("omit_token_response_fields").is_none());
-        let config = SecretsConfig {
-            oauth: vec![ordinary, protected],
-            ..Default::default()
-        };
-        let saved = serde_json::to_value(&config).unwrap();
-        assert_eq!(saved["oauth"][0], plain);
-        let wrapped = &saved["oauth"][1];
-        assert!(wrapped.get("grant_id").is_none());
-        assert_eq!(
-            wrapped["token_response_omission_v1"]["omit_token_response_fields"],
-            serde_json::json!(["id_token"])
-        );
-        let restored: SecretsConfig = serde_json::from_value(saved.clone()).unwrap();
-        assert_eq!(serde_json::to_value(restored).unwrap(), saved);
-
-        let mut ambiguous = plain.clone();
-        ambiguous["token_response_omission_v1"] = serde_json::Value::Null;
-        assert!(
-            serde_json::from_value::<SecretsConfig>(serde_json::json!({ "oauth": [ambiguous] }))
-                .is_err()
-        );
-        let patch = serde_json::to_value(SecretsConfigPatch::from_present_fields(config)).unwrap();
-        assert_eq!(patch["oauth"], saved["oauth"]);
-        let patch: SecretsConfigPatch = serde_json::from_value(patch).unwrap();
-        assert_eq!(
-            patch.into_config().oauth[1].omit_token_response_fields,
-            ["id_token"]
-        );
     }
 
     #[test]

@@ -64,8 +64,7 @@ pub async fn prepare<C: ConnectionTrait>(db: &C, version: &Version) -> Result<()
 }
 
 /// Find the first saved OAuth omission policy in either configuration column.
-/// Inspect raw JSON: both the protected envelope and an explicitly opted-in
-/// plain grant require a target that can enforce omission.
+/// Recognize the local network discriminator and explicit omission fields.
 pub async fn saved_oauth_omission<C: ConnectionTrait>(
     db: &C,
 ) -> Result<Option<(i64, &'static str)>, DbErr> {
@@ -86,11 +85,11 @@ pub async fn saved_oauth_omission<C: ConnectionTrait>(
             .query_one_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
                 format!(
-                    "SELECT sandbox.id FROM sandbox, json_each(CASE WHEN json_valid({column}) \
-                     THEN json_extract({column}, '$.network.secrets.oauth') END) AS grant \
-                     WHERE CASE WHEN grant.type = 'object' THEN \
-                       json_type(grant.value, '$.token_response_omission_v1') IS NOT NULL OR \
-                       json_array_length(grant.value, '$.omit_token_response_fields') > 0 END \
+                    "SELECT sandbox.id FROM sandbox WHERE CASE WHEN json_valid({column}) THEN \
+                       json_type({column}, '$.network.enabled.oauth_token_response_omission_v1') IS NOT NULL OR \
+                       EXISTS (SELECT 1 FROM json_each({column}, '$.network.secrets.oauth') AS grant \
+                         WHERE CASE WHEN grant.type = 'object' THEN \
+                           json_array_length(grant.value, '$.omit_token_response_fields') > 0 END) END \
                      LIMIT 1"
                 ),
             ))

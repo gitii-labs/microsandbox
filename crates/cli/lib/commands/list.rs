@@ -77,7 +77,7 @@ pub async fn run(args: ListArgs) -> anyhow::Result<()> {
     let mut table = ui::Table::new(&["NAME", "IMAGE", "STATUS", "CREATED"]);
 
     for s in &filtered {
-        let image = extract_image(s.config_json());
+        let image = extract_image(s);
         let status = format!("{:?}", s.status_snapshot());
         let created = s
             .created_at()
@@ -97,9 +97,10 @@ pub async fn run(args: ListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Extract image name from config JSON.
-fn extract_image(config_json: &str) -> String {
-    serde_json::from_str::<SandboxConfig>(config_json)
+/// Extract image name from saved configuration.
+fn extract_image(handle: &SandboxHandle) -> String {
+    serde_json::from_str::<SandboxConfig>(handle.config_json())
+        .or_else(|_| handle.config())
         .ok()
         .map(|c| match c.spec.image {
             microsandbox::sandbox::RootfsSource::Oci(ref oci) => oci.reference.clone(),
@@ -121,7 +122,7 @@ fn print_json(sandboxes: &[SandboxHandle]) -> anyhow::Result<()> {
                 "name": s.name(),
                 "status": format!("{:?}", s.status_snapshot()),
                 "created_at": s.created_at().map(|dt| ui::format_json_datetime(&dt)),
-                "image": extract_image(s.config_json()),
+                "image": extract_image(s),
             })
         })
         .collect();
