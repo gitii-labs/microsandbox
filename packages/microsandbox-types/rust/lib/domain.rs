@@ -3080,8 +3080,8 @@ impl SecretsConfig {
             for endpoint in
                 std::iter::once(grant.token_endpoint.as_str()).chain(grant.poll_endpoint.as_deref())
             {
-                let (host, port) = oauth_endpoint_authority(endpoint)
-                    .filter(|(host, _)| !host.contains('@'))
+                let (host, port, _) = oauth_endpoint_parts(endpoint)
+                    .filter(|(host, _, _)| !host.contains('@'))
                     .ok_or_else(|| invalid("invalid HTTPS token or poll endpoint"))?;
                 let port = port
                     .map(str::parse::<u16>)
@@ -3151,6 +3151,23 @@ impl SecretsConfig {
 }
 
 impl OAuthSecret {
+    /// Whether an OAuth endpoint path can be compared without normalization.
+    /// Request matching calls this on the path alone, after removing the query.
+    pub fn is_normalized_endpoint_path(path: &str) -> bool {
+        path.starts_with('/')
+            && !path.contains(['%', ';', '#', '?'])
+            && !path.contains("//")
+            && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+    }
+
+    /// Whether a protected OAuth endpoint path is safe to compare as-is.
+    pub fn is_protected_endpoint_path(path: &str) -> bool {
+        Self::is_normalized_endpoint_path(path)
+            && path
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b'\\')
+    }
+
     /// Validate durable OAuth metadata without contacting the broker.
     pub fn validate(&self, grant_index: usize) -> Result<(), SecretConfigError> {
         let invalid = |reason| SecretConfigError::InvalidOAuth {
@@ -3192,6 +3209,36 @@ impl OAuthSecret {
                 "poll_endpoint must include a host and path",
                 grant_index,
             )?;
+        }
+        if !self.omit_token_response_fields.is_empty() {
+            for endpoint in
+                std::iter::once(self.token_endpoint.as_str()).chain(self.poll_endpoint.as_deref())
+            {
+                let (host, port, path) = oauth_endpoint_parts(endpoint)
+                    .ok_or_else(|| invalid("invalid HTTPS token or poll endpoint"))?;
+                // TLS and CONNECT name DNS destinations without a trailing
+                // dot. Reject spellings the connection matcher cannot select.
+                if host.parse::<std::net::IpAddr>().is_ok()
+                    || !host.split('.').all(|label| {
+                        !label.is_empty()
+                            && !label.starts_with('-')
+                            && !label.ends_with('-')
+                            && label
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    })
+                {
+                    return Err(invalid("token and poll endpoints must use a DNS hostname"));
+                }
+                if port.is_some_and(|port| !port.parse::<u16>().is_ok_and(|port| port != 0)) {
+                    return Err(invalid("invalid token or poll endpoint port"));
+                }
+                if !Self::is_protected_endpoint_path(path) {
+                    return Err(invalid(
+                        "token and poll endpoints must use a normalized path without a query or fragment",
+                    ));
+                }
+            }
         }
         if self.inject_hosts.is_empty() {
             return Err(invalid("at least one inject host is required"));
@@ -3458,15 +3505,16 @@ fn validate_mint_endpoint(
 
 /// The bare hostname of an `https://host[:port]/path` endpoint.
 fn oauth_endpoint_host(endpoint: &str) -> Option<&str> {
-    oauth_endpoint_authority(endpoint).map(|(host, _)| host)
+    oauth_endpoint_parts(endpoint).map(|(host, _, _)| host)
 }
 
-fn oauth_endpoint_authority(endpoint: &str) -> Option<(&str, Option<&str>)> {
-    let authority = endpoint.strip_prefix("https://")?.split('/').next()?;
+fn oauth_endpoint_parts(endpoint: &str) -> Option<(&str, Option<&str>, &str)> {
+    let rest = endpoint.strip_prefix("https://")?;
+    let (authority, path) = rest.split_at(rest.find('/')?);
     let (host, port) = authority
         .rsplit_once(':')
         .map_or((authority, None), |(host, port)| (host, Some(port)));
-    (!host.is_empty()).then_some((host, port))
+    (!host.is_empty()).then_some((host, port, path))
 }
 
 fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), SecretConfigError> {
@@ -4792,6 +4840,37 @@ mod tests {
                 .validate_oauth_token_response_omission(&tls, DeploymentProfile::MultiTenant)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn oauth_omission_refuses_urls_that_cannot_be_matched_safely() {
+        for url in [
+            "https://auth.example.com/token?code=secret",
+            "https://auth.example.com/token#fragment",
+            "https://auth.example.com/%74oken",
+            "https://auth.example.com/oauth//token",
+            "https://auth.example.com/oauth/../token",
+            "https://auth.example.com/oauth;/token",
+            "https://auth.example.com/oauth\\token",
+            "https://auth.example.com./token",
+            "https://auth.example.com:0/token",
+            "https://user@auth.example.com/token",
+            "https://127.0.0.1/token",
+        ] {
+            for token in [true, false] {
+                let mut grant = device_flow_oauth();
+                if token {
+                    grant.token_endpoint = url.into();
+                } else {
+                    grant.poll_endpoint = Some(url.into());
+                }
+                grant.omit_token_response_fields = vec!["id_token".into()];
+                assert!(grant.validate(0).is_err(), "{url}");
+            }
+        }
+        let mut grant = device_flow_oauth();
+        grant.token_endpoint = "https://auth.example.com/token?legacy=true".into();
+        assert_eq!(grant.validate(0), Ok(()));
     }
 
     #[test]

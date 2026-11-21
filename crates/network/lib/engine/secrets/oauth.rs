@@ -435,20 +435,32 @@ impl OAuthConnection {
                 .as_deref()
                 .map(parse_https_endpoint)
                 .transpose()?;
-            let host_allowed = |matches: bool| {
-                matches
-                    && identity.is_none_or(|(guest_ip, shared)| {
-                        shared.any_resolved_hostname(guest_ip, |hostname| {
-                            hostname.eq_ignore_ascii_case(sni)
-                        })
+            let dns_attested = || {
+                identity.is_none_or(|(guest_ip, shared)| {
+                    shared.any_resolved_hostname(guest_ip, |hostname| {
+                        hostname.eq_ignore_ascii_case(sni)
                     })
+                })
             };
+            let endpoint_here = |endpoint: &Endpoint| {
+                port == endpoint.port && endpoint.host.eq_ignore_ascii_case(sni)
+            };
+            // Discover protected response routes before DNS admission. Treating
+            // an unattested route as irrelevant would forward and trace it raw.
+            if !config.omit_token_response_fields.is_empty()
+                && (endpoint_here(&token) || poll.as_ref().is_some_and(endpoint_here))
+                && !dns_attested()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "OAuth token response field omission requires DNS evidence for the destination",
+                ));
+            }
+            let host_allowed = |matches: bool| matches && dns_attested();
             // Every endpoint of the flow makes the grant relevant: the device
             // code endpoint carries no secret, but the connection that reaches
             // it also carries the poll and token requests that do.
-            let is_relevant = |endpoint: &Endpoint| {
-                port == endpoint.port && host_allowed(endpoint.host.eq_ignore_ascii_case(sni))
-            };
+            let is_relevant = |endpoint: &Endpoint| host_allowed(endpoint_here(endpoint));
             let endpoint_relevant = is_relevant(&token)
                 || device_code.as_ref().is_some_and(is_relevant)
                 || poll.as_ref().is_some_and(is_relevant);
@@ -868,7 +880,7 @@ impl OAuthConnection {
                     // ends, and each one we do not recognise is a request
                     // whose response would reach the guest unread.
                     if self.has_protected_endpoint(sni) {
-                        reject_unnormalized_target(target)?;
+                        reject_unnormalized_target(target, self.has_omission_endpoint(sni))?;
                         if let Some(kind) = self.equivalent_endpoint(sni, target) {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -1700,6 +1712,16 @@ impl OAuthConnection {
                     .mint_endpoints
                     .iter()
                     .any(|endpoint| mint_endpoint_here(endpoint, sni, port))
+        })
+    }
+
+    fn has_omission_endpoint(&self, sni: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            let here = |endpoint: &Endpoint| {
+                endpoint.port == self.connection_port && endpoint.host.eq_ignore_ascii_case(sni)
+            };
+            !grant.config.omit_token_response_fields.is_empty()
+                && (here(&grant.token) || grant.poll.as_ref().is_some_and(here))
         })
     }
 
@@ -2665,7 +2687,7 @@ fn mint_endpoint_here(endpoint: &MintEndpoint, sni: &str, port: u16) -> bool {
 ///
 /// Only the path is judged. A query string may hold anything a client wants
 /// to put in it, because nothing here is compared with it.
-fn reject_unnormalized_target(target: &str) -> io::Result<()> {
+fn reject_unnormalized_target(target: &str, omission: bool) -> io::Result<()> {
     let refuse = || {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2673,18 +2695,12 @@ fn reject_unnormalized_target(target: &str) -> io::Result<()> {
         ))
     };
     let path = target.split('?').next().unwrap_or(target);
-    // An absolute-form (`https://host/path`) or authority-form target does not
-    // start with a slash, and neither does the asterisk-form of OPTIONS.
-    if !path.starts_with('/') {
-        return refuse();
-    }
-    if path.contains('%') || path.contains("//") || path.contains(';') || path.contains('#') {
-        return refuse();
-    }
-    if path
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
+    let normalized = if omission {
+        OAuthSecret::is_protected_endpoint_path(path)
+    } else {
+        OAuthSecret::is_normalized_endpoint_path(path)
+    };
+    if !normalized {
         return refuse();
     }
     Ok(())
@@ -3889,6 +3905,23 @@ mod tests {
         }
         assert!(broker.commits().is_empty());
         assert!(broker.mints().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_refuses_a_request_path_that_needs_normalization() {
+        let broker = start_broker("synthetic-access", "synthetic-refresh");
+        let mut grant = broker_config(&broker);
+        grant.omit_token_response_fields = vec!["id_token".into()];
+        let mut connection = OAuthConnection::new(&[grant], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        let request = form_request(r"/oauth\token", "grant_type=authorization_code");
+        let error = connection
+            .transform_requests(request.as_bytes(), "auth.example.com")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin-form path"));
+        assert!(connection.exchanges.is_empty());
     }
 
     #[tokio::test]

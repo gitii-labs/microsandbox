@@ -41,7 +41,7 @@ func TestOAuthOmissionRefusesOlderPeer(t *testing.T) {
 	case "ffi":
 		want = "update the native SDK"
 	case "runtime":
-		want = "upgrade msb"
+		want = "does not support OAuth token response field omission; upgrade msb"
 	default:
 		t.Fatal("set MSB_TEST_OAUTH_OLD_PEER to ffi or runtime")
 	}
