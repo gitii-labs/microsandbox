@@ -96,13 +96,7 @@ async fn catalog_state(backend: &LocalBackend, name: &str) -> (String, String, S
     )
 }
 
-//--------------------------------------------------------------------------------------------------
-// Tests
-//--------------------------------------------------------------------------------------------------
-
-#[tokio::test]
-#[ignore = "requires Linux KVM, MSB_PATH, MSB_LIBKRUNFW_PATH, and a static MSB_TEST_OAUTH_BUSYBOX"]
-async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
+fn fixture_inputs() -> (tempfile::TempDir, PathBuf) {
     let busybox =
         PathBuf::from(std::env::var_os("MSB_TEST_OAUTH_BUSYBOX").expect("static BusyBox"));
     let scratch =
@@ -111,20 +105,41 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         .prefix("oauth-")
         .tempdir_in(scratch)
         .unwrap();
-    let home = fixture.path().join("msb");
-    let backend = |profile| {
-        Arc::new(
-            LocalBackend::builder()
-                .home(&home)
-                .config_path(home.join("user.json"))
-                .deployment_profile(profile)
-                .build_lazy()
-                .unwrap(),
-        )
-    };
-    let single = backend(DeploymentProfile::SingleTenant);
+    (fixture, busybox)
+}
+
+fn fixture_backend(directory: &Path, profile: DeploymentProfile) -> Arc<LocalBackend> {
+    let home = directory.join("msb");
+    Arc::new(
+        LocalBackend::builder()
+            .home(&home)
+            .config_path(home.join("user.json"))
+            .deployment_profile(profile)
+            .build_lazy()
+            .unwrap(),
+    )
+}
+
+async fn assert_join_refused(builder: SandboxBuilder, message: &str) {
+    let error = builder
+        .connect_or_create()
+        .await
+        .err()
+        .expect("protected request must not join");
+    assert!(error.to_string().contains(message), "{error}");
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires Linux KVM, MSB_PATH, MSB_LIBKRUNFW_PATH, and a static MSB_TEST_OAUTH_BUSYBOX"]
+async fn oauth_omission_preflights_restart_profile_and_host_sources() {
+    let (fixture, busybox) = fixture_inputs();
+    let single = fixture_backend(fixture.path(), DeploymentProfile::SingleTenant);
     let single_scope: Arc<dyn Backend> = single.clone();
-    let multi: Arc<dyn Backend> = backend(DeploymentProfile::MultiTenant);
+    let multi: Arc<dyn Backend> = fixture_backend(fixture.path(), DeploymentProfile::MultiTenant);
 
     let mut config = fixture_config(fixture.path(), "protected", &busybox);
     protect(&mut config, fixture.path());
@@ -135,7 +150,7 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
     let handle = with_backend(multi, Sandbox::get("protected"))
         .await
         .unwrap();
-    let result = handle.modify().max_memory(384u32).restart().apply().await;
+    let result = Box::pin(handle.modify().max_memory(384u32).restart().apply()).await;
     let after = catalog_state(&single, "protected").await;
     assert!(
         matches!(
@@ -164,8 +179,7 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         .unwrap();
     let missing =
         format!("HTTP CONNECT proxy: host environment variable {MISSING_PROXY_ENV} is not set");
-    let restart_error = handle
-        .restart()
+    let restart_error = Box::pin(handle.restart())
         .await
         .err()
         .expect("missing launch source must refuse restart");
@@ -174,11 +188,7 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         "{restart_error}"
     );
     assert_eq!(catalog_state(&single, "protected").await, before);
-    let modify_error = handle
-        .modify()
-        .max_memory(384u32)
-        .restart()
-        .apply()
+    let modify_error = Box::pin(handle.modify().max_memory(384u32).restart().apply())
         .await
         .unwrap_err();
     assert!(
@@ -191,53 +201,53 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         .await;
     protected.stop().await.unwrap();
     assert_eq!(output.unwrap().stdout().unwrap(), "synthetic-access");
+}
 
+#[tokio::test]
+#[ignore = "requires Linux KVM, MSB_PATH, MSB_LIBKRUNFW_PATH, and a static MSB_TEST_OAUTH_BUSYBOX"]
+async fn oauth_omission_refuses_invalid_and_concrete_join() {
+    let (fixture, busybox) = fixture_inputs();
+    let single = fixture_backend(fixture.path(), DeploymentProfile::SingleTenant);
+    let single_scope: Arc<dyn Backend> = single.clone();
     let ordinary = fixture_config(fixture.path(), "ordinary", &busybox);
-    with_backend(single_scope, async {
-        let running = SandboxBuilder::from(ordinary.clone())
-            .create()
-            .await
-            .unwrap();
-        let before = catalog_state(&single, "ordinary").await;
-        let mut requested = ordinary.clone();
-        protect(&mut requested, fixture.path());
-        let mut invalid = requested.spec.network.secrets.as_ref().unwrap().oauth[0].clone();
-        invalid.omit_token_response_fields = vec!["access_token".into()];
-        let rejected_setter = SandboxBuilder::from(ordinary.clone())
-            .oauth_secret(invalid.clone())
-            .connect_or_create()
+    with_backend(
+        single_scope,
+        Box::pin(async {
+            let running = SandboxBuilder::from(ordinary.clone())
+                .create()
+                .await
+                .unwrap();
+            let before = catalog_state(&single, "ordinary").await;
+            let mut requested = ordinary.clone();
+            protect(&mut requested, fixture.path());
+            let mut invalid = requested.spec.network.secrets.as_ref().unwrap().oauth[0].clone();
+            invalid.omit_token_response_fields = vec!["access_token".into()];
+            assert_join_refused(
+                SandboxBuilder::from(ordinary.clone()).oauth_secret(invalid.clone()),
+                "cannot omit mapped access or refresh token fields",
+            )
             .await;
-        let rejected_network = SandboxBuilder::from(ordinary.clone())
-            .network(|network| network.oauth_secret(invalid))
-            .connect_or_create()
+            assert_join_refused(
+                SandboxBuilder::from(ordinary.clone())
+                    .network(|network| network.oauth_secret(invalid)),
+                "cannot omit mapped access or refresh token fields",
+            )
             .await;
-        let protected_join = SandboxBuilder::from(requested).connect_or_create().await;
-        let ordinary_join = SandboxBuilder::from(ordinary)
-            .connect_or_create()
-            .await
-            .unwrap();
-        let after = catalog_state(&single, "ordinary").await;
-        assert_eq!(ordinary_join.id(), running.id());
-        running.stop().await.unwrap();
+            assert_join_refused(
+                SandboxBuilder::from(requested),
+                "requires create, not connect_or_create",
+            )
+            .await;
+            let ordinary_join = SandboxBuilder::from(ordinary)
+                .connect_or_create()
+                .await
+                .unwrap();
+            let after = catalog_state(&single, "ordinary").await;
+            assert_eq!(ordinary_join.id(), running.id());
+            running.stop().await.unwrap();
 
-        for rejected in [rejected_setter, rejected_network] {
-            let error = rejected
-                .err()
-                .expect("invalid omission intent must not join");
-            assert!(error.to_string().contains("omit"), "{error}");
-        }
-        let error = protected_join
-            .err()
-            .expect("protected concrete config must not join");
-        assert!(
-            matches!(
-                &error,
-                MicrosandboxError::InvalidConfig(message)
-                    if message.contains("requires create, not connect_or_create")
-            ),
-            "{error}"
-        );
-        assert_eq!(after, before);
-    })
+            assert_eq!(after, before);
+        }),
+    )
     .await;
 }
