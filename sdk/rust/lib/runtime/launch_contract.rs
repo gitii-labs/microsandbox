@@ -16,6 +16,11 @@ use std::{
 
 #[cfg(feature = "net")]
 use microsandbox_network::policy::{Action, Destination, Direction};
+#[cfg(feature = "net")]
+use microsandbox_network::{
+    ResolvedNetworkConfig,
+    config::{EnvNetworkSecretResolver, NetworkConfig},
+};
 use microsandbox_protocol::bootstrap::*;
 use microsandbox_runtime::launch::{LaunchCapabilities, LaunchConfig};
 #[cfg(feature = "net")]
@@ -717,11 +722,26 @@ pub(crate) async fn validate_runtime_config(
     contract
         .require_network_capabilities(&runtime.msb_path, &network)
         .await?;
+    #[cfg(feature = "net")]
+    if config.requires_oauth_omission() {
+        // Resolve and discard the launch values before any stop or persistence.
+        // Spawn resolves again; an external source can still change afterwards.
+        resolve_launch_network(network)?;
+    }
     validate_exec_limits(&runtime.msb_path, config).await?;
     validate_guest_clock(&runtime.msb_path, config).await?;
     validate_mount_table(&runtime.msb_path, config).await?;
     validate_fs_state_limit(&runtime.msb_path, global).await?;
     Ok(())
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn resolve_launch_network(
+    network: NetworkConfig,
+) -> MicrosandboxResult<ResolvedNetworkConfig> {
+    network
+        .resolve(&EnvNetworkSecretResolver)
+        .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))
 }
 
 pub(crate) async fn resolve(path: &Path) -> MicrosandboxResult<LaunchContract> {

@@ -14,6 +14,8 @@ use microsandbox::{
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serde_json::json;
 
+const MISSING_PROXY_ENV: &str = "MSB_TEST_OAUTH_MISSING_PROXY_PASSWORD";
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
@@ -135,10 +137,6 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         .unwrap();
     let result = handle.modify().max_memory(384u32).restart().apply().await;
     let after = catalog_state(&single, "protected").await;
-    let output = protected
-        .exec("/bin/sh", ["-c", "printf '%s' \"$ACCESS\""])
-        .await;
-    protected.stop().await.unwrap();
     assert!(
         matches!(
             &result,
@@ -148,6 +146,50 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         "{result:?}"
     );
     assert_eq!(after, before);
+
+    // Simulate a pending launch input in the desired row without changing the live VM.
+    assert!(std::env::var_os(MISSING_PROXY_ENV).is_none());
+    let proxy = json!({
+        "protocol":"http_connect", "address":"127.0.0.1:9",
+        "credentials":{"username":"fixture","password":{"kind":"env","var":MISSING_PROXY_ENV}}
+    });
+    single.db().await.unwrap().write().execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE sandbox SET config = json_set(config, '$.network.outbound_proxy', json(?)) WHERE name = 'protected'",
+        [proxy.to_string().into()],
+    )).await.unwrap();
+    let before = catalog_state(&single, "protected").await;
+    let handle = with_backend(single_scope.clone(), Sandbox::get("protected"))
+        .await
+        .unwrap();
+    let missing =
+        format!("HTTP CONNECT proxy: host environment variable {MISSING_PROXY_ENV} is not set");
+    let restart_error = handle
+        .restart()
+        .await
+        .err()
+        .expect("missing launch source must refuse restart");
+    assert!(
+        restart_error.to_string().contains(&missing),
+        "{restart_error}"
+    );
+    assert_eq!(catalog_state(&single, "protected").await, before);
+    let modify_error = handle
+        .modify()
+        .max_memory(384u32)
+        .restart()
+        .apply()
+        .await
+        .unwrap_err();
+    assert!(
+        modify_error.to_string().contains(&missing),
+        "{modify_error}"
+    );
+    assert_eq!(catalog_state(&single, "protected").await, before);
+    let output = protected
+        .exec("/bin/sh", ["-c", "printf '%s' \"$ACCESS\""])
+        .await;
+    protected.stop().await.unwrap();
     assert_eq!(output.unwrap().stdout().unwrap(), "synthetic-access");
 
     let ordinary = fixture_config(fixture.path(), "ordinary", &busybox);
@@ -159,6 +201,16 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         let before = catalog_state(&single, "ordinary").await;
         let mut requested = ordinary.clone();
         protect(&mut requested, fixture.path());
+        let mut invalid = requested.spec.network.secrets.as_ref().unwrap().oauth[0].clone();
+        invalid.omit_token_response_fields = vec!["access_token".into()];
+        let rejected_setter = SandboxBuilder::from(ordinary.clone())
+            .oauth_secret(invalid.clone())
+            .connect_or_create()
+            .await;
+        let rejected_network = SandboxBuilder::from(ordinary.clone())
+            .network(|network| network.oauth_secret(invalid))
+            .connect_or_create()
+            .await;
         let protected_join = SandboxBuilder::from(requested).connect_or_create().await;
         let ordinary_join = SandboxBuilder::from(ordinary)
             .connect_or_create()
@@ -168,6 +220,12 @@ async fn oauth_omission_respects_restart_profile_and_rejects_concrete_join() {
         assert_eq!(ordinary_join.id(), running.id());
         running.stop().await.unwrap();
 
+        for rejected in [rejected_setter, rejected_network] {
+            let error = rejected
+                .err()
+                .expect("invalid omission intent must not join");
+            assert!(error.to_string().contains("omit"), "{error}");
+        }
         let error = protected_join
             .err()
             .expect("protected concrete config must not join");

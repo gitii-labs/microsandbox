@@ -25,6 +25,7 @@ IMAGE = "docker.io/library/msb-oauth-omission-fixture:local"
 MARKER = {"oauth_token_response_omission_v1": True}
 UPGRADE = "does not support OAuth token response field omission; upgrade msb"
 HOST_PROFILE = "token response field omission is not supported in the multi-tenant profile"
+PROXY_PASSWORD = "MSB_TEST_OAUTH_PROXY_PASSWORD"
 
 
 def run(binary, env, *args, reject=None):
@@ -116,6 +117,7 @@ def load_image(new, env, busybox, home):
 def check_current(new, old_runtimes, firmware, busybox, home):
     home.mkdir(mode=0o700)
     env = environment(home, new, firmware)
+    env[PROXY_PASSWORD] = "synthetic-proxy-placeholder"
     assert json.loads(run(new, env, "__launch-protocol"))["oauth_token_response_omission"]
     load_image(new, env, busybox, home)
     grant = {
@@ -163,6 +165,11 @@ def check_current(new, old_runtimes, firmware, busybox, home):
             raw, = db.execute("SELECT config FROM sandbox WHERE name = 'protected'").fetchone()
             config = json.loads(raw)
             config["network"].update({**protected, "enabled": MARKER})
+            config["network"]["outbound_proxy"] = {
+                "protocol": "http_connect",
+                "address": "127.0.0.1:9",
+                "credentials": {"username": "fixture", "password": {"kind": "env", "var": PROXY_PASSWORD}},
+            }
             db.execute(
                 "UPDATE sandbox SET config = ?, caller_config_overrides = NULL WHERE name = 'protected'",
                 (json.dumps(config),),
@@ -195,6 +202,15 @@ def check_current(new, old_runtimes, firmware, busybox, home):
         finally:
             global_config.unlink()
         check("protected")
+        no_password = {key: value for key, value in env.items() if key != PROXY_PASSWORD}
+        missing = f"HTTP CONNECT proxy: host environment variable {PROXY_PASSWORD} is not set"
+        for flags in ((), ("--force",)):
+            run(new, no_password, "restart", "protected", *flags, reject=missing)
+            assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
+        run(new, no_password, "modify", "protected", "--restart", "--max-memory", "384M",
+            "--label", "proof=must-not-persist", reject=missing)
+        assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
+        check("protected")
         run(new, env, "restart", "protected")
         check("protected")
         # Fork explicitly authorizes inheriting this synthetic local grant.
@@ -210,7 +226,8 @@ def check_current(new, old_runtimes, firmware, busybox, home):
     print("current CLI preserved protected policy through live edit, restart, and fork; "
           "refused graceful and forced restart with both old runtimes and the "
           "effective multi-tenant profile without stopping; refused a restart-backed edit "
-          "under that profile without stopping or saving changes", flush=True)
+          "under that profile without stopping or saving changes; refused both paths "
+          "with a missing proxy password source", flush=True)
     return ordinary, {**ordinary, "enabled": desired["enabled"], "secrets": desired["secrets"]}
 
 

@@ -310,8 +310,10 @@ for omission without interpreting ordinary rows as current configuration. It
 validates protected rows with the catalog decoder and requires support from
 the staged binary. Both direct restart and restart-backed edits check the
 selected runtime and effective host profile before stopping a sandbox whose
-desired policy opts in. `connect_or_create` refuses an opted-in effective
-creation policy before looking up or joining an existing sandbox.
+desired policy opts in. They resolve host-backed network sources before
+stopping and again at launch; a source can change between these checks.
+`connect_or_create` refuses an opted-in effective creation policy or rejected
+opt-in builder input before looking up or joining an existing sandbox.
 
 The raw handle accessors expose the stored marker: Rust `config_json()`, Go
 `ConfigJSON()`, and Node `configJson`. Python's parsed handle `config()` and

@@ -50,7 +50,7 @@ use windows_sys::Win32::System::Threading::{
 use microsandbox_image::{Digest, GlobalCache};
 use microsandbox_metrics::{MetricsRegistry, ReserveSlot, SlotReservation};
 #[cfg(feature = "net")]
-use microsandbox_network::{ResolvedNetworkConfig, config::EnvNetworkSecretResolver};
+use microsandbox_network::ResolvedNetworkConfig;
 use microsandbox_protocol::{
     bootstrap::{
         BootstrapBlockRoot, BootstrapBlockRootUpper, BootstrapDirMount, BootstrapDiskMount,
@@ -297,10 +297,8 @@ impl LocalBackend {
         // them into the private runtime configuration before the sandbox process
         // is spawned.
         #[cfg(feature = "net")]
-        let resolved_network = config
-            .local_network_config()?
-            .resolve(&EnvNetworkSecretResolver)
-            .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))?;
+        let resolved_network =
+            launch_contract::resolve_launch_network(config.local_network_config()?)?;
 
         // Resolve the already-layered runtime paths as one compatible pair before launch.
         let global = self.config();
