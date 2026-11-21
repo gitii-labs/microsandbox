@@ -315,6 +315,11 @@ impl LocalBackend {
         .await?;
         #[cfg(not(feature = "embed-binaries"))]
         let resolved_runtime = crate::setup::resolve_runtime(global)?;
+        launch_contract::require_oauth_omission(
+            &resolved_runtime.msb_path,
+            config.requires_oauth_omission(),
+        )
+        .await?;
         ensure_sigchld_handler_uses_alt_stack_before_spawn().await?;
         launch_contract::require_protected_guest_state(&resolved_runtime.msb_path).await?;
         let launch_contract = launch_contract::resolve(&resolved_runtime.msb_path).await?;

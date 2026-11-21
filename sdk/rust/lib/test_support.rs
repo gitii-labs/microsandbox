@@ -3,7 +3,6 @@
 use std::sync::{Mutex, MutexGuard};
 
 pub(crate) mod fixtures;
-mod json;
 
 //--------------------------------------------------------------------------------------------------
 // Constants

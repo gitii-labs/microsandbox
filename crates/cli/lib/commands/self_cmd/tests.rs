@@ -1159,20 +1159,58 @@ async fn oauth_omission_downgrade_refuses_either_saved_column_without_mutation()
         )
         .await
         .unwrap();
-    let ordinary = r#"{"network":{"secrets":{"oauth":[{"grant_id":"ordinary","omit_token_response_fields":[]}]}}}"#;
-    let saved = |grant: &str| format!(r#"{{"network":{{"secrets":{{"oauth":[{grant}]}}}}}}"#);
-    let protected = r#"{"network":{"enabled":{"oauth_token_response_omission_v1":true},"secrets":{"oauth":[{"omit_token_response_fields":["id_token"]}]}}}"#;
+    let grant = r#""broker_endpoint":"/synthetic/broker.sock","grant_id":"fixture",
+        "token_endpoint":"https://provider.invalid/token","access_token_field":"access_token",
+        "refresh_token_field":"refresh_token","access_env_var":"ACCESS","refresh_env_var":"REFRESH",
+        "access_sentinel":"access-placeholder","refresh_sentinel":"refresh-placeholder""#;
+    let saved = |enabled: &str, fields: &str| {
+        format!(
+            r#"{{"network":{{"enabled":{enabled},"secrets":{{"oauth":[{{{grant},"omit_token_response_fields":{fields}}}]}}}}}}"#
+        )
+    };
+    let ordinary = saved("true", "[]");
+    let protected = saved(
+        r#"{"oauth_token_response_omission_v1":true}"#,
+        r#"["id_token"]"#,
+    );
     let marker_only = r#"{"network":{"enabled":{"oauth_token_response_omission_v1":true}}}"#;
-    let plain = saved(r#"{"grant_id":"synthetic","omit_token_response_fields":["id_token"]}"#);
+    let plain = saved("true", r#"["id_token"]"#);
+    let duplicate = protected.replacen(r#""enabled":"#, r#""enabled":true,"enabled":"#, 1);
     let staged = std::env::var_os("MSB_OAUTH_OLD_TARGET")
         .map_or_else(|| dir.path().join("missing-target"), PathBuf::from);
 
-    for (config, active, refused_column) in [
-        (ordinary, ordinary, None),
-        (protected, ordinary, Some("config")),
-        (ordinary, protected, Some("active_config")),
-        (marker_only, ordinary, Some("config")),
-        (ordinary, &plain, Some("active_config")),
+    for (config, active, expected) in [
+        (ordinary.as_str(), ordinary.as_str(), None),
+        (
+            &protected,
+            &ordinary,
+            Some("config requires OAuth token response field omission"),
+        ),
+        (
+            &ordinary,
+            &protected,
+            Some("active_config requires OAuth token response field omission"),
+        ),
+        (
+            marker_only,
+            &ordinary,
+            Some("config has invalid saved configuration"),
+        ),
+        (
+            &ordinary,
+            &plain,
+            Some("active_config has invalid saved configuration"),
+        ),
+        (
+            &duplicate,
+            &ordinary,
+            Some("config has invalid saved configuration"),
+        ),
+        (
+            &protected,
+            &duplicate,
+            Some("active_config has invalid saved configuration"),
+        ),
     ] {
         db.inner()
             .execute_raw(Statement::from_sql_and_values(
@@ -1183,14 +1221,9 @@ async fn oauth_omission_downgrade_refuses_either_saved_column_without_mutation()
             .await
             .unwrap();
         let result = refuse_oauth_omission_downgrade(db.inner(), &staged).await;
-        if let Some(column) = refused_column {
+        if let Some(expected) = expected {
             let error = result.unwrap_err().to_string();
-            assert!(
-                error.contains(&format!(
-                    "sandbox 1 {column} requires OAuth token response field omission"
-                )),
-                "{error}"
-            );
+            assert!(error.contains(&format!("sandbox 1 {expected}")), "{error}");
         } else {
             result.unwrap();
         }

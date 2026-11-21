@@ -301,11 +301,19 @@ configuration writers encode `network.enabled` as
 `{"oauth_token_response_omission_v1": <bool>}`. Historical typed config readers
 require a boolean there and refuse the protected row before using its config,
 even if they do not recognize `network.secrets.oauth`. The current catalog
-decoder requires the marker and a nonempty omission policy together. Public
-configuration input and launch JSON retain the normal boolean and grant shapes.
+decoder requires the marker and a nonempty omission policy together and rejects
+duplicate keys before normalization. Public configuration input and launch JSON
+retain the normal boolean and grant shapes.
 Other sandboxes retain their existing bytes; no schema migration or catalog-wide
 admission gate is added. The current `self downgrade` checks both saved columns
-and requires support from the staged binary before applying the downgrade.
+with the same decoder and requires support from the staged binary before
+applying the downgrade. Direct restart checks the selected runtime before
+stopping a sandbox whose desired policy opts in.
+
+The raw handle accessors expose the stored marker: Rust `config_json()`, Go
+`ConfigJSON()`, and Node `configJson`. Python's parsed handle `config()` and
+CLI `inspect --format json` also surface it. These views show saved JSON, not
+the result of typed policy validation.
 
 Evolution rules:
 

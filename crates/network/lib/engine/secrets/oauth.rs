@@ -442,45 +442,35 @@ impl OAuthConnection {
                     })
                 })
             };
-            let endpoint_here = |endpoint: &Endpoint| {
-                port == endpoint.port && endpoint.host.eq_ignore_ascii_case(sni)
-            };
-            // Discover protected response routes before DNS admission. Treating
-            // an unattested route as irrelevant would forward and trace it raw.
-            if !config.omit_token_response_fields.is_empty()
-                && (endpoint_here(&token) || poll.as_ref().is_some_and(endpoint_here))
-                && !dns_attested()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "OAuth token response field omission requires DNS evidence for the destination",
-                ));
-            }
+            let endpoint_relevant = flow_endpoint_relevant(
+                config,
+                &token,
+                device_code.as_ref(),
+                poll.as_ref(),
+                sni,
+                port,
+                dns_attested,
+            )?;
             let host_allowed = |matches: bool| matches && dns_attested();
-            // Every endpoint of the flow makes the grant relevant: the device
-            // code endpoint carries no secret, but the connection that reaches
-            // it also carries the poll and token requests that do.
-            let is_relevant = |endpoint: &Endpoint| host_allowed(endpoint_here(endpoint));
-            let endpoint_relevant = is_relevant(&token)
-                || device_code.as_ref().is_some_and(is_relevant)
-                || poll.as_ref().is_some_and(is_relevant);
             // A mint endpoint is an endpoint of the flow too, and it carries
             // its own host and port rather than a URL. Its host may be the
             // token endpoint's without being an inject host, and its port
             // need not be the token endpoint's, so without this a connection
             // that reaches only the mint endpoint loads no grant and its
             // response is forwarded with the minted secret in it.
-            let mint_relevant = config
-                .mint_endpoints
-                .iter()
-                .any(|endpoint| host_allowed(mint_endpoint_here(endpoint, sni, port)));
-            let inject_relevant = config.inject_hosts.iter().any(|host| {
-                identity.map_or_else(
-                    || host.matches(sni),
-                    |(guest_ip, shared)| host_pattern_allowed_for_tls(host, sni, guest_ip, shared),
-                )
-            });
-            let relevant = endpoint_relevant || mint_relevant || inject_relevant;
+            let relevant = endpoint_relevant
+                || config
+                    .mint_endpoints
+                    .iter()
+                    .any(|endpoint| host_allowed(mint_endpoint_here(endpoint, sni, port)))
+                || config.inject_hosts.iter().any(|host| {
+                    identity.map_or_else(
+                        || host.matches(sni),
+                        |(guest_ip, shared)| {
+                            host_pattern_allowed_for_tls(host, sni, guest_ip, shared)
+                        },
+                    )
+                });
             if !relevant {
                 continue;
             }
@@ -2668,6 +2658,38 @@ fn mint_endpoint_matches(endpoint: &MintEndpoint, sni: &str, port: u16, target: 
 
 /// Whether a mint endpoint is served by the host and port of this connection.
 ///
+fn flow_endpoint_relevant(
+    config: &OAuthSecret,
+    token: &Endpoint,
+    device_code: Option<&Endpoint>,
+    poll: Option<&Endpoint>,
+    sni: &str,
+    port: u16,
+    dns_attested: impl Fn() -> bool,
+) -> io::Result<bool> {
+    let endpoint_here =
+        |endpoint: &Endpoint| port == endpoint.port && endpoint.host.eq_ignore_ascii_case(sni);
+
+    if !config.omit_token_response_fields.is_empty()
+        && (endpoint_here(token) || poll.is_some_and(endpoint_here))
+    {
+        // A protected route is either admitted or rejected by this observation.
+        // Expiry or replacement must not downgrade it to an ordinary TLS relay.
+        return if dns_attested() {
+            Ok(true)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "OAuth token response field omission requires DNS evidence for the destination",
+            ))
+        };
+    }
+
+    // Every endpoint of an ordinary flow can make the grant relevant, including device code.
+    let is_relevant = |endpoint: &Endpoint| endpoint_here(endpoint) && dns_attested();
+    Ok(is_relevant(token) || device_code.is_some_and(is_relevant) || poll.is_some_and(is_relevant))
+}
+
 /// A mint endpoint names a host and a path rather than a URL, so its port is
 /// its own optional field, defaulting to the HTTPS port the rest of the
 /// configuration's URLs default to.
@@ -2904,6 +2926,7 @@ fn invalid_http() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -2938,6 +2961,45 @@ mod tests {
 
     fn connection() -> OAuthConnection {
         connection_for(vec![config()])
+    }
+
+    #[test]
+    fn oauth_omission_route_uses_one_dns_observation_for_admission() {
+        let mut grant = config();
+        grant.omit_token_response_fields = vec!["id_token".into()];
+        let token = parse_https_endpoint(&grant.token_endpoint).unwrap();
+        let poll = parse_https_endpoint("https://poll.example.com:8443/device").unwrap();
+
+        for endpoint in [&token, &poll] {
+            // Model an attestation that expires immediately after the first lookup.
+            let present = Cell::new(true);
+            let decision = || {
+                flow_endpoint_relevant(
+                    &grant,
+                    &token,
+                    None,
+                    Some(&poll),
+                    &endpoint.host,
+                    endpoint.port,
+                    || present.replace(false),
+                )
+            };
+
+            assert!(decision().unwrap());
+            assert!(!present.get());
+            assert_eq!(
+                decision().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+
+        grant.omit_token_response_fields.clear();
+        assert!(
+            !flow_endpoint_relevant(&grant, &token, None, None, &token.host, token.port, || {
+                false
+            })
+            .unwrap()
+        );
     }
 
     #[tokio::test]

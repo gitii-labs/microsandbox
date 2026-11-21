@@ -94,18 +94,6 @@ impl LaunchContract {
         msb_path: &Path,
         network: &microsandbox_network::config::NetworkConfig,
     ) -> MicrosandboxResult<()> {
-        if network.secrets.has_oauth_token_response_omission() {
-            if !self.machine {
-                return unsupported("OAuth token response field omission");
-            }
-            require_capability(
-                msb_path,
-                |capabilities| capabilities.oauth_token_response_omission,
-                "OAuth token response field omission",
-            )
-            .await?;
-        }
-
         if self.machine && network.max_inbound_tcp_connections.is_some() {
             require_capability(
                 msb_path,
@@ -685,10 +673,10 @@ pub(crate) async fn validate_runtime_config(
         Ok(runtime) => runtime,
         #[cfg(feature = "embed-binaries")]
         Err(MicrosandboxError::RuntimeNotInstalled(_))
-            if config.spec.resources.nested_virt == Some(true) =>
+            if config.spec.resources.nested_virt == Some(true)
+                || config.requires_oauth_omission() =>
         {
-            // Keep first-use installation working, but discover host support
-            // before replacement can remove the existing sandbox.
+            // Keep first-use installation working, but probe the runtime before replacement.
             crate::setup::ensure_runtime(
                 global,
                 crate::setup::InstallOptions {
@@ -699,12 +687,14 @@ pub(crate) async fn validate_runtime_config(
             .await?
         }
         Err(MicrosandboxError::RuntimeNotInstalled(_))
-            if config.spec.resources.nested_virt != Some(true) =>
+            if config.spec.resources.nested_virt != Some(true)
+                && !config.requires_oauth_omission() =>
         {
             return Ok(());
         }
         Err(error) => return Err(error),
     };
+    require_oauth_omission(&runtime.msb_path, config.requires_oauth_omission()).await?;
     require_protected_guest_state(&runtime.msb_path).await?;
     let contract = resolve(&runtime.msb_path).await?;
     validate_nested_virt(&runtime.msb_path, config, contract).await?;
@@ -1012,6 +1002,23 @@ pub(crate) async fn require_protected_guest_state(path: &Path) -> MicrosandboxRe
     )))
 }
 
+/// Check opted-in launches first, including runtimes that predate the probe itself.
+pub(crate) async fn require_oauth_omission(path: &Path, required: bool) -> MicrosandboxResult<()> {
+    if !required {
+        return Ok(());
+    }
+
+    let feature = "OAuth token response field omission";
+    match capabilities(path).await {
+        Ok(caps) if caps.protocols.contains(&2) && caps.oauth_token_response_omission => Ok(()),
+        Ok(_) => Err(MicrosandboxError::Runtime(upgrade_required(feature))),
+        Err(error) => Err(MicrosandboxError::Runtime(format!(
+            "{}. Capability probe failed: {error}",
+            upgrade_required(feature)
+        ))),
+    }
+}
+
 async fn require_capability(
     path: &Path,
     advertised: impl FnOnce(&LaunchCapabilities) -> bool,
@@ -1287,8 +1294,8 @@ mod tests {
         }))
         .unwrap();
         network.secrets.oauth.push(grant);
-        machine
-            .require_network_capabilities(&dir.path().join("no-probe-needed"), &network)
+        let requested = || network.secrets.has_oauth_token_response_omission();
+        require_oauth_omission(&dir.path().join("no-probe-needed"), requested())
             .await
             .unwrap();
 
@@ -1297,20 +1304,19 @@ mod tests {
         previous
             .validate_network(&network, DeploymentProfile::default())
             .unwrap_err();
-        let error = machine
-            .require_network_capabilities(&old, &network)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("OAuth token response field omission"),
-            "{error}"
-        );
-        assert!(error.contains("upgrade msb"), "{error}");
-        machine
-            .require_network_capabilities(&current, &network)
-            .await
-            .unwrap();
+        let pre_oauth = script(dir.path(), "pre-oauth", "exit 2");
+        let requested = network.secrets.has_oauth_token_response_omission();
+        for binary in [old, pre_oauth] {
+            let error = require_oauth_omission(&binary, requested)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("does not support OAuth token response field omission; upgrade msb"),
+                "{error}"
+            );
+        }
+        require_oauth_omission(&current, requested).await.unwrap();
         let launch = LaunchConfig {
             network: Some(network.resolve(&EnvNetworkSecretResolver).unwrap()),
             ..Default::default()

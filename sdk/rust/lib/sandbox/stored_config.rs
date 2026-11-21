@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::SandboxConfig;
+use crate::json::UniqueValue;
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 //--------------------------------------------------------------------------------------------------
@@ -24,6 +25,12 @@ struct ProtectedNetworkEnabled {
 //--------------------------------------------------------------------------------------------------
 
 impl SandboxConfig {
+    /// Validate a local catalog row and determine whether it requires OAuth omission.
+    #[doc(hidden)]
+    pub fn stored_requires_oauth_omission(json: &str) -> MicrosandboxResult<bool> {
+        Ok(Self::decode_stored(json)?.requires_oauth_omission())
+    }
+
     /// Decode the local catalog's desired or active configuration JSON.
     pub(crate) fn decode_stored(json: &str) -> MicrosandboxResult<Self> {
         match serde_json::from_str::<Self>(json) {
@@ -33,7 +40,7 @@ impl SandboxConfig {
                     .into(),
             )),
             Err(ordinary_error) => {
-                let mut value: Value = serde_json::from_str(json)?;
+                let UniqueValue(mut value) = serde_json::from_str(json)?;
                 let Some(enabled) = value
                     .pointer_mut("/network/enabled")
                     .filter(|v| v.is_object())
@@ -65,7 +72,7 @@ impl SandboxConfig {
         Ok(serde_json::to_string(&value)?)
     }
 
-    fn requires_oauth_omission(&self) -> bool {
+    pub(crate) fn requires_oauth_omission(&self) -> bool {
         self.spec
             .network
             .secrets
@@ -141,6 +148,44 @@ mod tests {
 
             marker["network"]["secrets"]["oauth"][0]["omit_token_response_fields"] = json!([]);
             assert!(SandboxConfig::decode_stored(&marker.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn oauth_omission_catalog_rejects_duplicate_fields_before_normalizing() {
+        let grant = r#"{"broker_endpoint":"/synthetic/broker.sock","grant_id":"fixture",
+            "token_endpoint":"https://provider.invalid/token","access_token_field":"access_token",
+            "refresh_token_field":"refresh_token","access_env_var":"ACCESS","refresh_env_var":"REFRESH",
+            "access_sentinel":"access-placeholder","refresh_sentinel":"refresh-placeholder",
+            "omit_token_response_fields":["id_token"]}"#;
+        let enabled = r#"{"oauth_token_response_omission_v1":true}"#;
+        let valid =
+            format!(r#"{{"network":{{"enabled":{enabled},"secrets":{{"oauth":[{grant}]}}}}}}"#);
+        assert!(SandboxConfig::stored_requires_oauth_omission(&valid).unwrap());
+
+        for (before, after) in [
+            (r#""network":"#, r#""network":{},"network":"#),
+            (r#""enabled":"#, r#""enabled":true,"enabled":"#),
+            (
+                r#""oauth_token_response_omission_v1":"#,
+                r#""oauth_token_response_omission_v1":false,"oauth_token_response_omission_v1":"#,
+            ),
+            (r#""secrets":"#, r#""secrets":null,"secrets":"#),
+            (r#""oauth":"#, r#""oauth":[],"oauth":"#),
+            (
+                r#""omit_token_response_fields":"#,
+                r#""omit_token_response_fields":[],"\u006fmit_token_response_fields":"#,
+            ),
+            (r#""grant_id":"#, r#""grant_id":"second","grant_id":"#),
+        ] {
+            let ambiguous = valid.replacen(before, after, 1);
+            let error = SandboxConfig::decode_stored(&ambiguous).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate configuration JSON field"),
+                "{error}"
+            );
         }
     }
 }

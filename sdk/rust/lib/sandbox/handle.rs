@@ -832,6 +832,20 @@ impl SandboxHandle {
         self.restart_with(RestartOptions::default()).await
     }
 
+    /// Check protected restart intent before an active sandbox is stopped.
+    #[doc(hidden)]
+    pub async fn preflight_restart(&self) -> MicrosandboxResult<()> {
+        #[cfg(feature = "local")]
+        if let Some(local) = self.backend.as_local() {
+            let config = self.config()?;
+            if config.requires_oauth_omission() {
+                crate::runtime::launch_contract::validate_runtime_config(&config, local.config())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Stop and start this exact sandbox with explicit lifecycle options.
     pub async fn restart_with(&self, options: RestartOptions) -> MicrosandboxResult<Sandbox> {
         let current = loop {
@@ -842,6 +856,7 @@ impl SandboxHandle {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 RestartAction::StopThenStart => {
+                    current.preflight_restart().await?;
                     stop_for_convergence(&current, options.force, options.timeout).await?;
                     break current;
                 }

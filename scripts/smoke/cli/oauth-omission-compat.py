@@ -23,6 +23,7 @@ from tempfile import TemporaryDirectory
 
 IMAGE = "docker.io/library/msb-oauth-omission-fixture:local"
 MARKER = {"oauth_token_response_omission_v1": True}
+UPGRADE = "does not support OAuth token response field omission; upgrade msb"
 
 
 def run(binary, env, *args, reject=None):
@@ -65,6 +66,17 @@ def saved_policy(env, name):
     )
 
 
+def latest_run(env, name):
+    with sqlite3.connect(Path(env["MSB_HOME"]) / "db/msb.db") as db:
+        run = db.execute(
+            "SELECT run.* FROM run JOIN sandbox ON run.sandbox_id = sandbox.id "
+            "WHERE sandbox.name = ? ORDER BY run.id DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+    assert run is not None
+    return run
+
+
 def load_image(new, env, busybox, home):
     architecture = {"x86_64": "amd64", "aarch64": "arm64"}[platform.machine()]
     layer_bytes = io.BytesIO()
@@ -100,7 +112,7 @@ def load_image(new, env, busybox, home):
     run(new, env, "image", "load", "--input", archive)
 
 
-def check_current(new, firmware, busybox, home):
+def check_current(new, old_runtimes, firmware, busybox, home):
     home.mkdir(mode=0o700)
     env = environment(home, new, firmware)
     assert json.loads(run(new, env, "__launch-protocol"))["oauth_token_response_omission"]
@@ -130,6 +142,7 @@ def check_current(new, firmware, busybox, home):
         **ordinary,
         "secrets": {"oauth": [dict(grant, omit_token_response_fields=["id_token"])]},
     }
+
     def check(name):
         desired, active = saved_policy(env, name)
         for network in (desired, active):
@@ -153,12 +166,21 @@ def check_current(new, firmware, busybox, home):
                 "UPDATE sandbox SET config = ?, caller_config_overrides = NULL WHERE name = 'protected'",
                 (json.dumps(config),),
             )
+        for old in old_runtimes:
+            run(new, {**env, "MSB_PATH": str(old)}, "start", "protected", reject=UPGRADE)
         run(new, env, "start", "protected")
         check("protected")
         run(new, env, "modify", "protected", "--label", "proof=current")
         current = json.loads(run(new, env, "inspect", "protected", "--format", "json"))
         assert current["config"]["labels"]["proof"] == "current", current
         desired = check("protected")
+        before = saved_row(env, "protected"), latest_run(env, "protected")
+        for old in old_runtimes:
+            old_runtime = {**env, "MSB_PATH": str(old)}
+            for flags in ((), ("--force",)):
+                run(new, old_runtime, "restart", "protected", *flags, reject=UPGRADE)
+                assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
+                check("protected")
         run(new, env, "restart", "protected")
         check("protected")
         # Fork explicitly authorizes inheriting this synthetic local grant.
@@ -171,7 +193,8 @@ def check_current(new, firmware, busybox, home):
             if saved_row(env, name) is not None:
                 run(new, env, "stop", name)
 
-    print("current CLI preserved protected desired/active policy through live edit, restart, and fork", flush=True)
+    print("current CLI preserved protected policy through live edit, restart, and fork; "
+          "refused graceful and forced restart with both old runtimes without stopping", flush=True)
     return ordinary, {**ordinary, "enabled": desired["enabled"], "secrets": desired["secrets"]}
 
 
@@ -233,7 +256,7 @@ def check_old(old, home, ordinary, protected, firmware, busybox, *, v060):
 def main(v060, fork, new, firmware, busybox, scratch):
     with TemporaryDirectory(prefix="mo-", dir=scratch) as directory:
         home = Path(directory)
-        ordinary, protected = check_current(new, firmware, busybox, home / "new")
+        ordinary, protected = check_current(new, (v060, fork), firmware, busybox, home / "new")
         check_old(v060, home / "v060", ordinary, protected, firmware, busybox, v060=True)
         check_old(fork, home / "fork", ordinary, protected, firmware, busybox, v060=False)
 
