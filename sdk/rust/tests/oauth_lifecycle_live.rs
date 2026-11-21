@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use microsandbox::sandbox::{DeploymentProfile, RootfsSource, SandboxBuilder};
-use microsandbox::{Backend, LocalBackend, MicrosandboxError, Sandbox, SandboxConfig, with_backend};
+use microsandbox::{
+    Backend, LocalBackend, MicrosandboxError, Sandbox, SandboxConfig, with_backend,
+};
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serde_json::json;
 

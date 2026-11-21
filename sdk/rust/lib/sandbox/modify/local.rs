@@ -5246,6 +5246,7 @@ mod tests {
         // from it, and a long macOS temporary directory can exceed the socket limit.
         let temp = tempfile::Builder::new()
             .prefix("msb-restart-preflight-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in("/tmp")
             .unwrap();
         let home = temp.path().join("home");
