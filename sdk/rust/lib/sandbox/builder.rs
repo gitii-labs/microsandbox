@@ -1777,10 +1777,30 @@ impl SandboxBuilder {
     /// are connected and stopped ones are started. Builder configuration is
     /// used only when this call creates the sandbox. A concurrent creator is
     /// handled by connecting to and converging on the winner.
+    /// Use [`Self::create`] when requesting OAuth token response field omission.
     pub async fn connect_or_create(self) -> MicrosandboxResult<Sandbox> {
         if self.config.replace_existing.unwrap_or(false) {
             return Err(MicrosandboxError::InvalidConfig(
                 "connect_or_create cannot be combined with replace_existing".to_string(),
+            ));
+        }
+        // Options are ignored when connecting to an existing sandbox, so this
+        // API cannot promise that the requested omission policy is active.
+        if self
+            .config
+            .spec
+            .network
+            .secrets
+            .as_ref()
+            .and_then(|secrets| secrets.oauth.as_ref())
+            .is_some_and(|grants| {
+                grants
+                    .iter()
+                    .any(|grant| !grant.omit_token_response_fields.is_empty())
+            })
+        {
+            return Err(MicrosandboxError::InvalidConfig(
+                "OAuth token response field omission requires create, not connect_or_create".into(),
             ));
         }
 

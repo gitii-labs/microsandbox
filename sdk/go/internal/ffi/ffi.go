@@ -100,6 +100,7 @@ static const char *dlerror(void) {
 typedef void     (*msb_free_string_fn)(char *ptr);
 typedef void     (*msb_supports_host_alias_ipv4_ports_fn)(void);
 typedef void     (*msb_supports_network_interface_overrides_fn)(void);
+typedef void     (*msb_supports_oauth_token_response_omission_fn)(void);
 typedef void     (*msb_set_sdk_msb_path_fn)(const char *path);
 typedef char *(*msb_jobs_fn)(uint64_t cancel_id, uint64_t sandbox, const char *request, uint8_t *buf, size_t buf_len);
 static msb_jobs_fn ptr_msb_jobs = NULL;
@@ -282,6 +283,7 @@ typedef void (*msb_agent_free_bytes_fn)(uint8_t *ptr, size_t len);
 static msb_free_string_fn        ptr_msb_free_string        = NULL;
 static msb_supports_host_alias_ipv4_ports_fn ptr_msb_supports_host_alias_ipv4_ports = NULL;
 static msb_supports_network_interface_overrides_fn ptr_msb_supports_network_interface_overrides = NULL;
+static msb_supports_oauth_token_response_omission_fn ptr_msb_supports_oauth_token_response_omission = NULL;
 static msb_set_sdk_msb_path_fn   ptr_msb_set_sdk_msb_path   = NULL;
 static msb_cancel_alloc_fn       ptr_msb_cancel_alloc       = NULL;
 static msb_cancel_trigger_fn     ptr_msb_cancel_trigger     = NULL;
@@ -521,6 +523,7 @@ const char *load_microsandbox(const char *path) {
 	RESOLVE(msb_free_string);
 	RESOLVE_OPTIONAL(msb_supports_host_alias_ipv4_ports);
 	RESOLVE_OPTIONAL(msb_supports_network_interface_overrides);
+	RESOLVE_OPTIONAL(msb_supports_oauth_token_response_omission);
 	RESOLVE(msb_set_sdk_msb_path);
 	RESOLVE(msb_cancel_alloc);
 	RESOLVE(msb_cancel_trigger);
@@ -833,6 +836,7 @@ bool has_branch_integrity(void) { return ptr_msb_sandbox_branch_with_options != 
 bool has_guest_flush(void) { return ptr_msb_sandbox_pause_with_guest_flush != NULL; }
 bool has_host_alias_ipv4_ports(void) { return ptr_msb_supports_host_alias_ipv4_ports != NULL; }
 bool has_network_interface_overrides(void) { return ptr_msb_supports_network_interface_overrides != NULL; }
+bool has_oauth_token_response_omission(void) { return ptr_msb_supports_oauth_token_response_omission != NULL; }
 char *call_msb_sandbox_pause_with_guest_flush(uint64_t cancel_id, uint64_t handle, const char *source, const char *expected_id, const char *policy, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_pause_with_guest_flush ? ptr_msb_sandbox_pause_with_guest_flush(cancel_id, handle, source, expected_id, policy, buf, buf_len) : NULL;
 }
@@ -2156,23 +2160,24 @@ type SecretSubstitutionOptions struct {
 	Body         bool     `json:"body,omitempty"`
 }
 
-// OAuthSecretOptions is the durable JSON representation of an OAuth grant.
+// OAuthSecretOptions is the create-options JSON representation of an OAuth grant.
 type OAuthSecretOptions struct {
-	BrokerEndpoint     string                     `json:"broker_endpoint"`
-	GrantID            string                     `json:"grant_id"`
-	TokenEndpoint      string                     `json:"token_endpoint"`
-	RequireGrantMarker bool                       `json:"require_grant_marker"`
-	DeviceCodeEndpoint string                     `json:"device_code_endpoint,omitempty"`
-	PollEndpoint       string                     `json:"poll_endpoint,omitempty"`
-	PollSecretFields   []string                   `json:"poll_secret_fields,omitempty"`
-	MintEndpoints      []OAuthMintEndpointOptions `json:"mint_endpoints,omitempty"`
-	InjectHosts        []string                   `json:"inject_hosts"`
-	AccessTokenField   string                     `json:"access_token_field"`
-	RefreshTokenField  string                     `json:"refresh_token_field"`
-	AccessEnvVar       string                     `json:"access_env_var"`
-	RefreshEnvVar      string                     `json:"refresh_env_var"`
-	AccessSentinel     string                     `json:"access_sentinel"`
-	RefreshSentinel    string                     `json:"refresh_sentinel"`
+	BrokerEndpoint          string                     `json:"broker_endpoint"`
+	GrantID                 string                     `json:"grant_id"`
+	TokenEndpoint           string                     `json:"token_endpoint"`
+	RequireGrantMarker      bool                       `json:"require_grant_marker"`
+	DeviceCodeEndpoint      string                     `json:"device_code_endpoint,omitempty"`
+	PollEndpoint            string                     `json:"poll_endpoint,omitempty"`
+	PollSecretFields        []string                   `json:"poll_secret_fields,omitempty"`
+	OmitTokenResponseFields []string                   `json:"omit_token_response_fields,omitempty"`
+	MintEndpoints           []OAuthMintEndpointOptions `json:"mint_endpoints,omitempty"`
+	InjectHosts             []string                   `json:"inject_hosts"`
+	AccessTokenField        string                     `json:"access_token_field"`
+	RefreshTokenField       string                     `json:"refresh_token_field"`
+	AccessEnvVar            string                     `json:"access_env_var"`
+	RefreshEnvVar           string                     `json:"refresh_env_var"`
+	AccessSentinel          string                     `json:"access_sentinel"`
+	RefreshSentinel         string                     `json:"refresh_sentinel"`
 }
 
 // OAuthMintEndpointOptions is the JSON representation of one minting endpoint.
@@ -2258,6 +2263,11 @@ func ConnectOrCreateSandbox(ctx context.Context, name string, opts CreateOptions
 func createSandbox(ctx context.Context, name string, opts CreateOptions, connectOrCreate bool) (*Sandbox, error) {
 	if err := ensureLoaded(); err != nil {
 		return nil, err
+	}
+	for _, grant := range opts.OAuthSecrets {
+		if len(grant.OmitTokenResponseFields) != 0 && !bool(C.has_oauth_token_response_omission()) {
+			return nil, &Error{Kind: KindUnsupportedOperation, Message: "native SDK does not support OAuth token response field omission; update the native SDK"}
+		}
 	}
 	if opts.Network != nil {
 		if opts.Network.Interface != nil && !bool(C.has_network_interface_overrides()) {

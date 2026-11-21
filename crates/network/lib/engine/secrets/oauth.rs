@@ -1386,6 +1386,16 @@ impl OAuthConnection {
         if poll {
             match poll_outcome(status, body, &self.grants[index].config) {
                 PollOutcome::Waiting => {
+                    // Keep the old wire path unless the grant requires omission.
+                    let response = if self.grants[index]
+                        .config
+                        .omit_token_response_fields
+                        .is_empty()
+                    {
+                        response
+                    } else {
+                        self.sanitize_token_error(index, headers, body)?
+                    };
                     // Nothing was committed, so the broker lease is released
                     // rather than held across the guest's polling interval.
                     self.grants[index].lease = None;
@@ -1420,6 +1430,7 @@ impl OAuthConnection {
                 "OAuth poll response must be an object",
             )
         })?;
+        self.omit_token_response_fields(index, object);
         self.replace_poll_secrets(index, object)?;
         // No token was committed, so the grant keeps its material and the
         // lease goes back to the broker.
@@ -1445,6 +1456,16 @@ impl OAuthConnection {
             object.insert(field, Value::String(sentinel));
         }
         Ok(())
+    }
+
+    fn omit_token_response_fields(
+        &self,
+        index: usize,
+        object: &mut serde_json::Map<String, Value>,
+    ) {
+        for field in &self.grants[index].config.omit_token_response_fields {
+            object.remove(field);
+        }
     }
 
     /// Mint or refresh the sentinel standing in for one poll secret field. The
@@ -1549,6 +1570,7 @@ impl OAuthConnection {
                 "OAuth response must be an object",
             )
         })?;
+        self.omit_token_response_fields(index, object);
         let grant = &mut self.grants[index];
         let access = object
             .get(&grant.config.access_token_field)
@@ -1626,7 +1648,6 @@ impl OAuthConnection {
         headers: &[u8],
         body: &[u8],
     ) -> io::Result<Vec<u8>> {
-        let grant = &self.grants[index];
         let mut json: Value = serde_json::from_slice(body).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "malformed OAuth error response")
         })?;
@@ -1636,6 +1657,8 @@ impl OAuthConnection {
                 "OAuth error response must be an object",
             )
         })?;
+        self.omit_token_response_fields(index, object);
+        let grant = &self.grants[index];
         if object.contains_key(&grant.config.refresh_token_field)
             && grant.config.refresh_token_field != grant.config.access_token_field
         {
@@ -2885,6 +2908,7 @@ mod tests {
             device_code_endpoint: None,
             poll_endpoint: None,
             poll_secret_fields: vec![],
+            omit_token_response_fields: vec![],
             mint_endpoints: vec![],
             inject_hosts: vec![HostPattern::Exact("api.example.com".into())],
             access_token_field: "access_token".into(),
@@ -3694,6 +3718,177 @@ mod tests {
         assert!(!guest.contains("new-refresh"));
         broker.await.unwrap();
         std::fs::remove_file(socket).ok();
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_drops_fields_on_exchange_refresh_and_error_without_replay() {
+        let broker = start_broker("synthetic-old-access", "synthetic-old-refresh");
+        let mut grant = broker_config(&broker);
+        grant.omit_token_response_fields = vec!["id_token".into(), "extra".into()];
+        let mut connection = OAuthConnection::new(&[grant], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+
+        for (request_body, status, response_body, expected) in [
+            (
+                "grant_type=authorization_code&code=synthetic-code",
+                200,
+                r#"{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id-1","extra":{"secret":"synthetic-extra"},"id\u005ftoken":"synthetic-id-2","scope":"read"}"#,
+                serde_json::json!({
+                    "access_token": "$MSB_OAUTH_ACCESS_123",
+                    "refresh_token": "$MSB_OAUTH_REFRESH_123",
+                    "scope": "read"
+                }),
+            ),
+            (
+                "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123",
+                200,
+                r#"{"access_token":"synthetic-renewed","id_token":"synthetic-id-3","expires_in":3600}"#,
+                serde_json::json!({"access_token": "$MSB_OAUTH_ACCESS_123", "expires_in": 3600}),
+            ),
+            (
+                "grant_type=refresh_token&refresh_token=$MSB_OAUTH_REFRESH_123",
+                400,
+                r#"{"error":"invalid_grant","id_token":"synthetic-id-4","extra":["synthetic-extra"]}"#,
+                serde_json::json!({"error": "invalid_grant"}),
+            ),
+        ] {
+            let request = form_request("/oauth/token", request_body);
+            let upstream = connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap();
+            let upstream = String::from_utf8(upstream).unwrap();
+            if request_body.starts_with("grant_type=refresh_token") {
+                assert!(upstream.contains("refresh_token=synthetic-refresh"));
+            } else {
+                assert!(upstream.contains("code=synthetic-code"));
+            }
+            assert!(!upstream.contains("synthetic-id"));
+
+            let response = chunked_response(status, response_body, &[]);
+            let split = response.len() - 5;
+            assert!(
+                connection
+                    .transform_responses(&response.as_bytes()[..split])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let guest = connection
+                .transform_responses(&response.as_bytes()[split..])
+                .await
+                .unwrap();
+            let rebuilt = read_token_response(&guest);
+            assert_eq!(response_status(&rebuilt.headers).unwrap(), status);
+            assert_eq!(rebuilt.total_len, guest.len());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&rebuilt.body).unwrap(),
+                expected
+            );
+            assert!(connection.grants[0].lease.is_none());
+        }
+
+        let commits = broker.commits();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["access"], "synthetic-access");
+        assert_eq!(commits[1]["access"], "synthetic-renewed");
+        for commit in commits {
+            assert_eq!(commit["refresh"], "synthetic-refresh");
+            let wire = commit.to_string();
+            assert!(!wire.contains("synthetic-id") && !wire.contains("synthetic-extra"));
+        }
+        assert!(broker.mints().is_empty());
+        assert!(connection.grants[0].poll_secrets.is_empty());
+        assert!(
+            !connection
+                .seen_tokens
+                .iter()
+                .any(|token| token.starts_with("synthetic-id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_applies_to_waiting_and_extra_secret_polls() {
+        let broker = start_broker("synthetic-access", "synthetic-refresh");
+        let mut grant = broker_config(&broker);
+        grant.poll_endpoint = Some("https://auth.example.com/oauth/poll".into());
+        grant.poll_secret_fields = vec!["authorization_code".into()];
+        grant.omit_token_response_fields = vec!["id_token".into()];
+        let mut connection = OAuthConnection::new(&[grant], "auth.example.com", 443, None)
+            .await
+            .unwrap();
+        let request = form_request("/oauth/poll", "device_code=synthetic-device");
+        for (status, body, key) in [
+            (
+                400,
+                r#"{"error":"authorization_pending","id_token":{"secret":"synthetic-id"}}"#,
+                "error",
+            ),
+            (
+                200,
+                r#"{"authorization_code":"synthetic-provider-code","id_token":"synthetic-id"}"#,
+                "authorization_code",
+            ),
+        ] {
+            connection
+                .transform_requests(request.as_bytes(), "auth.example.com")
+                .await
+                .unwrap();
+            let response = json_response(status, body);
+            let guest = connection
+                .transform_responses(response.as_bytes())
+                .await
+                .unwrap();
+            let message = read_token_response(&guest);
+            let json: Value = serde_json::from_slice(&message.body).unwrap();
+            assert!(json.get("id_token").is_none());
+            let value = json[key].as_str().unwrap();
+            assert!(!value.is_empty() && value != "synthetic-provider-code");
+            assert!(connection.grants[0].lease.is_none());
+        }
+        assert!(broker.commits().is_empty());
+        assert!(broker.mints().is_empty());
+        assert_eq!(connection.grants[0].poll_secrets.len(), 1);
+        assert_eq!(
+            connection.grants[0].poll_secrets[0].field,
+            "authorization_code"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_refuses_malformed_success_and_error_without_committing() {
+        let broker = start_broker("synthetic-access", "synthetic-refresh");
+        let mut grant = broker_config(&broker);
+        grant.omit_token_response_fields = vec!["id_token".into()];
+        for status in [200, 400] {
+            for body in [r#"{"id_token":"synthetic-id""#, r#"["synthetic-id"]"#] {
+                let mut connection = OAuthConnection::new(
+                    std::slice::from_ref(&grant),
+                    "auth.example.com",
+                    443,
+                    None,
+                )
+                .await
+                .unwrap();
+                let request = form_request(
+                    "/oauth/token",
+                    "grant_type=authorization_code&code=synthetic-code",
+                );
+                connection
+                    .transform_requests(request.as_bytes(), "auth.example.com")
+                    .await
+                    .unwrap();
+                let response = json_response(status, body);
+                let error = connection
+                    .transform_responses(response.as_bytes())
+                    .await
+                    .unwrap_err();
+                assert!(!error.to_string().contains("synthetic-id"));
+            }
+        }
+        assert!(broker.commits().is_empty());
+        assert!(broker.mints().is_empty());
     }
 
     #[tokio::test]
@@ -5697,7 +5892,8 @@ mod tests {
         // The broker can remint a JWT sentinel after configuration. Routing uses
         // its exact known identity, not a prefix, claims, or an opaque grant ID.
         opencode.set_sentinels(JWT_ACCESS_SENTINEL, JWT_REFRESH_SENTINEL);
-        let configs = mixed_anthropic_configs(&opencode, &claude);
+        let mut configs = mixed_anthropic_configs(&opencode, &claude);
+        configs[0].omit_token_response_fields = vec!["id_token".into()];
         let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = provider.local_addr().unwrap();
         let provider_task = tokio::spawn(async move {
@@ -5715,7 +5911,7 @@ mod tests {
                 let response = json_response(
                     200,
                     &format!(
-                        r#"{{"access_token":"{account}-new-access","refresh_token":"{account}-new-refresh"}}"#
+                        r#"{{"access_token":"{account}-new-access","refresh_token":"{account}-new-refresh","id_token":"{account}-synthetic-id"}}"#
                     ),
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -5756,6 +5952,10 @@ mod tests {
             assert!(sanitized.contains(expected_sentinel));
             assert!(!sanitized.contains(&format!("{account}-new-access")));
             assert!(!sanitized.contains(&format!("{account}-new-refresh")));
+            assert_eq!(
+                sanitized.contains(&format!(r#""id_token":"{account}-synthetic-id""#)),
+                account == "claude"
+            );
         }
         provider_task.await.unwrap();
         assert_eq!(opencode.commits().len(), 1);

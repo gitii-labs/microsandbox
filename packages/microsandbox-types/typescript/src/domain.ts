@@ -178,7 +178,8 @@ export type OAuthSecret = {
    * [`access_token_field`](Self::access_token_field) is committed to the
    * broker and sanitized like a token-endpoint response, while the
    * `authorization_pending`, `slow_down`, `expired_token` and
-   * `access_denied` errors are forwarded untouched. May be the same URL as
+   * `access_denied` errors are forwarded untouched unless configured fields
+   * must be omitted. May be the same URL as
    * [`token_endpoint`](Self::token_endpoint).
    */
   poll_endpoint?: string | null;
@@ -197,6 +198,11 @@ export type OAuthSecret = {
    * listed here, stays on the verbatim path and reaches the sandbox.
    */
   poll_secret_fields: Array<string>;
+  /**
+   * Exact top-level JSON keys to remove from token and poll responses,
+   * including errors, before forwarding or retaining any field for replay.
+   */
+  omit_token_response_fields?: Array<string>;
   /**
    * Endpoints that mint a new long-lived secret in their response.
    *

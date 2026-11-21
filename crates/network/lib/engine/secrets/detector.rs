@@ -676,6 +676,7 @@ mod tests {
             device_code_endpoint: None,
             poll_endpoint: Some("https://auth.example.com/oauth/device".into()),
             poll_secret_fields: vec!["authorization_code".into()],
+            omit_token_response_fields: vec![],
             mint_endpoints: vec![],
             inject_hosts: vec![HostPattern::Exact("api.example.com".into())],
             access_token_field: "access_token".into(),

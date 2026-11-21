@@ -110,7 +110,8 @@ func CreateSandbox(ctx context.Context, name string, opts ...SandboxOption) (*Sa
 // ConnectOrCreateSandbox connects to and runs the persisted sandbox with this
 // name, or creates it if absent. opts apply only when creation is necessary; an
 // existing sandbox retains its persisted configuration. Concurrent callers
-// converge on the winning identity.
+// converge on the winning identity. Use CreateSandbox when requesting OAuth
+// token response field omission.
 func ConnectOrCreateSandbox(ctx context.Context, name string, opts ...SandboxOption) (*Sandbox, error) {
 	return createSandboxWithMode(ctx, name, true, opts...)
 }
@@ -323,21 +324,22 @@ func buildFFICreateOptions(o SandboxConfig) ffi.CreateOptions {
 			})
 		}
 		ffiOpts.OAuthSecrets = append(ffiOpts.OAuthSecrets, ffi.OAuthSecretOptions{
-			BrokerEndpoint:     grant.BrokerEndpoint,
-			GrantID:            grant.GrantID,
-			TokenEndpoint:      grant.TokenEndpoint,
-			RequireGrantMarker: grant.RequireGrantMarker,
-			DeviceCodeEndpoint: grant.DeviceCodeEndpoint,
-			PollEndpoint:       grant.PollEndpoint,
-			PollSecretFields:   grant.PollSecretFields,
-			MintEndpoints:      mints,
-			InjectHosts:        grant.InjectHosts,
-			AccessTokenField:   grant.AccessTokenField,
-			RefreshTokenField:  grant.RefreshTokenField,
-			AccessEnvVar:       grant.AccessEnvVar,
-			RefreshEnvVar:      grant.RefreshEnvVar,
-			AccessSentinel:     grant.AccessSentinel,
-			RefreshSentinel:    grant.RefreshSentinel,
+			BrokerEndpoint:          grant.BrokerEndpoint,
+			GrantID:                 grant.GrantID,
+			TokenEndpoint:           grant.TokenEndpoint,
+			RequireGrantMarker:      grant.RequireGrantMarker,
+			DeviceCodeEndpoint:      grant.DeviceCodeEndpoint,
+			PollEndpoint:            grant.PollEndpoint,
+			PollSecretFields:        grant.PollSecretFields,
+			OmitTokenResponseFields: grant.OmitTokenResponseFields,
+			MintEndpoints:           mints,
+			InjectHosts:             grant.InjectHosts,
+			AccessTokenField:        grant.AccessTokenField,
+			RefreshTokenField:       grant.RefreshTokenField,
+			AccessEnvVar:            grant.AccessEnvVar,
+			RefreshEnvVar:           grant.RefreshEnvVar,
+			AccessSentinel:          grant.AccessSentinel,
+			RefreshSentinel:         grant.RefreshSentinel,
 		})
 	}
 

@@ -1015,6 +1015,7 @@ mod tests {
                 device_code_endpoint: None,
                 poll_endpoint: None,
                 poll_secret_fields: vec![],
+                omit_token_response_fields: vec!["id_token".into()],
                 mint_endpoints: vec![],
                 inject_hosts: vec![],
                 access_token_field: "access_token".into(),
@@ -1081,6 +1082,7 @@ mod tests {
             assert_eq!(commit["action"], "commit");
             assert_eq!(commit["access"], "new-test-access");
             assert_eq!(commit["refresh"], "new-test-refresh");
+            assert!(!line.contains("synthetic-id"));
             lease
                 .get_mut()
                 .write_all(b"{\"ok\":true,\"generation\":8}\n")
@@ -1109,8 +1111,7 @@ mod tests {
                 let mut body = vec![0; "refresh_token=test-refresh".len()];
                 stream.read_exact(&mut body).await.unwrap();
                 assert_eq!(body, b"refresh_token=test-refresh");
-                let body =
-                    br#"{"access_token":"new-test-access","refresh_token":"new-test-refresh"}"#;
+                let body = br#"{"access_token":"new-test-access","refresh_token":"new-test-refresh","id_token":"synthetic-id"}"#;
                 if matches!(end, LeaseEnd::PendingBody | LeaseEnd::AfterCommit) {
                     stream
                         .get_mut()
@@ -1211,6 +1212,8 @@ mod tests {
             assert!(response.contains("$MSB_OAUTH_ACCESS_test"));
             assert!(response.contains("$MSB_OAUTH_REFRESH_test"));
             assert!(!response.contains("new-test-"));
+            assert!(!response.contains("id_token"));
+            assert!(!response.contains("synthetic-id"));
         } else {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             assert!(response.is_empty());

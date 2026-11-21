@@ -2640,7 +2640,11 @@ pub struct SecretsConfig {
     pub secrets: Vec<SecretEntry>,
 
     /// OAuth grants whose token material is held by a host broker.
-    #[serde(default)]
+    #[serde(default, with = "crate::compat::oauth_response_policy")]
+    #[cfg_attr(
+        feature = "ts",
+        ts(type = "Array<OAuthSecret | { token_response_omission_v1: OAuthSecret }>")
+    )]
     pub oauth: Vec<OAuthSecret>,
 
     /// Default action when a placeholder leaks to a disallowed host.
@@ -2683,7 +2687,8 @@ pub struct OAuthSecret {
     /// [`access_token_field`](Self::access_token_field) is committed to the
     /// broker and sanitized like a token-endpoint response, while the
     /// `authorization_pending`, `slow_down`, `expired_token` and
-    /// `access_denied` errors are forwarded untouched. May be the same URL as
+    /// `access_denied` errors are forwarded untouched unless configured fields
+    /// must be omitted. May be the same URL as
     /// [`token_endpoint`](Self::token_endpoint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_endpoint: Option<String>,
@@ -2701,6 +2706,11 @@ pub struct OAuthSecret {
     /// listed here, stays on the verbatim path and reaches the sandbox.
     #[serde(default)]
     pub poll_secret_fields: Vec<String>,
+    /// Exact top-level JSON keys to remove from token and poll responses,
+    /// including errors, before forwarding or retaining any field for replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>", optional))]
+    pub omit_token_response_fields: Vec<String>,
     /// Endpoints that mint a new long-lived secret in their response.
     ///
     /// A token endpoint hands back the grant's own tokens; these hand back
@@ -3035,6 +3045,13 @@ pub enum SecretConfigError {
 }
 
 impl SecretsConfig {
+    /// Whether a grant requires OAuth token response field omission.
+    pub fn has_oauth_token_response_omission(&self) -> bool {
+        self.oauth
+            .iter()
+            .any(|grant| !grant.omit_token_response_fields.is_empty())
+    }
+
     /// Whether any configured secret requires verified TLS identity.
     pub fn has_tls_identity_secrets(&self) -> bool {
         self.secrets
@@ -3135,6 +3152,19 @@ impl OAuthSecret {
             }
             if *field == self.access_token_field || *field == self.refresh_token_field {
                 return Err(invalid("poll secret fields must not be token fields"));
+            }
+        }
+        for field in &self.omit_token_response_fields {
+            if field.is_empty() {
+                return Err(invalid(
+                    "omitted token response field names must not be empty",
+                ));
+            }
+            if *field == self.access_token_field || *field == self.refresh_token_field {
+                return Err(invalid("cannot omit mapped access or refresh token fields"));
+            }
+            if self.poll_secret_fields.contains(field) {
+                return Err(invalid("cannot both omit and retain a poll secret field"));
             }
         }
         for mint in &self.mint_endpoints {
@@ -4333,6 +4363,7 @@ mod tests {
             device_code_endpoint: Some("https://github.com/login/device/code".into()),
             poll_endpoint: Some("https://github.com/login/oauth/access_token".into()),
             poll_secret_fields: vec![],
+            omit_token_response_fields: vec![],
             mint_endpoints: vec![],
             inject_hosts: vec![HostPattern::Exact("api.github.com".into())],
             access_token_field: "access_token".into(),
@@ -4648,6 +4679,60 @@ mod tests {
                 grant_index: 0,
                 reason: "poll secret fields must not be token fields",
             })
+        );
+    }
+
+    #[test]
+    fn oauth_omission_validates_custom_mappings_and_poll_secrets() {
+        let mut grant = device_flow_oauth();
+        grant.access_token_field = "mapped-access".into();
+        grant.refresh_token_field = "mapped-refresh".into();
+        grant.poll_secret_fields = vec!["authorization_code".into()];
+        for field in ["", "mapped-access", "mapped-refresh", "authorization_code"] {
+            grant.omit_token_response_fields = vec![field.into()];
+            assert!(grant.validate(0).is_err(), "accepted {field:?}");
+        }
+        grant.device_code_endpoint = None;
+        grant.poll_endpoint = None;
+        grant.poll_secret_fields.clear();
+        grant.omit_token_response_fields = vec!["id_token".into()];
+        assert_eq!(grant.validate(0), Ok(()));
+    }
+
+    #[test]
+    fn oauth_omission_wraps_only_protected_grants_in_saved_config_and_patches() {
+        let ordinary = device_flow_oauth();
+        let mut protected = ordinary.clone();
+        protected.omit_token_response_fields = vec!["id_token".into()];
+        let plain = serde_json::to_value(&ordinary).unwrap();
+        assert!(plain.get("omit_token_response_fields").is_none());
+        let config = SecretsConfig {
+            oauth: vec![ordinary, protected],
+            ..Default::default()
+        };
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["oauth"][0], plain);
+        let wrapped = &saved["oauth"][1];
+        assert!(wrapped.get("grant_id").is_none());
+        assert_eq!(
+            wrapped["token_response_omission_v1"]["omit_token_response_fields"],
+            serde_json::json!(["id_token"])
+        );
+        let restored: SecretsConfig = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), saved);
+
+        let mut ambiguous = plain.clone();
+        ambiguous["token_response_omission_v1"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<SecretsConfig>(serde_json::json!({ "oauth": [ambiguous] }))
+                .is_err()
+        );
+        let patch = serde_json::to_value(SecretsConfigPatch::from_present_fields(config)).unwrap();
+        assert_eq!(patch["oauth"], saved["oauth"]);
+        let patch: SecretsConfigPatch = serde_json::from_value(patch).unwrap();
+        assert_eq!(
+            patch.into_config().oauth[1].omit_token_response_fields,
+            ["id_token"]
         );
     }
 

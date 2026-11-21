@@ -1652,6 +1652,10 @@ type OAuthSecretConfig struct {
 	// PollSecretFields names extra secret JSON fields in a poll response that
 	// are replaced with sentinels before the sandbox sees them.
 	PollSecretFields []string
+	// OmitTokenResponseFields removes exact top-level JSON keys from token
+	// and poll responses, including errors. Omitted fields are not replayed.
+	// This requires an updated native SDK and local runtime.
+	OmitTokenResponseFields []string
 	// MintEndpoints names exact endpoints whose response mints a new
 	// long-lived secret, such as an API key created from an OAuth session.
 	// The secret is stored by the broker and the sandbox is handed a

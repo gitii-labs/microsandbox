@@ -189,6 +189,22 @@ OAuth connections to keep markers, injected tokens and raw provider responses
 out of logs; other connections retain their existing tracing. Agent framing, storage and leases are
 unchanged.
 
+OAuth `omit_token_response_fields` is opt-in per grant. The SDK probes
+`oauth_token_response_omission` through `__launch-protocol` before starting or
+replacing a sandbox that uses it. Older local runtimes return an upgrade-required
+error, and managed cloud does not accept the option. The Go loader requires the
+optional `msb_supports_oauth_token_response_omission` symbol before sending it
+to the native library. Old SDKs and existing grants do not need either capability.
+
+Local saved and launch policies encode only an opted-in grant in a
+`token_response_omission_v1` envelope. Older readers require routing fields at
+the top level and reject this entry rather than dropping the policy on start or
+edit. Other sandboxes in the same catalog and grants with no omission retain
+their previous representation. No schema migration, guest protocol, or broker
+protocol change is required. Rust callers using exhaustive `OAuthSecret`
+literals must initialize the added field. Go callers using keyed
+`OAuthSecretConfig` literals can leave it unset.
+
 OAuth token forwarding observes the existing acquired broker socket until the
 provider response is complete. EOF, socket errors or unsolicited broker data
 cancel the upstream connection; a lease already closed before dispatch refuses

@@ -760,6 +760,10 @@ pub extern "C" fn msb_supports_host_alias_ipv4_ports() {}
 #[unsafe(no_mangle)]
 pub extern "C" fn msb_supports_network_interface_overrides() {}
 
+/// Capability marker: this native SDK preserves OAuth token response field omission.
+#[unsafe(no_mangle)]
+pub extern "C" fn msb_supports_oauth_token_response_omission() {}
+
 /// Free a C string previously returned as an error from any `msb_*` function.
 /// Safe to call with a null pointer (no-op).
 ///
@@ -1073,6 +1077,8 @@ struct OAuthSecretOpts {
     poll_endpoint: Option<String>,
     #[serde(default)]
     poll_secret_fields: Vec<String>,
+    #[serde(default)]
+    omit_token_response_fields: Vec<String>,
     #[serde(default)]
     mint_endpoints: Vec<MintEndpointOpts>,
     inject_hosts: Vec<String>,
@@ -2164,6 +2170,7 @@ fn apply_oauth_secret(
         device_code_endpoint: oauth.device_code_endpoint,
         poll_endpoint: oauth.poll_endpoint,
         poll_secret_fields: oauth.poll_secret_fields,
+        omit_token_response_fields: oauth.omit_token_response_fields,
         mint_endpoints: oauth
             .mint_endpoints
             .into_iter()
@@ -8097,6 +8104,49 @@ mod tests {
                 config.spec.network.secrets.unwrap().oauth[0].require_grant_marker,
                 policy.unwrap_or(false)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_ffi_preserves_config_and_rejects_mapped_fields() {
+        let mut value = serde_json::json!({
+            "broker_endpoint": "/nonexistent/oauth-broker.sock",
+            "grant_id": "fixture",
+            "token_endpoint": "https://provider.invalid/token",
+            "inject_hosts": ["provider.invalid"],
+            "access_token_field": "mapped-access",
+            "refresh_token_field": "mapped-refresh",
+            "access_env_var": "ACCESS",
+            "refresh_env_var": "REFRESH",
+            "access_sentinel": "$ACCESS",
+            "refresh_sentinel": "$REFRESH"
+        });
+        for field in ["id_token", "mapped-access", "mapped-refresh"] {
+            value["omit_token_response_fields"] = serde_json::json!([field]);
+            let builder = || {
+                let opts = serde_json::from_value(value.clone()).unwrap();
+                let builder = microsandbox::Sandbox::builder("oauth-omission-ffi").image("alpine");
+                apply_oauth_secret(builder, opts)
+            };
+            if field == "id_token" {
+                let config = builder().build().await.unwrap();
+                assert_eq!(
+                    config.spec.network.secrets.unwrap().oauth[0].omit_token_response_fields,
+                    [field]
+                );
+                assert!(matches!(
+                    builder().connect_or_create().await,
+                    Err(MicrosandboxError::InvalidConfig(message))
+                        if message.contains("requires create, not connect_or_create")
+                ));
+            } else {
+                let error = builder().build().await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("cannot omit mapped access or refresh")
+                );
+            }
         }
     }
 

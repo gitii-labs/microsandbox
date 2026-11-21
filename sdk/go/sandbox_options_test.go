@@ -865,13 +865,14 @@ func TestFFIWireShape_Secrets(t *testing.T) {
 
 func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 	got := marshalCreateOptions(t, WithOAuthSecrets(OAuthSecretConfig{
-		BrokerEndpoint:     "/run/msb/oauth.sock",
-		GrantID:            "opaque-42",
-		TokenEndpoint:      "https://login.example.com/oauth/token",
-		RequireGrantMarker: true,
-		DeviceCodeEndpoint: "https://login.example.com/oauth/device/code",
-		PollEndpoint:       "https://login.example.com/oauth/device/token",
-		PollSecretFields:   []string{"authorization_code", "code_verifier"},
+		BrokerEndpoint:          "/run/msb/oauth.sock",
+		GrantID:                 "opaque-42",
+		TokenEndpoint:           "https://login.example.com/oauth/token",
+		RequireGrantMarker:      true,
+		DeviceCodeEndpoint:      "https://login.example.com/oauth/device/code",
+		PollEndpoint:            "https://login.example.com/oauth/device/token",
+		PollSecretFields:        []string{"authorization_code", "code_verifier"},
+		OmitTokenResponseFields: []string{"id_token"},
 		MintEndpoints: []OAuthMintEndpoint{{
 			Host:  "api.example.com",
 			Path:  "/api/oauth/claude_cli/create_api_key",
@@ -932,6 +933,10 @@ func TestFFIWireShape_OAuthSecrets(t *testing.T) {
 	if !ok || len(fields) != 2 || fields[0] != "authorization_code" || fields[1] != "code_verifier" {
 		t.Fatalf("poll_secret_fields = %v", grant["poll_secret_fields"])
 	}
+	omitted, ok := grant["omit_token_response_fields"].([]any)
+	if !ok || len(omitted) != 1 || omitted[0] != "id_token" {
+		t.Fatalf("omit_token_response_fields = %v", grant["omit_token_response_fields"])
+	}
 	for _, forbidden := range []string{"access", "refresh", "value"} {
 		if _, ok := grant[forbidden]; ok {
 			t.Fatalf("OAuth wire has token-bearing field %q: %+v", forbidden, grant)
@@ -944,6 +949,9 @@ func TestFFIWireShape_OAuthSecretsDefaultGrantMarker(t *testing.T) {
 	grant := mustField(t, got, "oauth_secrets").([]any)[0].(map[string]any)
 	if grant["require_grant_marker"] != false {
 		t.Fatalf("require_grant_marker = %v, want false", grant["require_grant_marker"])
+	}
+	if _, ok := grant["omit_token_response_fields"]; ok {
+		t.Fatal("omission must not affect the default wire shape")
 	}
 }
 

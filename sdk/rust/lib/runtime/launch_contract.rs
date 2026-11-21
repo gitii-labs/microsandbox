@@ -94,6 +94,18 @@ impl LaunchContract {
         msb_path: &Path,
         network: &microsandbox_network::config::NetworkConfig,
     ) -> MicrosandboxResult<()> {
+        if network.secrets.has_oauth_token_response_omission() {
+            if !self.machine {
+                return unsupported("OAuth token response field omission");
+            }
+            require_capability(
+                msb_path,
+                |capabilities| capabilities.oauth_token_response_omission,
+                "OAuth token response field omission",
+            )
+            .await?;
+        }
+
         if self.machine && network.max_inbound_tcp_connections.is_some() {
             require_capability(
                 msb_path,
@@ -163,6 +175,10 @@ impl LaunchContract {
         })?;
         if self.machine {
             return Ok(());
+        }
+
+        if network.secrets.has_oauth_token_response_omission() {
+            return unsupported("OAuth token response field omission");
         }
 
         if matches!(
@@ -489,6 +505,18 @@ impl LaunchContract {
 
     /// Check SDK launch intent before preparation can replace an existing sandbox.
     pub(crate) fn validate_launch_intent(self, config: &SandboxConfig) -> MicrosandboxResult<()> {
+        #[cfg(not(feature = "net"))]
+        if config
+            .spec
+            .network
+            .secrets
+            .as_ref()
+            .is_some_and(microsandbox_types::SecretsConfig::has_oauth_token_response_omission)
+        {
+            return Err(MicrosandboxError::Runtime(
+                "OAuth token response field omission requires a networking-enabled SDK".into(),
+            ));
+        }
         #[cfg(feature = "net")]
         self.validate_network(
             &config.local_network_config()?,
@@ -1217,6 +1245,81 @@ mod tests {
             "printf '%s' '{\"protocols\":[2],\"required_restore_backing\":\"true\"}'",
         );
         assert!(require_restore_backing(&malformed).await.is_err());
+    }
+
+    #[cfg(all(unix, feature = "net"))]
+    #[tokio::test]
+    async fn oauth_omission_requires_runtime_capability_only_when_requested() {
+        use microsandbox_network::config::{EnvNetworkSecretResolver, NetworkConfig};
+        use microsandbox_types::DeploymentProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = script(dir.path(), "old", "printf '%s' '{\"protocols\":[2,1]}'");
+        let current = script(
+            dir.path(),
+            "current",
+            r#"printf '%s' '{"protocols":[2,1],"oauth_token_response_omission":true}'"#,
+        );
+        let machine = LaunchContract {
+            patch: 0,
+            machine: true,
+        };
+        let previous = LaunchContract {
+            patch: 18,
+            machine: false,
+        };
+        let mut network = NetworkConfig::default();
+        let grant = serde_json::from_value(serde_json::json!({
+            "broker_endpoint": "/nonexistent/oauth-broker.sock",
+            "grant_id": "fixture",
+            "token_endpoint": "https://provider.invalid/token",
+            "inject_hosts": [{"Exact": "provider.invalid"}],
+            "access_token_field": "access_token",
+            "refresh_token_field": "refresh_token",
+            "access_env_var": "ACCESS",
+            "refresh_env_var": "REFRESH",
+            "access_sentinel": "$ACCESS",
+            "refresh_sentinel": "$REFRESH"
+        }))
+        .unwrap();
+        network.secrets.oauth.push(grant);
+        machine
+            .require_network_capabilities(&dir.path().join("no-probe-needed"), &network)
+            .await
+            .unwrap();
+
+        network.secrets.oauth[0].omit_token_response_fields = vec!["id_token".into()];
+        previous
+            .validate_network(&network, DeploymentProfile::default())
+            .unwrap_err();
+        let error = machine
+            .require_network_capabilities(&old, &network)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("OAuth token response field omission"),
+            "{error}"
+        );
+        assert!(error.contains("upgrade msb"), "{error}");
+        machine
+            .require_network_capabilities(&current, &network)
+            .await
+            .unwrap();
+        let launch = LaunchConfig {
+            network: Some(network.resolve(&EnvNetworkSecretResolver).unwrap()),
+            ..Default::default()
+        };
+        let encoded = machine.encode(&launch).unwrap();
+        assert_eq!(
+            encoded["network"]["config"]["secrets"]["oauth"][0]["token_response_omission_v1"]["omit_token_response_fields"],
+            json!(["id_token"])
+        );
+        let runtime: LaunchConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            runtime.network.unwrap().config().secrets.oauth[0].omit_token_response_fields,
+            ["id_token"]
+        );
     }
 
     #[cfg(all(unix, feature = "net"))]

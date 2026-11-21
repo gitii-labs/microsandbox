@@ -5,6 +5,7 @@
 pub(crate) mod cloud;
 /// Field presence for typed compatibility readers.
 pub mod field;
+pub(crate) mod oauth_response_policy;
 /// Local secret policies introduced in v0.5.0.
 pub mod v0_5_0;
 /// Alternate catalog and cloud-create shapes introduced in v0.6.5.

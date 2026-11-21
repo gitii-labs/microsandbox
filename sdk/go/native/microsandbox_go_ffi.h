@@ -21,6 +21,11 @@ void msb_supports_host_alias_ipv4_ports(void);
 void msb_supports_network_interface_overrides(void);
 
 /**
+ * Capability marker: this native SDK preserves OAuth token response field omission.
+ */
+void msb_supports_oauth_token_response_omission(void);
+
+/**
  * Free a C string previously returned as an error from any `msb_*` function.
  * Safe to call with a null pointer (no-op).
  *
