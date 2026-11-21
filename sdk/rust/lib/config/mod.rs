@@ -513,6 +513,14 @@ impl GlobalConfig {
         Ok(profile)
     }
 
+    #[cfg(feature = "local")]
+    pub(crate) fn effective_deployment_profile(
+        &self,
+        requested: DeploymentProfile,
+    ) -> DeploymentProfile {
+        self.deployment_profile.unwrap_or(requested)
+    }
+
     /// Get the resolved home directory.
     pub fn home(&self) -> PathBuf {
         self.home.clone().unwrap_or_else(resolve_default_home)

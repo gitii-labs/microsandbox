@@ -657,12 +657,23 @@ impl FileIdentity {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Check launch intent before create can replace an existing sandbox.
+/// Check launch intent before create or restart can stop an existing sandbox.
 /// Host paths, named volumes and network slots are checked again in the final encoder.
 pub(crate) async fn validate_runtime_config(
     config: &SandboxConfig,
     global: &GlobalConfig,
 ) -> MicrosandboxResult<()> {
+    // A saved profile may predate current host policy. Validate protected intent
+    // against the same override as start, without changing the caller's saved config.
+    let profile = global.effective_deployment_profile(config.spec.deployment_profile);
+    let effective = (config.requires_oauth_omission() && profile != config.spec.deployment_profile)
+        .then(|| {
+            let mut effective = config.clone();
+            effective.spec.deployment_profile = profile;
+            effective
+        });
+    let config = effective.as_ref().unwrap_or(config);
+
     #[cfg(feature = "net")]
     let network = config.local_network_config()?;
     #[cfg(feature = "net")]

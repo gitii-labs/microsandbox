@@ -837,10 +837,8 @@ impl SandboxHandle {
     pub async fn preflight_restart(&self) -> MicrosandboxResult<()> {
         #[cfg(feature = "local")]
         if let Some(local) = self.backend.as_local() {
-            let mut config = self.config()?;
+            let config = self.config()?;
             if config.requires_oauth_omission() {
-                config.spec.deployment_profile = local
-                    .resolve_deployment_profile(&config.spec.name, config.spec.deployment_profile);
                 crate::runtime::launch_contract::validate_runtime_config(&config, local.config())
                     .await?;
             }

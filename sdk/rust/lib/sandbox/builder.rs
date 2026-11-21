@@ -36,7 +36,7 @@ use super::{
 };
 #[cfg(feature = "local")]
 use crate::UnsupportedReason;
-use crate::backend::default_backend;
+use crate::backend::{default_backend, with_backend};
 use crate::config::layers::BackendConfig;
 #[cfg(feature = "local")]
 use crate::config::{GlobalConfig, GlobalConfigPatch};
@@ -1784,44 +1784,50 @@ impl SandboxBuilder {
                 "connect_or_create cannot be combined with replace_existing".to_string(),
             ));
         }
-        // Options are ignored when connecting to an existing sandbox, so this
-        // API cannot promise that the requested omission policy is active.
-        if self
-            .config
-            .spec
-            .network
-            .secrets
-            .as_ref()
-            .and_then(|secrets| secrets.oauth.as_ref())
-            .is_some_and(|grants| {
-                grants
-                    .iter()
-                    .any(|grant| !grant.omit_token_response_fields.is_empty())
-            })
-        {
-            return Err(MicrosandboxError::InvalidConfig(
-                "OAuth token response field omission requires create, not connect_or_create".into(),
-            ));
-        }
-
+        refuse_oauth_omission_on_join(&self.config)?;
+        let backend = default_backend();
+        self.validate_connect_or_create_policy(backend.as_ref())?;
         let name = self.config.spec.name.clone().unwrap_or_default();
         let detached = self.detached;
-        match Sandbox::get(&name).await {
-            Ok(handle) => return handle.connect_or_start_with_mode(detached).await,
-            Err(MicrosandboxError::SandboxNotFound(_)) => {}
-            Err(error) => return Err(error),
-        }
-
-        match self.create().await {
-            Ok(sandbox) => Ok(sandbox),
-            Err(MicrosandboxError::SandboxAlreadyExists(_)) => {
-                Sandbox::get(&name)
-                    .await?
-                    .connect_or_start_with_mode(detached)
-                    .await
+        with_backend(backend, async move {
+            match Sandbox::get(&name).await {
+                Ok(handle) => return handle.connect_or_start_with_mode(detached).await,
+                Err(MicrosandboxError::SandboxNotFound(_)) => {}
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
-        }
+
+            match self.create().await {
+                Ok(sandbox) => Ok(sandbox),
+                Err(MicrosandboxError::SandboxAlreadyExists(_)) => {
+                    Sandbox::get(&name)
+                        .await?
+                        .connect_or_start_with_mode(detached)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await
+    }
+
+    fn validate_connect_or_create_policy(
+        &self,
+        backend: &dyn crate::Backend,
+    ) -> MicrosandboxResult<()> {
+        // Resolve just the policy before either lookup. Image and portable
+        // snapshot metadata cannot supply OAuth grants.
+        let options = match &self.config_source {
+            ConfigSource::ExistingConfig(resolved) => {
+                (**resolved).clone().overlay(self.rebuild_overrides())
+            }
+            ConfigSource::ResolvedSnapshot(resolved) => (**resolved).clone(),
+            ConfigSource::Fresh | ConfigSource::Snapshot(_) => self.config.clone(),
+        };
+        let effective = match BackendConfig::for_backend(backend) {
+            Some(config) => config.sandbox_layers().options(options).build(),
+            None => options,
+        };
+        refuse_oauth_omission_on_join(&effective)
     }
 
     /// Create the sandbox for detached/background use.
@@ -2347,6 +2353,27 @@ impl SandboxBuilder {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+fn refuse_oauth_omission_on_join(options: &SandboxConfigPatch) -> MicrosandboxResult<()> {
+    // The winner of a lookup or name race can have a different network policy.
+    if options
+        .spec
+        .network
+        .secrets
+        .as_ref()
+        .and_then(|secrets| secrets.oauth.as_ref())
+        .is_some_and(|grants| {
+            grants
+                .iter()
+                .any(|grant| !grant.omit_token_response_fields.is_empty())
+        })
+    {
+        return Err(MicrosandboxError::InvalidConfig(
+            "OAuth token response field omission requires create, not connect_or_create".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Populate local restore inputs without changing capture semantics during backend dispatch.
 #[cfg(feature = "local")]

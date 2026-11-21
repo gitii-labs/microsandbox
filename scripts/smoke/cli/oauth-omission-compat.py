@@ -24,6 +24,7 @@ from tempfile import TemporaryDirectory
 IMAGE = "docker.io/library/msb-oauth-omission-fixture:local"
 MARKER = {"oauth_token_response_omission_v1": True}
 UPGRADE = "does not support OAuth token response field omission; upgrade msb"
+HOST_PROFILE = "token response field omission is not supported in the multi-tenant profile"
 
 
 def run(binary, env, *args, reject=None):
@@ -186,9 +187,11 @@ def check_current(new, old_runtimes, firmware, busybox, home):
         global_config.write_text('{"version":1,"deployment_profile":"multi_tenant"}')
         try:
             for flags in ((), ("--force",)):
-                run(new, env, "restart", "protected", *flags,
-                    reject="token response field omission is not supported in the multi-tenant profile")
+                run(new, env, "restart", "protected", *flags, reject=HOST_PROFILE)
                 assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
+            run(new, env, "modify", "protected", "--restart", "--max-memory", "384M",
+                "--label", "proof=must-not-persist", reject=HOST_PROFILE)
+            assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
         finally:
             global_config.unlink()
         check("protected")
@@ -206,7 +209,8 @@ def check_current(new, old_runtimes, firmware, busybox, home):
 
     print("current CLI preserved protected policy through live edit, restart, and fork; "
           "refused graceful and forced restart with both old runtimes and the "
-          "effective multi-tenant profile without stopping", flush=True)
+          "effective multi-tenant profile without stopping; refused a restart-backed edit "
+          "under that profile without stopping or saving changes", flush=True)
     return ordinary, {**ordinary, "enabled": desired["enabled"], "secrets": desired["secrets"]}
 
 

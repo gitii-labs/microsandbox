@@ -438,11 +438,8 @@ pub(super) async fn apply(
         prospective.update_secrets(&builder.patch)?;
         serde_json::to_string(&prospective)?;
 
-        // A restart-backed modification must be launchable on the selected
-        // runtime before the VM is stopped. Otherwise a capability gap (for
-        // example HTTP CONNECT proxy authentication) is only discovered by
-        // the start that follows `stop`, which leaves the workload down and
-        // the rejected change already persisted.
+        // Use the same effective host policy and runtime preflight as start,
+        // before stopping the VM or persisting the proposed patch.
         if restart_required && let Some(local) = builder.backend.as_local() {
             crate::runtime::launch_contract::validate_runtime_config(&prospective, local.config())
                 .await?;
