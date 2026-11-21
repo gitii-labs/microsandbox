@@ -1147,6 +1147,66 @@ async fn scoped_header_downgrade_refuses_without_changing_the_catalog() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[tokio::test]
+async fn oauth_omission_downgrade_refuses_either_saved_column_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_downgrade_db(&dir.path().join("source.db"))
+        .await
+        .unwrap();
+    db.inner()
+        .execute_unprepared(
+            "CREATE TABLE sandbox(id INTEGER PRIMARY KEY, config TEXT, active_config TEXT)",
+        )
+        .await
+        .unwrap();
+    let ordinary = r#"{"network":{"secrets":{"oauth":[{"grant_id":"ordinary","omit_token_response_fields":[]}]}}}"#;
+    let saved = |grant: &str| format!(r#"{{"network":{{"secrets":{{"oauth":[{grant}]}}}}}}"#);
+    let protected =
+        saved(r#"{"token_response_omission_v1":{"omit_token_response_fields":["id_token"]}}"#);
+    let plain = saved(r#"{"grant_id":"synthetic","omit_token_response_fields":["id_token"]}"#);
+    let staged = std::env::var_os("MSB_OAUTH_OLD_TARGET")
+        .map_or_else(|| dir.path().join("missing-target"), PathBuf::from);
+
+    for (config, active, refused_column) in [
+        (ordinary, ordinary, None),
+        (&protected, ordinary, Some("config")),
+        (ordinary, &protected, Some("active_config")),
+        (ordinary, &plain, Some("active_config")),
+    ] {
+        db.inner()
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT OR REPLACE INTO sandbox VALUES (1, ?, ?)",
+                [config.into(), active.into()],
+            ))
+            .await
+            .unwrap();
+        let result = refuse_oauth_omission_downgrade(db.inner(), &staged).await;
+        if let Some(column) = refused_column {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(&format!(
+                    "sandbox 1 {column} requires OAuth token response field omission"
+                )),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+        let row = db
+            .inner()
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT * FROM sandbox",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "config").unwrap(), config);
+        assert_eq!(row.try_get::<String>("", "active_config").unwrap(), active);
+    }
+}
+
 /// Uses catalogs created and upgraded by real release/candidate binaries.
 #[tokio::test]
 #[ignore = "requires MSB_TEST_CATALOG_MATRIX containing isolated release fixture homes"]

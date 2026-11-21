@@ -199,10 +199,15 @@ The new policy is single-tenant and requires intercepted TCP ports with QUIC
 blocked and no TLS bypass for the token or poll hosts.
 
 Local saved and launch policies encode only an opted-in grant in a
-`token_response_omission_v1` envelope. Older readers require routing fields at
-the top level and reject this entry rather than dropping the policy on start or
-edit. Other sandboxes in the same catalog and grants with no omission retain
-their previous representation. No schema migration, guest protocol, or broker
+`token_response_omission_v1` envelope. Older readers that recognize `oauth`
+require routing fields at the top level and reject the entry, as verified
+with the fork's `v0.7.13-gitii.5`. Pre-OAuth readers, such as v0.6.0, can
+ignore the whole `oauth` key. Do not point those executables directly at an
+opted-in catalog. Use a separate home for old tooling or keep all catalog
+operators on a supporting release. Current `self downgrade` checks both
+saved config columns and requires the staged target to advertise omission
+before changing the installation. Other sandboxes in the same catalog and
+grants with no omission retain their previous representation. No schema migration, guest protocol, or broker
 protocol change is required. Rust callers using exhaustive `OAuthSecret`
 literals must initialize the added field. Go callers using keyed
 `OAuthSecretConfig` literals can leave it unset.

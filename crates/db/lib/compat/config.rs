@@ -63,6 +63,45 @@ pub async fn prepare<C: ConnectionTrait>(db: &C, version: &Version) -> Result<()
     Ok(())
 }
 
+/// Find the first saved OAuth omission policy in either configuration column.
+/// Inspect raw JSON: both the protected envelope and an explicitly opted-in
+/// plain grant require a target that can enforce omission.
+pub async fn saved_oauth_omission<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Option<(i64, &'static str)>, DbErr> {
+    let columns = db
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA table_info(sandbox)",
+        ))
+        .await?;
+    for column in ["config", "active_config"] {
+        if !columns.iter().any(|row| {
+            row.try_get::<String>("", "name")
+                .is_ok_and(|name| name == column)
+        }) {
+            continue;
+        }
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!(
+                    "SELECT sandbox.id FROM sandbox, json_each(CASE WHEN json_valid({column}) \
+                     THEN json_extract({column}, '$.network.secrets.oauth') END) AS grant \
+                     WHERE CASE WHEN grant.type = 'object' THEN \
+                       json_type(grant.value, '$.token_response_omission_v1') IS NOT NULL OR \
+                       json_array_length(grant.value, '$.omit_token_response_fields') > 0 END \
+                     LIMIT 1"
+                ),
+            ))
+            .await?;
+        if let Some(row) = row {
+            return Ok(Some((row.try_get("", "id")?, column)));
+        }
+    }
+    Ok(None)
+}
+
 /// Convert supported saved formats from previous versions without dropping unknown fields.
 pub fn to_current(value: &mut Value) -> Result<(), &'static str> {
     compat::v0_6_5::config::to_current(value)?;
