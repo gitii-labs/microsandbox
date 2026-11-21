@@ -64,7 +64,7 @@ def main(old, new, scratch):
                 config = {
                     "name": name,
                     "image": {"Bind": {"path": str(home)}},
-                    "network": {"secrets": {"oauth": [options]}},
+                    "network": {"tls": {"enabled": True}, "secrets": {"oauth": [options]}},
                 }
                 db.execute(
                     "INSERT INTO sandbox(name, status, config) VALUES (?, 'Stopped', ?)",

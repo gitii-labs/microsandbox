@@ -3052,6 +3052,62 @@ impl SecretsConfig {
             .any(|grant| !grant.omit_token_response_fields.is_empty())
     }
 
+    /// Reject settings that would leave an opted-in token or poll endpoint
+    /// outside the sandbox's TLS interception path.
+    pub fn validate_oauth_token_response_omission(
+        &self,
+        tls: &TlsConfig,
+        profile: DeploymentProfile,
+    ) -> Result<(), SecretConfigError> {
+        for (grant_index, grant) in self.oauth.iter().enumerate() {
+            if grant.omit_token_response_fields.is_empty() {
+                continue;
+            }
+            let invalid = |reason| SecretConfigError::InvalidOAuth {
+                grant_index,
+                reason,
+            };
+            if profile == DeploymentProfile::MultiTenant {
+                return Err(invalid(
+                    "token response field omission is not supported in the multi-tenant profile",
+                ));
+            }
+            if !tls.enabled || !tls.block_quic_on_intercept {
+                return Err(invalid(
+                    "token response field omission requires TLS interception with QUIC blocked on intercepted ports",
+                ));
+            }
+            for endpoint in
+                std::iter::once(grant.token_endpoint.as_str()).chain(grant.poll_endpoint.as_deref())
+            {
+                let (host, port) = oauth_endpoint_authority(endpoint)
+                    .filter(|(host, _)| !host.contains('@'))
+                    .ok_or_else(|| invalid("invalid HTTPS token or poll endpoint"))?;
+                let port = port
+                    .map(str::parse::<u16>)
+                    .transpose()
+                    .map_err(|_| invalid("invalid token or poll endpoint port"))?
+                    .unwrap_or(443);
+                if port == 0 || !tls.intercepted_ports.contains(&port) {
+                    return Err(invalid(
+                        "the token and poll endpoint ports must be intercepted",
+                    ));
+                }
+                if tls.bypass.iter().any(|pattern| {
+                    let pattern = pattern.trim_end_matches('.');
+                    // TLS bypass treats `*` as an exact name, not a catch-all.
+                    pattern != "*"
+                        && HostPattern::parse(pattern).matches(host.trim_end_matches('.'))
+                }) {
+                    return Err(invalid(
+                        "the token and poll endpoint hosts must not bypass TLS interception",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether any configured secret requires verified TLS identity.
     pub fn has_tls_identity_secrets(&self) -> bool {
         self.secrets
@@ -3402,11 +3458,15 @@ fn validate_mint_endpoint(
 
 /// The bare hostname of an `https://host[:port]/path` endpoint.
 fn oauth_endpoint_host(endpoint: &str) -> Option<&str> {
+    oauth_endpoint_authority(endpoint).map(|(host, _)| host)
+}
+
+fn oauth_endpoint_authority(endpoint: &str) -> Option<(&str, Option<&str>)> {
     let authority = endpoint.strip_prefix("https://")?.split('/').next()?;
-    let host = authority
+    let (host, port) = authority
         .rsplit_once(':')
-        .map_or(authority, |(host, _)| host);
-    (!host.is_empty()).then_some(host)
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    (!host.is_empty()).then_some((host, port))
 }
 
 fn validate_placeholder(placeholder: &str, secret_index: usize) -> Result<(), SecretConfigError> {
@@ -4697,6 +4757,41 @@ mod tests {
         grant.poll_secret_fields.clear();
         grant.omit_token_response_fields = vec!["id_token".into()];
         assert_eq!(grant.validate(0), Ok(()));
+    }
+
+    #[test]
+    fn oauth_omission_requires_intercepting_token_and_poll_endpoints() {
+        let mut grant = device_flow_oauth();
+        grant.poll_endpoint = Some("https://poll.example.org:8443/token".into());
+        let mut config = SecretsConfig {
+            oauth: vec![grant],
+            ..Default::default()
+        };
+        let mut tls = TlsConfig::default();
+        assert_eq!(
+            config.validate_oauth_token_response_omission(&tls, DeploymentProfile::MultiTenant),
+            Ok(())
+        );
+        config.oauth[0].omit_token_response_fields = vec!["id_token".into()];
+        let validate = |tls: &TlsConfig| {
+            config.validate_oauth_token_response_omission(tls, DeploymentProfile::SingleTenant)
+        };
+        assert!(validate(&tls).is_err());
+        tls.enabled = true;
+        assert!(validate(&tls).is_err());
+        tls.intercepted_ports.push(8443);
+        assert_eq!(validate(&tls), Ok(()));
+        tls.bypass = vec!["*.EXAMPLE.org.".into()];
+        assert!(validate(&tls).is_err());
+        tls.bypass.clear();
+        tls.block_quic_on_intercept = false;
+        assert!(validate(&tls).is_err());
+        tls.block_quic_on_intercept = true;
+        assert!(
+            config
+                .validate_oauth_token_response_omission(&tls, DeploymentProfile::MultiTenant)
+                .is_err()
+        );
     }
 
     #[test]

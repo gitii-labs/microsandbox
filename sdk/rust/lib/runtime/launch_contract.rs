@@ -173,6 +173,10 @@ impl LaunchContract {
         network.secrets.validate().map_err(|error| {
             MicrosandboxError::InvalidConfig(format!("invalid secret configuration: {error}"))
         })?;
+        network
+            .secrets
+            .validate_oauth_token_response_omission(&network.tls, profile)
+            .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))?;
         if self.machine {
             return Ok(());
         }
@@ -1289,6 +1293,7 @@ mod tests {
             .unwrap();
 
         network.secrets.oauth[0].omit_token_response_fields = vec!["id_token".into()];
+        network.tls.enabled = true;
         previous
             .validate_network(&network, DeploymentProfile::default())
             .unwrap_err();

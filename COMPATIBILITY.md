@@ -195,6 +195,8 @@ replacing a sandbox that uses it. Older local runtimes return an upgrade-require
 error, and managed cloud does not accept the option. The Go loader requires the
 optional `msb_supports_oauth_token_response_omission` symbol before sending it
 to the native library. Old SDKs and existing grants do not need either capability.
+The new policy is single-tenant and requires intercepted TCP ports with QUIC
+blocked and no TLS bypass for the token or poll hosts.
 
 Local saved and launch policies encode only an opted-in grant in a
 `token_response_omission_v1` envelope. Older readers require routing fields at
