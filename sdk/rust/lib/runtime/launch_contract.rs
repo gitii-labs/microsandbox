@@ -724,9 +724,14 @@ pub(crate) async fn validate_runtime_config(
         .await?;
     #[cfg(feature = "net")]
     if config.requires_oauth_omission() {
-        // Resolve and discard the launch values before any stop or persistence.
-        // Spawn resolves again; an external source can still change afterwards.
-        resolve_launch_network(network)?;
+        // Check launch inputs without persisting them or touching the default CA.
+        // Launch checks them again; an external source can change in between.
+        let resolved = resolve_launch_network(network)?;
+        let network = resolved.config();
+        if network.enabled && network.tls.enabled {
+            microsandbox_network::tls::validate_explicit_intercept_ca(&network.tls)
+                .map_err(|error| MicrosandboxError::InvalidConfig(error.to_string()))?;
+        }
     }
     validate_exec_limits(&runtime.msb_path, config).await?;
     validate_guest_clock(&runtime.msb_path, config).await?;

@@ -56,7 +56,7 @@ pub struct SandboxBuilder {
     detached: bool,
     pub(crate) build_error: Option<crate::MicrosandboxError>,
     #[cfg(feature = "net")]
-    rejected_oauth_omission: bool,
+    network_error_blocks_join: bool,
     /// Raw script snippets supplied through construction patches. They are materialized only when
     /// building so later shell overrides determine their shebang.
     config_scripts: BTreeMap<String, String>,
@@ -140,7 +140,7 @@ impl SandboxBuilder {
             detached: false,
             build_error: None,
             #[cfg(feature = "net")]
-            rejected_oauth_omission: false,
+            network_error_blocks_join: false,
             config_scripts: BTreeMap::new(),
             config_source: ConfigSource::default(),
         }
@@ -753,9 +753,8 @@ impl SandboxBuilder {
         let network = match self.local_network_config() {
             Ok(network) => network,
             Err(err) => {
-                if self.build_error.is_none() {
-                    self.build_error = Some(err);
-                }
+                // The caller's closure did not run, so its policy intent is unknown.
+                self.record_network_build_error(err, true);
                 return self;
             }
         };
@@ -1572,8 +1571,8 @@ impl SandboxBuilder {
     }
 
     #[cfg(feature = "net")]
-    fn record_network_build_error(&mut self, error: MicrosandboxError, omission: bool) {
-        self.rejected_oauth_omission |= omission;
+    fn record_network_build_error(&mut self, error: MicrosandboxError, blocks_join: bool) {
+        self.network_error_blocks_join |= blocks_join;
         if self.build_error.is_none() {
             self.build_error = Some(error);
         }
@@ -1783,6 +1782,9 @@ impl SandboxBuilder {
     /// are connected and stopped ones are started. Builder configuration is
     /// used only when this call creates the sandbox. A concurrent creator is
     /// handled by connecting to and converging on the winner.
+    ///
+    /// If invalid initial network settings prevent a supplied `network` closure
+    /// from running, this method returns the configuration error before lookup.
     /// Use [`Self::create`] when requesting OAuth token response field omission.
     pub async fn connect_or_create(self) -> MicrosandboxResult<Sandbox> {
         if self.config.replace_existing.unwrap_or(false) {
@@ -1791,7 +1793,7 @@ impl SandboxBuilder {
             ));
         }
         #[cfg(feature = "net")]
-        if self.rejected_oauth_omission {
+        if self.network_error_blocks_join {
             return Err(self.build_error.unwrap_or_else(oauth_omission_join_error));
         }
         refuse_oauth_omission_on_join(&self.config)?;
@@ -2785,7 +2787,7 @@ impl From<SandboxConfig> for SandboxBuilder {
             detached: false,
             build_error: None,
             #[cfg(feature = "net")]
-            rejected_oauth_omission: false,
+            network_error_blocks_join: false,
             config_scripts: BTreeMap::new(),
             config_source: ConfigSource::ExistingConfig(Box::new(patch)),
         }

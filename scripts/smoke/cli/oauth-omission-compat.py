@@ -211,7 +211,41 @@ def check_current(new, old_runtimes, firmware, busybox, home):
             "--label", "proof=must-not-persist", reject=missing)
         assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
         check("protected")
+        default_cert = Path(env["MSB_HOME"]) / "tls/ca.crt"
+        default_key = Path(env["MSB_HOME"]) / "tls/ca.key"
+        default_before = [(path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+                          for path in (default_cert, default_key)]
+        cert, key = home / "explicit.crt", home / "explicit.key"
+        shutil.copy2(default_cert, cert)
+        with sqlite3.connect(Path(env["MSB_HOME"]) / "db/msb.db") as db:
+            db.execute(
+                "UPDATE sandbox SET config = json_set(config, '$.network.tls.intercept_ca', json(?)) "
+                "WHERE name = 'protected'",
+                (json.dumps({"cert_path": str(cert), "key_path": str(key)}),),
+            )
+        before = saved_row(env, "protected"), latest_run(env, "protected")
+        for signing_input, expected in (
+            (None, "failed to read intercept CA key"),
+            (b"not a PEM signing key", "failed to parse CA key"),
+        ):
+            if signing_input is not None:
+                key.write_bytes(signing_input)
+            for flags in ((), ("--force",)):
+                run(new, env, "restart", "protected", *flags, reject=expected)
+                assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
+            run(new, env, "modify", "protected", "--restart", "--max-memory", "384M",
+                "--label", "proof=must-not-persist", reject=expected)
+            assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
+            assert (key.read_bytes() if key.exists() else None) == signing_input
+        assert [(path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+                for path in (default_cert, default_key)] == default_before
+        assert cert.read_bytes() == default_before[0][2]
+        shutil.copy2(default_key, key)
+        check("protected")
         run(new, env, "restart", "protected")
+        assert latest_run(env, "protected") != before[1]
+        _, active = saved_policy(env, "protected")
+        assert active["tls"]["intercept_ca"] == {"cert_path": str(cert), "key_path": str(key)}
         check("protected")
         # Fork explicitly authorizes inheriting this synthetic local grant.
         run(new, env, "fork", "protected", "--name", "child", "--dangerously-inherit-resources")
@@ -227,7 +261,7 @@ def check_current(new, old_runtimes, firmware, busybox, home):
           "refused graceful and forced restart with both old runtimes and the "
           "effective multi-tenant profile without stopping; refused a restart-backed edit "
           "under that profile without stopping or saving changes; refused both paths "
-          "with a missing proxy password source", flush=True)
+          "with a missing proxy password source or missing/invalid explicit signing key", flush=True)
     return ordinary, {**ordinary, "enabled": desired["enabled"], "secrets": desired["secrets"]}
 
 

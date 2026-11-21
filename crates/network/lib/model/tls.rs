@@ -11,6 +11,9 @@ pub use crate::engine::tls::state;
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(feature = "intercept-ca")]
+#[doc(hidden)]
+pub use crate::intercept_ca::{TlsStateError, validate_explicit_intercept_ca};
 pub use microsandbox_types::{
     CertCacheConfig, InterceptCaConfig, ScopedUpstreamCaCert, ScopedVerifyUpstream, TlsConfig,
 };

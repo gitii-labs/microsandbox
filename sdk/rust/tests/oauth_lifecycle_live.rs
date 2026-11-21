@@ -1,4 +1,5 @@
-//! Local OAuth lifecycle regression using an isolated static BusyBox rootfs.
+//! Local OAuth lifecycle regressions using an isolated static BusyBox rootfs.
+//! Set MSB_HOME inside MSB_TEST_OAUTH_SCRATCH and run these tests serially.
 
 #![cfg(all(target_os = "linux", feature = "local", feature = "net"))]
 
@@ -101,11 +102,19 @@ fn fixture_inputs() -> (tempfile::TempDir, PathBuf) {
         PathBuf::from(std::env::var_os("MSB_TEST_OAUTH_BUSYBOX").expect("static BusyBox"));
     let scratch =
         PathBuf::from(std::env::var_os("MSB_TEST_OAUTH_SCRATCH").expect("private scratch parent"));
+    assert!(
+        runtime_home().starts_with(&scratch),
+        "MSB_HOME must be inside the test scratch"
+    );
     let fixture = tempfile::Builder::new()
         .prefix("oauth-")
         .tempdir_in(scratch)
         .unwrap();
     (fixture, busybox)
+}
+
+fn runtime_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("MSB_HOME").expect("isolated runtime home"))
 }
 
 fn fixture_backend(directory: &Path, profile: DeploymentProfile) -> Arc<LocalBackend> {
@@ -125,8 +134,30 @@ async fn assert_join_refused(builder: SandboxBuilder, message: &str) {
         .connect_or_create()
         .await
         .err()
-        .expect("protected request must not join");
+        .expect("invalid request must not join");
     assert!(error.to_string().contains(message), "{error}");
+}
+
+async fn assert_restart_refused(
+    backend: &Arc<LocalBackend>,
+    sandbox: &Sandbox,
+    error_fragment: &str,
+) {
+    let name = sandbox.name();
+    let before = catalog_state(backend, name).await;
+    let scoped: Arc<dyn Backend> = backend.clone();
+    let handle = with_backend(scoped, Sandbox::get(name)).await.unwrap();
+    let error = Box::pin(handle.restart())
+        .await
+        .err()
+        .expect("invalid launch input must refuse restart");
+    assert!(error.to_string().contains(error_fragment), "{error}");
+    assert_eq!(catalog_state(backend, name).await, before);
+    let error = Box::pin(handle.modify().max_memory(384u32).restart().apply())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains(error_fragment), "{error}");
+    assert_eq!(catalog_state(backend, name).await, before);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -173,34 +204,66 @@ async fn oauth_omission_preflights_restart_profile_and_host_sources() {
         "UPDATE sandbox SET config = json_set(config, '$.network.outbound_proxy', json(?)) WHERE name = 'protected'",
         [proxy.to_string().into()],
     )).await.unwrap();
-    let before = catalog_state(&single, "protected").await;
-    let handle = with_backend(single_scope.clone(), Sandbox::get("protected"))
-        .await
-        .unwrap();
     let missing =
         format!("HTTP CONNECT proxy: host environment variable {MISSING_PROXY_ENV} is not set");
-    let restart_error = Box::pin(handle.restart())
-        .await
-        .err()
-        .expect("missing launch source must refuse restart");
-    assert!(
-        restart_error.to_string().contains(&missing),
-        "{restart_error}"
-    );
-    assert_eq!(catalog_state(&single, "protected").await, before);
-    let modify_error = Box::pin(handle.modify().max_memory(384u32).restart().apply())
-        .await
-        .unwrap_err();
-    assert!(
-        modify_error.to_string().contains(&missing),
-        "{modify_error}"
-    );
-    assert_eq!(catalog_state(&single, "protected").await, before);
+    Box::pin(assert_restart_refused(&single, &protected, &missing)).await;
     let output = protected
         .exec("/bin/sh", ["-c", "printf '%s' \"$ACCESS\""])
         .await;
     protected.stop().await.unwrap();
     assert_eq!(output.unwrap().stdout().unwrap(), "synthetic-access");
+}
+
+#[tokio::test]
+#[ignore = "requires Linux KVM, MSB_PATH, MSB_LIBKRUNFW_PATH, and a static MSB_TEST_OAUTH_BUSYBOX"]
+async fn oauth_omission_preflights_explicit_interception_signer() {
+    let (fixture, busybox) = fixture_inputs();
+    let single = fixture_backend(fixture.path(), DeploymentProfile::SingleTenant);
+    let scoped: Arc<dyn Backend> = single.clone();
+    let mut config = fixture_config(fixture.path(), "protected", &busybox);
+    protect(&mut config, fixture.path());
+    let protected = with_backend(scoped, SandboxBuilder::from(config).create())
+        .await
+        .unwrap();
+
+    let default = runtime_home().join("tls");
+    let default_cert = fs::read(default.join("ca.crt")).unwrap();
+    let default_key = fs::read(default.join("ca.key")).unwrap();
+    let cert = fixture.path().join("explicit.crt");
+    let key = fixture.path().join("explicit.key");
+    fs::write(&cert, &default_cert).unwrap();
+    let explicit = json!({"cert_path":cert,"key_path":key});
+    single.db().await.unwrap().write().execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE sandbox SET config = json_set(config, '$.network.tls.intercept_ca', json(?)) WHERE name = 'protected'",
+        [explicit.to_string().into()],
+    )).await.unwrap();
+
+    Box::pin(assert_restart_refused(
+        &single,
+        &protected,
+        "failed to read intercept CA key",
+    ))
+    .await;
+    assert!(!key.exists());
+    fs::write(&key, b"not a PEM signing key").unwrap();
+    Box::pin(assert_restart_refused(
+        &single,
+        &protected,
+        "failed to parse CA key",
+    ))
+    .await;
+    assert_eq!(fs::read(&key).unwrap(), b"not a PEM signing key");
+    assert_eq!(fs::read(&cert).unwrap(), default_cert);
+    assert_eq!(fs::read(default.join("ca.crt")).unwrap(), default_cert);
+    assert_eq!(fs::read(default.join("ca.key")).unwrap(), default_key);
+
+    let output = protected
+        .exec("/bin/sh", ["-c", "printf '%s' \"$ACCESS\""])
+        .await
+        .unwrap();
+    protected.stop().await.unwrap();
+    assert_eq!(output.stdout().unwrap(), "synthetic-access");
 }
 
 #[tokio::test]
@@ -238,11 +301,32 @@ async fn oauth_omission_refuses_invalid_and_concrete_join() {
                 "requires create, not connect_or_create",
             )
             .await;
+            let mut invalid_base = ordinary.clone();
+            invalid_base.spec.network.tcp_accept_queue_size = Some(0);
+            let closure_called = std::cell::Cell::new(false);
+            let unevaluated = SandboxBuilder::from(invalid_base.clone()).network(|net| {
+                closure_called.set(true);
+                net
+            });
+            assert!(!closure_called.get());
+            assert_join_refused(unevaluated, "TCP accept queue size must be between").await;
+
+            // Without an attempted network closure, unused create options still do not affect a join.
+            let ignored_base = SandboxBuilder::from(invalid_base)
+                .connect_or_create()
+                .await
+                .unwrap();
+            assert_eq!(ignored_base.id(), running.id());
             let ordinary_join = SandboxBuilder::from(ordinary)
+                .network(|net| {
+                    closure_called.set(true);
+                    net
+                })
                 .connect_or_create()
                 .await
                 .unwrap();
             let after = catalog_state(&single, "ordinary").await;
+            assert!(closure_called.get());
             assert_eq!(ordinary_join.id(), running.id());
             running.stop().await.unwrap();
 

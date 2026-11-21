@@ -13,7 +13,7 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject};
 use time::{Duration, OffsetDateTime};
 use tokio_rustls::TlsConnector;
 
-use super::ca::CertAuthority;
+use super::ca::{CertAuthority, load_explicit_ca};
 use super::certgen::{self, DomainCert, DomainCertError};
 use crate::secrets::handle::SecretsHandle;
 use microsandbox_types::TlsConfig;
@@ -42,45 +42,6 @@ pub struct TlsState {
     pub secrets: SecretsHandle,
     /// Pre-computed lowercased bypass patterns for efficient matching.
     bypass_patterns: Vec<DomainPattern>,
-}
-
-/// Errors that prevent TLS interception state from being initialized safely.
-#[derive(Debug, thiserror::Error)]
-pub enum TlsStateError {
-    /// Exactly one of the intercept CA certificate/key paths was configured.
-    #[error("intercept CA config is incomplete; set both cert_path and key_path")]
-    IncompleteInterceptCaConfig,
-
-    /// The configured intercept CA certificate could not be read.
-    #[error("failed to read intercept CA certificate `{path}`: {source}")]
-    ReadInterceptCaCert {
-        /// Certificate path that failed to read.
-        path: PathBuf,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// The configured intercept CA private key could not be read.
-    #[error("failed to read intercept CA key `{path}`: {source}")]
-    ReadInterceptCaKey {
-        /// Private-key path that failed to read.
-        path: PathBuf,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// The configured intercept CA files were readable but did not form a usable CA.
-    #[error("failed to load intercept CA `{cert_path}` / `{key_path}`: {reason}")]
-    InvalidInterceptCa {
-        /// Certificate path that was loaded.
-        cert_path: PathBuf,
-        /// Private-key path that was loaded.
-        key_path: PathBuf,
-        /// Validation or parsing failure from the CA loader.
-        reason: String,
-    },
 }
 
 /// A pre-processed domain pattern (avoids per-connection allocations).
@@ -136,7 +97,7 @@ impl TlsState {
     /// 2. Microsandbox home TLS path (`$MSB_HOME/tls` or `~/.microsandbox/tls`)
     /// 3. Auto-generate and persist to the microsandbox home TLS path
     pub fn new(config: TlsConfig, secrets: SecretsHandle) -> Result<Self, TlsStateError> {
-        let ca = load_or_generate_ca(&config)?;
+        let ca = load_or_generate_ca(&config, secrets.load().has_oauth_token_response_omission())?;
 
         let capacity =
             NonZeroUsize::new(config.cache.capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
@@ -427,36 +388,16 @@ fn normalize_domain(domain: &str) -> String {
 /// 1. User-provided paths (`cert_path` + `key_path`)
 /// 2. Microsandbox home TLS path (`$MSB_HOME/tls` or `~/.microsandbox/tls`)
 /// 3. Auto-generate and persist to the microsandbox home TLS path
-fn load_or_generate_ca(config: &TlsConfig) -> Result<CertAuthority, TlsStateError> {
-    match (
-        &config.intercept_ca.cert_path,
-        &config.intercept_ca.key_path,
-    ) {
-        (Some(cert_path), Some(key_path)) => {
-            let cert_pem =
-                std::fs::read(cert_path).map_err(|source| TlsStateError::ReadInterceptCaCert {
-                    path: cert_path.clone(),
-                    source,
-                })?;
-            let key_pem =
-                std::fs::read(key_path).map_err(|source| TlsStateError::ReadInterceptCaKey {
-                    path: key_path.clone(),
-                    source,
-                })?;
-            let ca = CertAuthority::load(&cert_pem, &key_pem).map_err(|err| {
-                TlsStateError::InvalidInterceptCa {
-                    cert_path: cert_path.clone(),
-                    key_path: key_path.clone(),
-                    reason: err.to_string(),
-                }
-            })?;
-            tracing::info!("loaded user-provided CA from {:?}", cert_path);
-            return Ok(ca);
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(TlsStateError::IncompleteInterceptCaConfig);
-        }
-        (None, None) => {}
+fn load_or_generate_ca(
+    config: &TlsConfig,
+    require_matching_key: bool,
+) -> Result<CertAuthority, TlsStateError> {
+    if let Some(ca) = load_explicit_ca(config, require_matching_key)? {
+        tracing::info!(
+            "loaded user-provided CA from {:?}",
+            config.intercept_ca.cert_path
+        );
+        return Ok(ca);
     }
 
     // 2. Try the same microsandbox home root used by cache/db/logs/metrics.
@@ -719,3 +660,9 @@ mod tests {
         assert_eq!(root_store.len(), 1);
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use super::ca::TlsStateError;

@@ -310,10 +310,13 @@ for omission without interpreting ordinary rows as current configuration. It
 validates protected rows with the catalog decoder and requires support from
 the staged binary. Both direct restart and restart-backed edits check the
 selected runtime and effective host profile before stopping a sandbox whose
-desired policy opts in. They resolve host-backed network sources before
-stopping and again at launch; a source can change between these checks.
+desired policy opts in. They resolve host-backed network sources and validate
+explicit interception signing inputs before stopping and again at launch; a
+source can change between these checks. Preflight does not touch the default CA.
 `connect_or_create` refuses an opted-in effective creation policy or rejected
-opt-in builder input before looking up or joining an existing sandbox.
+opt-in builder input before looking up or joining an existing sandbox. It also
+propagates a network configuration error if an explicitly supplied network
+closure could not run; it cannot know what policy that closure requested.
 
 The raw handle accessors expose the stored marker: Rust `config_json()`, Go
 `ConfigJSON()`, and Node `configJson`. Python's parsed handle `config()` and
