@@ -20,44 +20,66 @@ struct ProtectedNetworkEnabled {
     oauth_token_response_omission_v1: bool,
 }
 
+/// Only the opted-in field matters when checking untagged historical rows.
+#[derive(Deserialize)]
+struct SavedOmissionField {
+    #[serde(default)]
+    omit_token_response_fields: Vec<String>,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
 
 impl SandboxConfig {
-    /// Validate a local catalog row and determine whether it requires OAuth omission.
+    /// Inspect the saved policy without imposing today's config shape on ordinary rows.
     #[doc(hidden)]
     pub fn stored_requires_oauth_omission(json: &str) -> MicrosandboxResult<bool> {
-        Ok(Self::decode_stored(json)?.requires_oauth_omission())
+        let UniqueValue(mut value) = serde_json::from_str(json)?;
+        if let Some(enabled) = protected_enabled(&mut value) {
+            Self::decode_protected(value, enabled?)?;
+            return Ok(true);
+        }
+
+        if let Some(oauth) = value.pointer("/network/secrets/oauth") {
+            let grants = Vec::<SavedOmissionField>::deserialize(oauth)?;
+            if grants
+                .iter()
+                .any(|grant| !grant.omit_token_response_fields.is_empty())
+            {
+                return Err(missing_marker());
+            }
+        }
+        Ok(false)
     }
 
     /// Decode the local catalog's desired or active configuration JSON.
     pub(crate) fn decode_stored(json: &str) -> MicrosandboxResult<Self> {
         match serde_json::from_str::<Self>(json) {
             Ok(config) if !config.requires_oauth_omission() => Ok(config),
-            Ok(_) => Err(MicrosandboxError::InvalidConfig(
-                "saved OAuth token response field omission requires a protected network record"
-                    .into(),
-            )),
+            Ok(_) => Err(missing_marker()),
             Err(ordinary_error) => {
                 let UniqueValue(mut value) = serde_json::from_str(json)?;
-                let Some(enabled) = value
-                    .pointer_mut("/network/enabled")
-                    .filter(|v| v.is_object())
-                else {
+                let Some(enabled) = protected_enabled(&mut value) else {
                     return Err(ordinary_error.into());
                 };
-                let marker: ProtectedNetworkEnabled = serde_json::from_value(enabled.take())?;
-                *enabled = Value::Bool(marker.oauth_token_response_omission_v1);
-                let config: Self = serde_json::from_value(value)?;
-                if !config.requires_oauth_omission() {
-                    return Err(MicrosandboxError::InvalidConfig(
-                        "protected network record requires a saved OAuth token response field omission policy".into(),
-                    ));
-                }
-                Ok(config)
+                Self::decode_protected(value, enabled?)
             }
         }
+    }
+
+    fn decode_protected(
+        mut value: Value,
+        marker: ProtectedNetworkEnabled,
+    ) -> MicrosandboxResult<Self> {
+        value["network"]["enabled"] = Value::Bool(marker.oauth_token_response_omission_v1);
+        let config: Self = serde_json::from_value(value)?;
+        if !config.requires_oauth_omission() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "protected network record requires a saved OAuth token response field omission policy".into(),
+            ));
+        }
+        Ok(config)
     }
 
     #[cfg(feature = "local")]
@@ -79,6 +101,23 @@ impl SandboxConfig {
             .as_ref()
             .is_some_and(SecretsConfig::has_oauth_token_response_omission)
     }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn protected_enabled(value: &mut Value) -> Option<serde_json::Result<ProtectedNetworkEnabled>> {
+    value
+        .pointer_mut("/network/enabled")
+        .filter(|enabled| enabled.is_object())
+        .map(|enabled| serde_json::from_value(enabled.take()))
+}
+
+fn missing_marker() -> MicrosandboxError {
+    MicrosandboxError::InvalidConfig(
+        "saved OAuth token response field omission requires a protected network record".into(),
+    )
 }
 
 //--------------------------------------------------------------------------------------------------

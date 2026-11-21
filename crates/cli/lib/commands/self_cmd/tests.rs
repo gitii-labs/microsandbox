@@ -1241,6 +1241,52 @@ async fn oauth_omission_downgrade_refuses_either_saved_column_without_mutation()
     }
 }
 
+#[tokio::test]
+async fn oauth_omission_downgrade_admits_historical_bind_without_rewriting_it() {
+    // Written by the released v0.6.0 CLI after a local BusyBox boot and stop.
+    // Only the scratch rootfs path has been normalized.
+    let historical =
+        include_str!("../../../../../sdk/rust/lib/db/fixtures/bind-config-0.6.0.json").trim_end();
+    assert!(serde_json::from_str::<SandboxConfig>(historical).is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_downgrade_db(&dir.path().join("source.db"))
+        .await
+        .unwrap();
+    db.inner()
+        .execute_unprepared(
+            "CREATE TABLE sandbox(id INTEGER PRIMARY KEY, config TEXT, active_config TEXT)",
+        )
+        .await
+        .unwrap();
+    db.inner()
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO sandbox VALUES (1, ?, ?)",
+            [historical.into(), historical.into()],
+        ))
+        .await
+        .unwrap();
+
+    // No staged binary exists; reading an ordinary row must not probe it.
+    refuse_oauth_omission_downgrade(db.inner(), &dir.path().join("unstaged"))
+        .await
+        .unwrap();
+    prepare(db.inner(), &Version::new(0, 6, 0)).await.unwrap();
+
+    let row = db
+        .inner()
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT * FROM sandbox WHERE id = 1",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    for column in ["config", "active_config"] {
+        assert_eq!(row.try_get::<String>("", column).unwrap(), historical);
+    }
+}
+
 /// Uses catalogs created and upgraded by real release/candidate binaries.
 #[tokio::test]
 #[ignore = "requires MSB_TEST_CATALOG_MATRIX containing isolated release fixture homes"]

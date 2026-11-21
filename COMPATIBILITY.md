@@ -305,10 +305,11 @@ decoder requires the marker and a nonempty omission policy together and rejects
 duplicate keys before normalization. Public configuration input and launch JSON
 retain the normal boolean and grant shapes.
 Other sandboxes retain their existing bytes; no schema migration or catalog-wide
-admission gate is added. The current `self downgrade` checks both saved columns
-with the same decoder and requires support from the staged binary before
-applying the downgrade. Direct restart checks the selected runtime before
-stopping a sandbox whose desired policy opts in.
+admission gate is added. The current `self downgrade` scans both saved columns
+for omission without interpreting ordinary rows as current configuration. It
+validates protected rows with the catalog decoder and requires support from
+the staged binary. Direct restart checks the selected runtime and effective
+host profile before stopping a sandbox whose desired policy opts in.
 
 The raw handle accessors expose the stored marker: Rust `config_json()`, Go
 `ConfigJSON()`, and Node `configJson`. Python's parsed handle `config()` and
@@ -706,4 +707,7 @@ Incoming unversioned launch/cloud requests retain detection of previous formats.
 
 The runtime dispatcher selects the current reader when `execution` is present, `v0_6_10/launch.rs` when `bootstrap` is present, and `v0_5_9/launch.rs` otherwise. `client/launch.rs` contains both `LaunchConfig` and the `LaunchCapabilities` probe response. The launch type remains in the runtime crate to avoid a dependency cycle. SDK tests exercise its encoder against the runtime decoder; runtime tests also consume independently captured release payloads.
 
-Launch and cloud requests reject duplicate recognized fields and conflicting previous/current spellings. Previous saved-format decoding and the duplicate-key JSON fixture reader in the SDK are test-only.
+Launch and cloud requests reject duplicate recognized fields and conflicting
+previous/current spellings. Previous saved-format fixture decoding is test-only.
+The SDK's duplicate-key JSON reader also runs in production for protected catalog
+decoding and the downgrade policy scan.

@@ -181,6 +181,17 @@ def check_current(new, old_runtimes, firmware, busybox, home):
                 run(new, old_runtime, "restart", "protected", *flags, reject=UPGRADE)
                 assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
                 check("protected")
+        global_config = Path(env["MSB_HOME"]) / "config.json"
+        assert not global_config.exists()
+        global_config.write_text('{"version":1,"deployment_profile":"multi_tenant"}')
+        try:
+            for flags in ((), ("--force",)):
+                run(new, env, "restart", "protected", *flags,
+                    reject="token response field omission is not supported in the multi-tenant profile")
+                assert (saved_row(env, "protected"), latest_run(env, "protected")) == before
+        finally:
+            global_config.unlink()
+        check("protected")
         run(new, env, "restart", "protected")
         check("protected")
         # Fork explicitly authorizes inheriting this synthetic local grant.
@@ -194,7 +205,8 @@ def check_current(new, old_runtimes, firmware, busybox, home):
                 run(new, env, "stop", name)
 
     print("current CLI preserved protected policy through live edit, restart, and fork; "
-          "refused graceful and forced restart with both old runtimes without stopping", flush=True)
+          "refused graceful and forced restart with both old runtimes and the "
+          "effective multi-tenant profile without stopping", flush=True)
     return ordinary, {**ordinary, "enabled": desired["enabled"], "secrets": desired["secrets"]}
 
 

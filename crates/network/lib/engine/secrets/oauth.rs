@@ -420,6 +420,24 @@ impl OAuthConnection {
         port: u16,
         identity: Option<(IpAddr, &SharedState)>,
     ) -> io::Result<Self> {
+        let observe_dns = || {
+            identity.is_none_or(|(guest_ip, shared)| {
+                shared
+                    .any_resolved_hostname(guest_ip, |hostname| hostname.eq_ignore_ascii_case(sni))
+            })
+        };
+        // A protected destination and every grant sharing it must use the
+        // same evidence, even if DNS changes while a broker load is pending.
+        let dns_snapshot = has_protected_endpoint(configs, sni, port)?.then(observe_dns);
+        if dns_snapshot == Some(false) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "OAuth token response field omission requires DNS evidence for the destination",
+            ));
+        }
+        let dns_attested = || dns_snapshot.unwrap_or_else(observe_dns);
+        let here = |endpoint: &Endpoint| flow_endpoint_here(endpoint, sni, port);
+
         let mut grants = Vec::new();
         let mut reported = Vec::new();
         let mut seen_tokens = Vec::new();
@@ -435,23 +453,11 @@ impl OAuthConnection {
                 .as_deref()
                 .map(parse_https_endpoint)
                 .transpose()?;
-            let dns_attested = || {
-                identity.is_none_or(|(guest_ip, shared)| {
-                    shared.any_resolved_hostname(guest_ip, |hostname| {
-                        hostname.eq_ignore_ascii_case(sni)
-                    })
-                })
-            };
-            let endpoint_relevant = flow_endpoint_relevant(
-                config,
-                &token,
-                device_code.as_ref(),
-                poll.as_ref(),
-                sni,
-                port,
-                dns_attested,
-            )?;
             let host_allowed = |matches: bool| matches && dns_attested();
+            let is_relevant = |endpoint: &Endpoint| host_allowed(here(endpoint));
+            let endpoint_relevant = is_relevant(&token)
+                || device_code.as_ref().is_some_and(is_relevant)
+                || poll.as_ref().is_some_and(is_relevant);
             // A mint endpoint is an endpoint of the flow too, and it carries
             // its own host and port rather than a URL. Its host may be the
             // token endpoint's without being an inject host, and its port
@@ -464,6 +470,10 @@ impl OAuthConnection {
                     .iter()
                     .any(|endpoint| host_allowed(mint_endpoint_here(endpoint, sni, port)))
                 || config.inject_hosts.iter().any(|host| {
+                    if dns_snapshot == Some(true) {
+                        // An attested SNI that matches the pattern already satisfies DNS.
+                        return host.matches(sni);
+                    }
                     identity.map_or_else(
                         || host.matches(sni),
                         |(guest_ip, shared)| {
@@ -2656,38 +2666,25 @@ fn mint_endpoint_matches(endpoint: &MintEndpoint, sni: &str, port: u16, target: 
     match_endpoint_path(&endpoint.path, target)
 }
 
-/// Whether a mint endpoint is served by the host and port of this connection.
-///
-fn flow_endpoint_relevant(
-    config: &OAuthSecret,
-    token: &Endpoint,
-    device_code: Option<&Endpoint>,
-    poll: Option<&Endpoint>,
-    sni: &str,
-    port: u16,
-    dns_attested: impl Fn() -> bool,
-) -> io::Result<bool> {
-    let endpoint_here =
-        |endpoint: &Endpoint| port == endpoint.port && endpoint.host.eq_ignore_ascii_case(sni);
-
-    if !config.omit_token_response_fields.is_empty()
-        && (endpoint_here(token) || poll.is_some_and(endpoint_here))
-    {
-        // A protected route is either admitted or rejected by this observation.
-        // Expiry or replacement must not downgrade it to an ordinary TLS relay.
-        return if dns_attested() {
-            Ok(true)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "OAuth token response field omission requires DNS evidence for the destination",
-            ))
-        };
+fn has_protected_endpoint(configs: &[OAuthSecret], sni: &str, port: u16) -> io::Result<bool> {
+    for config in configs {
+        if config.omit_token_response_fields.is_empty() {
+            continue;
+        }
+        if flow_endpoint_here(&parse_https_endpoint(&config.token_endpoint)?, sni, port) {
+            return Ok(true);
+        }
+        if let Some(poll) = &config.poll_endpoint
+            && flow_endpoint_here(&parse_https_endpoint(poll)?, sni, port)
+        {
+            return Ok(true);
+        }
     }
+    Ok(false)
+}
 
-    // Every endpoint of an ordinary flow can make the grant relevant, including device code.
-    let is_relevant = |endpoint: &Endpoint| endpoint_here(endpoint) && dns_attested();
-    Ok(is_relevant(token) || device_code.is_some_and(is_relevant) || poll.is_some_and(is_relevant))
+fn flow_endpoint_here(endpoint: &Endpoint, sni: &str, port: u16) -> bool {
+    port == endpoint.port && endpoint.host.eq_ignore_ascii_case(sni)
 }
 
 /// A mint endpoint names a host and a path rather than a URL, so its port is
@@ -2926,7 +2923,6 @@ fn invalid_http() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -2963,42 +2959,71 @@ mod tests {
         connection_for(vec![config()])
     }
 
-    #[test]
-    fn oauth_omission_route_uses_one_dns_observation_for_admission() {
-        let mut grant = config();
-        grant.omit_token_response_fields = vec!["id_token".into()];
-        let token = parse_https_endpoint(&grant.token_endpoint).unwrap();
-        let poll = parse_https_endpoint("https://poll.example.com:8443/device").unwrap();
+    #[tokio::test]
+    async fn oauth_omission_shared_endpoint_keeps_both_candidates_after_dns_changes() {
+        let socket = std::env::temp_dir().join(format!(
+            "msb-oauth-snapshot-{}-{}.sock",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let ordinary_broker = start_broker("ordinary-access-value", "ordinary-refresh-value");
+        let mut protected = config();
+        protected.broker_endpoint = socket.to_string_lossy().into_owned();
+        protected.omit_token_response_fields = vec!["id_token".into()];
+        let mut ordinary = broker_config(&ordinary_broker);
+        ordinary.grant_id = "ordinary-grant".into();
+        ordinary.access_sentinel = "$ORDINARY_ACCESS".into();
+        ordinary.refresh_sentinel = "$ORDINARY_REFRESH".into();
+        let configs = [protected, ordinary];
+        let host = "auth.example.com";
+        let ip = "192.0.2.1".parse().unwrap();
+        let shared = SharedState::new(4);
+        shared.cache_resolved_hostname(
+            host,
+            ResolvedHostnameFamily::Ipv4,
+            [ip],
+            Duration::from_secs(60),
+        );
 
-        for endpoint in [&token, &poll] {
-            // Model an attestation that expires immediately after the first lookup.
-            let present = Cell::new(true);
-            let decision = || {
-                flow_endpoint_relevant(
-                    &grant,
-                    &token,
-                    None,
-                    Some(&poll),
-                    &endpoint.host,
-                    endpoint.port,
-                    || present.replace(false),
-                )
-            };
-
-            assert!(decision().unwrap());
-            assert!(!present.get());
+        let broker = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            std::fs::remove_file(&socket).unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).await.unwrap();
             assert_eq!(
-                decision().unwrap_err().kind(),
-                io::ErrorKind::PermissionDenied
+                serde_json::from_str::<Value>(&request).unwrap()["action"],
+                "load"
             );
-        }
+            // Change the evidence while the protected grant is waiting on its broker.
+            shared.clear_resolved_hostname(host, ResolvedHostnameFamily::Ipv4);
+            stream.get_mut().write_all(
+                b"{\"access\":\"protected-access-value\",\"refresh\":\"protected-refresh-value\",\"generation\":1}\n"
+            ).await.unwrap();
+        };
+        let (connection, ()) = tokio::time::timeout(BROKER_TIMEOUT, async {
+            tokio::join!(
+                OAuthConnection::new_tls_intercepted(&configs, host, 443, ip, &shared),
+                broker
+            )
+        })
+        .await
+        .unwrap();
+        let mut connection = connection.unwrap();
+        assert_eq!(connection.grants.len(), 2);
 
-        grant.omit_token_response_fields.clear();
-        assert!(
-            !flow_endpoint_relevant(&grant, &token, None, None, &token.host, token.port, || {
-                false
-            })
-            .unwrap()
+        let request = json_request(
+            "/oauth/token",
+            r#"{"grant_type":"authorization_code","code":"synthetic"}"#,
+        );
+        let error = connection
+            .transform_requests(request.as_bytes(), host)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "OAuth grant routing is invalid or ambiguous"
         );
     }
 
