@@ -3082,11 +3082,23 @@ async fn handle_message_with_charge(
             };
             match credit.kind {
                 BulkKind::Filesystem => {
-                    let result = state
-                        .read_sessions
-                        .get(&msg.id)
-                        .ok_or_else(|| format!("unknown filesystem read session: {}", msg.id))
-                        .and_then(|session| session.apply_credit(credit));
+                    let result = match state.read_sessions.get(&msg.id) {
+                        Some(session) => session.apply_credit(credit),
+                        // Caller validation: a write receives records and never takes host credit.
+                        None if state.write_sessions.contains_key(&msg.id)
+                            || state.bulk_write_workers.contains_key(&msg.id) =>
+                        {
+                            Err(format!(
+                                "filesystem write session {} received credit",
+                                msg.id
+                            ))
+                        }
+                        // The final response retires a read before the other physical lane
+                        // finishes delivering its records, and the host keeps granting credit
+                        // while it consumes them. Late credit has no recipient and must not
+                        // cancel that tail or manufacture a second terminal response.
+                        None => Ok(()),
+                    };
                     if let Err(error) = result {
                         encode_bulk_fs_failure(msg.id, error, out_buf)?;
                         cancel_bulk_correlation(msg.id, BulkKind::Filesystem, state, &session_tx);
@@ -4929,6 +4941,211 @@ mod tests {
         })
         .await
         .expect("late-credit TCP tail did not complete");
+    }
+
+    #[tokio::test]
+    async fn late_fs_read_credit_preserves_raw_tail_before_and_after_terminal_retirement() {
+        use microsandbox_protocol::bulk::{BulkOffer, DEFAULT_FILESYSTEM_BULK_RECORD_PAYLOAD};
+        use microsandbox_protocol::fs::{FsOp, FsOpenOptions, FsResponseData};
+
+        let path = std::env::temp_dir().join(format!(
+            "msb-agentd-late-fs-read-credit-{}",
+            std::process::id()
+        ));
+        // Two records that fit the initial window: the read completes without further credit.
+        let payload = (0..DEFAULT_FILESYSTEM_BULK_RECORD_PAYLOAD as usize + 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        assert!(payload.len() as u64 <= DEFAULT_BULK_WINDOW);
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut state = AgentState::default();
+            let incarnation = [0x58; CLIENT_INCARNATION_SIZE];
+            establish_relay_client(
+                &mut state,
+                RelayClientConnected {
+                    id_start: 1,
+                    id_end_exclusive: microsandbox_protocol::AGENT_RELAY_ID_RANGE_STEP,
+                    incarnation,
+                },
+            )
+            .unwrap();
+            // Leave the dedicated scheduler's input queued: primary completion is allowed to
+            // overtake these bytes, but no late credit may send DropFlow to discard their tail.
+            let (mut sender, mut control, mut bulk, mut scheduler_commands) =
+                SessionOutputSender::split_channel();
+            let producer = sender.with_incarnation(Some(incarnation));
+
+            let mut out = Vec::new();
+            crate::fs::handle_fs_request(
+                1,
+                PROTOCOL_VERSION,
+                FsRequest {
+                    op: FsOp::OpenFile {
+                        path: path.to_str().unwrap().into(),
+                        options: FsOpenOptions {
+                            read: true,
+                            ..Default::default()
+                        },
+                    },
+                    bulk: None,
+                },
+                &mut state.fs,
+                &mut out,
+                &producer,
+            )
+            .await
+            .unwrap();
+            let opened = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+            let Some(FsResponseData::Handle(handle)) = opened.payload::<FsResponse>().unwrap().data
+            else {
+                panic!("file did not open");
+            };
+
+            let mut out = Vec::new();
+            let Some(FsStreamSession::Read(session)) = crate::fs::handle_fs_request(
+                1,
+                PROTOCOL_VERSION,
+                FsRequest {
+                    op: FsOp::Read {
+                        handle,
+                        offset: 0,
+                        len: None,
+                    },
+                    bulk: Some(BulkOffer::filesystem_read()),
+                },
+                &mut state.fs,
+                &mut out,
+                &producer,
+            )
+            .await
+            .unwrap() else {
+                panic!("expected read session");
+            };
+            assert_eq!(
+                codec::try_decode_from_buf(&mut out).unwrap().unwrap().t,
+                MessageType::BulkAccepted
+            );
+            state.read_sessions.insert(1, session);
+
+            let first = bulk.recv().await.unwrap();
+            let SessionOutput::Bulk(output) = &first.output else {
+                panic!()
+            };
+            let consumed = output.record.payload.len();
+            assert!(consumed < payload.len());
+            let mut received = vec![first];
+            let mut terminal = None;
+            for expected in [MessageType::BulkFinish, MessageType::FsResponse] {
+                let envelope = control.recv().await.unwrap();
+                let SessionOutput::Raw(mut output) = envelope.output else {
+                    panic!()
+                };
+                let message = codec::try_decode_from_buf(&mut output.frame)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(message.t, expected);
+                if expected == MessageType::BulkFinish {
+                    assert_eq!(
+                        message.payload::<BulkFinish>().unwrap().final_offset,
+                        payload.len() as u64
+                    );
+                } else {
+                    assert!(message.payload::<FsResponse>().unwrap().ok);
+                    terminal = Some(output);
+                }
+            }
+            assert!(
+                !bulk.is_empty(),
+                "the dedicated output tail must still be queued"
+            );
+
+            let credit = BulkCredit {
+                kind: BulkKind::Filesystem,
+                flow: BulkFlow::GuestToHost,
+                consumed_offset: consumed as u64,
+                credit_limit: consumed as u64 + DEFAULT_BULK_WINDOW,
+            };
+            let mut activity = ActivityTracker::new();
+            let config = AgentdConfig {
+                exec_limits: None,
+                user: None,
+                security_profile: Default::default(),
+                handoff_init_path: None,
+                default_cwd: None,
+                default_env: Vec::new(),
+            };
+            let mut workload = crate::workload::tests::fake_latch();
+            let heartbeat = heartbeat::HeartbeatControl::default();
+            for retired in [false, true] {
+                if retired {
+                    let terminal = terminal.take().unwrap();
+                    assert!(matches!(
+                        terminal.completion,
+                        Some(RawSessionCompletion::FsRead)
+                    ));
+                    complete_raw_session(
+                        1,
+                        terminal.completion,
+                        &mut state.read_sessions,
+                        &mut state.tcp_sessions,
+                    );
+                    clear_bulk_receive_state(&mut state, 1);
+                }
+                assert_eq!(state.read_sessions.contains_key(&1), !retired);
+                let mut out = Vec::new();
+                handle_message(
+                    Message::with_payload(MessageType::BulkCredit, 1, &credit).unwrap(),
+                    &mut state,
+                    &mut activity,
+                    &mut sender,
+                    &mut out,
+                    &config,
+                    &mut workload,
+                    &heartbeat,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    out.is_empty(),
+                    "late credit must not emit cancellation or another terminal"
+                );
+                assert!(
+                    matches!(
+                        scheduler_commands.try_recv(),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    ),
+                    "late credit must not purge raw output"
+                );
+                assert!(!bulk.is_empty());
+            }
+            assert!(matches!(
+                control.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            while let Ok(envelope) = bulk.try_recv() {
+                received.push(envelope);
+            }
+            let mut offset = 0;
+            for envelope in received {
+                assert_eq!(envelope.id, 1);
+                assert_eq!(envelope.incarnation, Some(incarnation));
+                let SessionOutput::Bulk(output) = envelope.output else {
+                    panic!()
+                };
+                let record = output.record;
+                assert_eq!(record.offset, offset as u64);
+                let end = offset + record.payload.len();
+                assert_eq!(record.payload.as_ref(), &payload[offset..end]);
+                offset = end;
+            }
+            assert_eq!(offset, payload.len());
+            state.fs.clear();
+        })
+        .await
+        .expect("late-credit filesystem tail did not complete");
+        tokio::fs::remove_file(&path).await.unwrap();
     }
 
     #[tokio::test]
