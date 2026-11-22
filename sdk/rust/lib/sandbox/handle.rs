@@ -308,10 +308,9 @@ impl SandboxHandle {
 
     /// Parse the active configuration snapshot, when one is available.
     pub fn active_config(&self) -> MicrosandboxResult<Option<SandboxConfig>> {
-        Ok(self
-            .active_config_json()
+        self.active_config_json()
             .map(SandboxConfig::decode_stored)
-            .transpose()?)
+            .transpose()
     }
 
     /// Start planning a sandbox modification from this handle.
